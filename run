@@ -1,0 +1,20 @@
+#!/bin/bash
+# Build one phase-1 probe and forward the remaining arguments to it.
+#
+#   ./run DispatchChain [iterations] [max_chain] [groups] [work]
+#   ./run VectorMiscompile          # OPT=-O2 ./run VectorMiscompile fails, which is why OPT is -O1
+#
+# -O1 because Homebrew clang 22.1.8 miscompiles vector growth at -O2. See probes/VectorMiscompile.cpp.
+
+set -e
+cd "$(dirname "$0")"
+Probe=${1:?usage: ./run <DispatchChain|VectorMiscompile> [args...]}
+shift
+Llvm=$(brew --prefix llvm)
+mkdir -p build
+"$Llvm/bin/clang++" -std=c++23 -stdlib=libc++ -fblocks "${OPT:--O1}" -Wall -Wextra \
+    -isysroot "$(xcrun --show-sdk-path)" -mmacosx-version-min=26.0 -Ilib/metal-cpp \
+    -framework Metal -framework Foundation -framework QuartzCore \
+    -L"$Llvm/lib/c++" -Wl,-rpath,"$Llvm/lib/c++" \
+    "probes/$Probe.cpp" -o "build/$Probe"
+exec "build/$Probe" "$@"
