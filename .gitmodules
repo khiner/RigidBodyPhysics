@@ -1,0 +1,6 @@
+[submodule "lib/metal-cpp"]
+	path = lib/metal-cpp
+	url = https://github.com/apple/metal-cpp.git
+[submodule "lib/doctest"]
+	path = lib/doctest
+	url = https://github.com/doctest/doctest.git
