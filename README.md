@@ -1,6 +1,13 @@
 # RigidBodyPhysics
 Rigid body physics and collision detection running on Apple Silicon
 
+A Metal 4 GPU engine built around an AVBD solver.
+[Architecture.md](Architecture.md) records the measured Metal 4 structure the engine is built on, [LiteratureReview.md](LiteratureReview.md) is the research base, and [NOTICE.md](NOTICE.md) attributes the ported references.
+
+```
+cmake -S . -B build/cmake && cmake --build build/cmake && ctest --test-dir build/cmake
+```
+
 ## Probes
 
 Standalone probes, run as `./run <probe> [args...]` with Homebrew clang and metal-cpp.
