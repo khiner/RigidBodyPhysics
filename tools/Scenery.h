@@ -4,27 +4,52 @@
 // - RbpScenes reports what the solver did with it, RbpBench times it - so the geometry lives here and
 // each tool keeps only its own instrumentation.
 
+#include "Solver.h"
 #include "World.h"
 
 #include <cmath>
 #include <numbers>
+#include <span>
 #include <vector>
 
 constexpr float Half = 0.5f, Density = 1000, Friction = 0.5f;
 constexpr Shape UnitBox{.HalfExtents = {Half, Half, Half}, .Kind = ShapeBox};
 constexpr Shape GroundPlane{.Normal = {0, 1, 0}, .Offset = 0, .Kind = ShapePlane};
 
+// The ground every scene here stands on, and a body of the one density and friction they all use -
+// so a scene says where its bodies are and nothing else.
+inline Index AddGround(World &world) { return world.AddBody({.Shape = world.AddShape(GroundPlane), .Friction = Friction}); }
+inline Index Place(World &world, Index shape, float3 at, float4 turn = float4{0, 0, 0, 1}) {
+    return world.AddBody({.Pose = At(at, turn), .Shape = shape, .Density = Density, .Friction = Friction});
+}
+
+// How many contacts the world is holding, and how many of them are in one body's own run. Nothing is
+// appended to the pool, so a slot that was never filled reads as inactive and a scan is the whole of it.
+inline uint32_t ActiveContacts(const World &world) {
+    uint32_t live = 0;
+    for (uint32_t slot = 0; slot < world.Contacts.Capacity; ++slot) live += world.Contacts[slot].Active ? 1 : 0;
+    return live;
+}
+inline uint32_t ActiveContacts(const World &world, Index body) {
+    uint32_t live = 0;
+    for (uint32_t slot = 0; slot < ContactsPerBody; ++slot) live += world.Contacts[body * ContactsPerBody + slot].Active ? 1 : 0;
+    return live;
+}
+
+// And how many of these have stopped being solved.
+inline uint32_t Asleep(const World &world, std::span<const Index> bodies, const StepSettings &settings) {
+    uint32_t count = 0;
+    for (const Index body : bodies) count += world.Quiet[body] >= settings.SleepSteps ? 1 : 0;
+    return count;
+}
+
 // A chain: boxes stacked on the plane, which is the shape the contact run was sized against - a box in
 // one touches the box below and the box above, and no more.
 inline std::vector<Index> BuildStack(World &world, uint32_t boxes) {
     const auto shape = world.AddShape(UnitBox);
-    world.AddBody({.Shape = world.AddShape(GroundPlane), .Friction = Friction});
+    AddGround(world);
     std::vector<Index> stack;
-    for (uint32_t i = 0; i < boxes; ++i)
-        stack.push_back(world.AddBody({.Pose = {.Position = {0, Half + 1.02f * float(i), 0}, .Orientation = {0, 0, 0, 1}},
-                                       .Shape = shape,
-                                       .Density = Density,
-                                       .Friction = Friction}));
+    for (uint32_t i = 0; i < boxes; ++i) stack.push_back(Place(world, shape, float3{0, Half + 1.02f * float(i), 0}));
     return stack;
 }
 
@@ -33,17 +58,14 @@ inline std::vector<Index> BuildStack(World &world, uint32_t boxes) {
 // A box in the middle of it names nine partners, which is what the contact budget is sized from.
 inline std::vector<Index> BuildRaft(World &world, uint32_t side, uint32_t layers) {
     const auto shape = world.AddShape(UnitBox);
-    world.AddBody({.Shape = world.AddShape(GroundPlane), .Friction = Friction});
+    AddGround(world);
     std::vector<Index> boxes;
     for (uint32_t layer = 0; layer < layers; ++layer) {
         const uint32_t across = side > layer ? side - layer : 1;
+        const float centre = 0.5f * float(across - 1);
         for (uint32_t x = 0; x < across; ++x)
             for (uint32_t z = 0; z < across; ++z)
-                boxes.push_back(world.AddBody({.Pose = {.Position = {float(x) - 0.5f * float(across - 1), Half + 1.02f * float(layer), float(z) - 0.5f * float(across - 1)},
-                                                        .Orientation = {0, 0, 0, 1}},
-                                               .Shape = shape,
-                                               .Density = Density,
-                                               .Friction = Friction}));
+                boxes.push_back(Place(world, shape, float3{float(x) - centre, Half + 1.02f * float(layer), float(z) - centre}));
     }
     return boxes;
 }
@@ -60,7 +82,7 @@ inline float CoinTwist(uint32_t sides, float twist, uint32_t coin) {
 // the only one whose manifolds are wider than the four a pair may keep. Empty when the prism will not
 // cook, which is the one way this scene can fail to build.
 inline std::vector<Index> BuildCoins(World &world, uint32_t sides, uint32_t coins, float twist) {
-    world.AddBody({.Shape = world.AddShape(GroundPlane), .Friction = Friction});
+    AddGround(world);
     std::vector<float3> points;
     for (uint32_t i = 0; i < sides; ++i) {
         const float angle = 2 * std::numbers::pi_v<float> * float(i) / float(sides);
@@ -71,11 +93,7 @@ inline std::vector<Index> BuildCoins(World &world, uint32_t sides, uint32_t coin
     if (shape == NoIndex) return {};
     std::vector<Index> stack;
     for (uint32_t i = 0; i < coins; ++i)
-        stack.push_back(world.AddBody({.Pose = {.Position = {0, CoinHalfHeight + 2 * CoinHalfHeight * 1.02f * float(i), 0},
-                                                .Orientation = QuatFromRotationVector(float3{0, CoinTwist(sides, twist, i), 0})},
-                                       .Shape = shape,
-                                       .Density = Density,
-                                       .Friction = Friction}));
+        stack.push_back(Place(world, shape, float3{0, CoinHalfHeight + 2 * CoinHalfHeight * 1.02f * float(i), 0}, QuatFromRotationVector(float3{0, CoinTwist(sides, twist, i), 0})));
     return stack;
 }
 
@@ -93,4 +111,13 @@ inline Index FloorMesh(World &world, uint32_t cells) {
             indices.insert(indices.end(), {at(x, z), at(x + 1, z + 1), at(x + 1, z)});
         }
     return world.AddMesh(points, indices);
+}
+
+// And the body wearing it, since a mesh is only a floor once something has it. False when the mesh
+// would not cook, which is the one way a scene built on one fails to build.
+inline bool AddMeshFloor(World &world, uint32_t cells) {
+    const Index floor = FloorMesh(world, cells);
+    if (floor == NoIndex) return false;
+    world.AddBody({.Shape = floor, .Friction = Friction});
+    return true;
 }

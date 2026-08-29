@@ -65,11 +65,10 @@ std::string FirstLine(const char *command) {
 // the joint rows stay loaded for the whole run.
 void Chain(World &world, uint32_t links) {
     const auto shape = world.AddShape(UnitBox);
-    const auto anchor = world.AddBody({.Pose = {.Position = {-Half - 0.01f, 0, 0}, .Orientation = {0, 0, 0, 1}}, .Density = 0});
-    Index previous = anchor;
+    Index previous = world.AddBody({.Pose = At(float3{-Half - 0.01f, 0, 0}), .Density = 0});
     for (uint32_t i = 0; i < links; ++i) {
         const float x = 1.02f * float(i);
-        const auto link = world.AddBody({.Pose = {.Position = {x, 0, 0}, .Orientation = {0, 0, 0, 1}}, .Shape = shape, .Density = Density});
+        const auto link = Place(world, shape, float3{x, 0, 0});
         world.AddJoint({.BodyA = previous, .BodyB = link, .At = {x - Half - 0.01f, 0, 0}});
         previous = link;
     }
@@ -79,12 +78,8 @@ void Chain(World &world, uint32_t links) {
 // resumable mesh gather runs its batch loop ten or so times a step. The configuration a fixed gather
 // cap dropped through the floor.
 bool Slab(World &world, float half_width) {
-    if (FloorMesh(world, 64) == NoIndex) return false;
-    world.AddBody({.Shape = 0, .Friction = Friction});
-    world.AddBody({.Pose = {.Position = {0, 0.25f, 0}, .Orientation = {0, 0, 0, 1}},
-                   .Shape = world.AddShape({.HalfExtents = {half_width, 0.25f, half_width}, .Kind = ShapeBox}),
-                   .Density = Density,
-                   .Friction = Friction});
+    if (!AddMeshFloor(world, 64)) return false;
+    Place(world, world.AddShape({.HalfExtents = {half_width, 0.25f, half_width}, .Kind = ShapeBox}), float3{0, 0.25f, 0});
     return true;
 }
 
@@ -92,14 +87,11 @@ bool Slab(World &world, float half_width) {
 // scale, which makes it the series to read the narrowphase's N^2 slope from.
 void Lattice(World &world, uint32_t across, uint32_t deep, uint32_t high) {
     const auto shape = world.AddShape(UnitBox);
-    world.AddBody({.Shape = world.AddShape(GroundPlane), .Friction = Friction});
+    AddGround(world);
     for (uint32_t x = 0; x < across; ++x)
         for (uint32_t z = 0; z < deep; ++z)
             for (uint32_t y = 0; y < high; ++y)
-                world.AddBody({.Pose = {.Position = {1.5f * float(x), Half + 1.02f * float(y), 1.5f * float(z)}, .Orientation = {0, 0, 0, 1}},
-                               .Shape = shape,
-                               .Density = Density,
-                               .Friction = Friction});
+                Place(world, shape, float3{1.5f * float(x), Half + 1.02f * float(y), 1.5f * float(z)});
 }
 
 struct Result {
@@ -125,8 +117,7 @@ int main(int argc, char **argv) {
 
     const std::string power = FirstLine("pmset -g batt");
     const bool on_ac = power.contains("AC Power");
-    std::println("RbpBench: {}, {}, {} timed steps after {} warmup, sleeping off",
-                 FirstLine("sysctl -n machdep.cpu.brand_string"), on_ac ? "AC power" : "ON BATTERY", timed, warmup);
+    std::println("RbpBench: {}, {}, {} timed steps after {} warmup, sleeping off", FirstLine("sysctl -n machdep.cpu.brand_string"), on_ac ? "AC power" : "ON BATTERY", timed, warmup);
     if (!on_ac) std::println("!! on battery - these timings are noise, plug in and run again");
     // A hung sibling holding a Metal queue cost the heavier scenes 2-3x while the light ones read
     // clean, so the poison is quiet exactly where a spot check would look. Refuse to share the GPU
@@ -176,8 +167,7 @@ int main(int argc, char **argv) {
             sample = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
         }
         std::ranges::sort(ms);
-        uint32_t rows = 0, colors = 0;
-        for (uint32_t slot = 0; slot < world.Contacts.Capacity; ++slot) rows += world.Contacts[slot].Active ? 1 : 0;
+        uint32_t colors = 0;
         // The colouring the scene settled on, which with the extra dispatched to grow into is the
         // sweep count a step pays.
         for (uint32_t body = 0; body < world.BodyCount(); ++body) colors = std::max(colors, ColorOf(world.Colors[body]) + 1);
@@ -190,7 +180,7 @@ int main(int argc, char **argv) {
             for (uint32_t c = 0; c < colors; ++c) std::print("c{}={} ", c, spread[c]);
             std::println("");
         }
-        results.push_back({name, world.BodyCount(), rows, colors, ms.front(), Percentile(ms, 0.5), Percentile(ms, 0.9), ms.back()});
+        results.push_back({name, world.BodyCount(), ActiveContacts(world), colors, ms.front(), Percentile(ms, 0.5), Percentile(ms, 0.9), ms.back()});
     };
 
     bench("floor", [](World &world) { return BuildStack(world, 1), true; });
@@ -207,15 +197,11 @@ int main(int argc, char **argv) {
     // with nothing else in flight to hide behind - and 25 bodies pay ~1.2 us. The ratio of this line
     // to slab1m's is the standing check on that amortization.
     bench("slabs25", [](World &world) {
-        if (FloorMesh(world, 64) == NoIndex) return false;
-        world.AddBody({.Shape = 0, .Friction = Friction});
+        if (!AddMeshFloor(world, 64)) return false;
         const auto shape = world.AddShape({.HalfExtents = {0.5f, 0.25f, 0.5f}, .Kind = ShapeBox});
         for (uint32_t x = 0; x < 5; ++x)
             for (uint32_t z = 0; z < 5; ++z)
-                world.AddBody({.Pose = {.Position = {3.0f * float(x) - 6, 0.25f, 3.0f * float(z) - 6}, .Orientation = {0, 0, 0, 1}},
-                               .Shape = shape,
-                               .Density = Density,
-                               .Friction = Friction});
+                Place(world, shape, float3{3.0f * float(x) - 6, 0.25f, 3.0f * float(z) - 6});
         return true;
     });
     bench("lattice125", [](World &world) { return Lattice(world, 5, 5, 5), true; });

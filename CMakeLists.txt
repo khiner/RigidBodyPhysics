@@ -18,6 +18,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Emit build/compile_commands.json for cla
 # -O1, not -O2: Homebrew clang 22.1.8 miscompiles vector growth at -O2, and the failure is silent.
 # probes/VectorMiscompile.cpp is the reproducer, re-checkable with OPT=-O2 ./run VectorMiscompile.
 set(CMAKE_CXX_FLAGS "-O1 -stdlib=libc++")
+# On every target here and in tests/, which are all first-party. Designated initializers leave the
+# fields they do not name at their defaults on purpose, which is what the third one is for.
+add_compile_options(-Wall -Wextra -Wno-missing-field-initializers)
 add_link_options("-L${HomebrewLlvm}/lib/c++" "-Wl,-rpath,${HomebrewLlvm}/lib/c++")
 
 # Metal is compiled at runtime from embedded source, which keeps the build off Xcode's Metal
@@ -50,15 +53,12 @@ add_library(rbp STATIC
 target_sources(rbp PRIVATE ${GeneratedGpuSource})
 target_include_directories(rbp PUBLIC src ${CMAKE_BINARY_DIR}/gen SYSTEM PUBLIC lib/metal-cpp)
 target_link_libraries(rbp PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
-target_compile_options(rbp PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 
 add_executable(RbpScenes tools/Scenes.cpp)
 target_link_libraries(RbpScenes PRIVATE rbp)
-target_compile_options(RbpScenes PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 
 add_executable(RbpBench tools/Bench.cpp)
 target_link_libraries(RbpBench PRIVATE rbp)
-target_compile_options(RbpBench PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 
 enable_testing()
 add_subdirectory(tests)

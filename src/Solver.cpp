@@ -3,42 +3,14 @@
 #include "GpuSource.h"
 
 #include <algorithm>
+#include <string_view>
 
 namespace {
-// The argument table slots the kernels declare. One table, bound once, since every pass reads from
-// the same world.
-enum Binding : uint32_t { PosesAt,
-                          InitialAt,
-                          InertialAt,
-                          VelocitiesAt,
-                          MassesAt,
-                          ContactsAt,
-                          BodyShapesAt,
-                          ParamsAt,
-                          ShapesAt,
-                          PreviousVelocitiesAt,
-                          FrictionsAt,
-                          SolvedAt,
-                          ColorsAt,
-                          NextColorsAt,
-                          CursorAt,
-                          RestitutionsAt,
-                          JointsAt,
-                          IncomingAt,
-                          IncomingSlotsAt,
-                          FiltersAt,
-                          JointedAt,
-                          QuietAt,
-                          RestPosesAt,
-                          NextQuietAt,
-                          ContactEventsAt,
-                          ContactEventCountsAt,
-                          ContactRefusalsAt,
-                          ShapeVerticesAt,
-                          TrianglesAt,
-                          BvhNodesAt,
-                          HullFacesAt,
-                          BindingCount };
+// The one argument-table slot a step rebinds, and how many there are in all. Every other slot is
+// bound once in Step, from the list there - which is why the numbers live in that list and in
+// Solve.metal's [[buffer(n)]] indices and nowhere else.
+constexpr uint32_t CursorAt = 14;
+constexpr uint32_t BindingCount = 31;
 
 // How many times the restitution pass sweeps its contacts. It is Jacobi - every contact computes an
 // impulse from one velocity snapshot and a gather applies them - so a manifold's points each answer for
@@ -62,31 +34,41 @@ uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
         if (world.Masses[body].InvMass > 0) used = std::max(used, ColorOf(world.Colors[body]) + 1);
     return std::clamp(used + 1, 1u, std::min(settings.MaxColors, MaxSupportedColors));
 }
+
+// The kernel each pass runs, in the order Solver::Pass names them. A prefix is where a #define goes
+// when one kernel text has to be compiled more than one way.
+constexpr struct {
+    const char *Name;
+    std::string_view Prefix;
+} Kernels[]{
+    {"Integrate"},
+    {"CollectContacts"},
+    {"CountIncoming"},
+    {"ScanIncoming"},
+    {"FillIncoming"},
+    {"SortIncoming"},
+    {"PrepareJoints"},
+    {"WarmStart"},
+    {"UpdateColors"},
+    {"PublishColors"},
+    {"SolveBodies"},
+    {"PublishPoses"},
+    {"UpdateDuals"},
+    {"UpdateJointDuals"},
+    {"Finalize"},
+    {"Restitution"},
+    {"ApplyRestitution"},
+    {"SolveBodies", "#define STABILIZE 1"},
+    {"CountQuiet"},
+    {"SpreadWaking"},
+    {"PublishWaking"},
+};
 } // namespace
 
 Solver::Solver(const mtl::Context &context) : Context(context) {
-    IntegratePipeline = context.Pipeline(gpu::SolveSource, "Integrate");
-    CollectPipeline = context.Pipeline(gpu::SolveSource, "CollectContacts");
-    WarmStartPipeline = context.Pipeline(gpu::SolveSource, "WarmStart");
-    PrepareJointsPipeline = context.Pipeline(gpu::SolveSource, "PrepareJoints");
-    SpreadWakingPipeline = context.Pipeline(gpu::SolveSource, "SpreadWaking");
-    PublishWakingPipeline = context.Pipeline(gpu::SolveSource, "PublishWaking");
-    CountIncomingPipeline = context.Pipeline(gpu::SolveSource, "CountIncoming");
-    ScanIncomingPipeline = context.Pipeline(gpu::SolveSource, "ScanIncoming");
-    FillIncomingPipeline = context.Pipeline(gpu::SolveSource, "FillIncoming");
-    SortIncomingPipeline = context.Pipeline(gpu::SolveSource, "SortIncoming");
-    JointDualPipeline = context.Pipeline(gpu::SolveSource, "UpdateJointDuals");
-    SolvePipeline = context.Pipeline(gpu::SolveSource, "SolveBodies");
-    DualPipeline = context.Pipeline(gpu::SolveSource, "UpdateDuals");
-    FinalizePipeline = context.Pipeline(gpu::SolveSource, "Finalize");
-    RestitutionPipeline = context.Pipeline(gpu::SolveSource, "Restitution");
-    ApplyRestitutionPipeline = context.Pipeline(gpu::SolveSource, "ApplyRestitution");
-    CountQuietPipeline = context.Pipeline(gpu::SolveSource, "CountQuiet");
-    // The same text again, with the C0 term kept, for the stabilization pass at the end of a step.
-    StabilizePipeline = context.Pipeline(gpu::SolveSource, "SolveBodies", "#define STABILIZE 1");
-    PublishPipeline = context.Pipeline(gpu::SolveSource, "PublishPoses");
-    ColorPipeline = context.Pipeline(gpu::SolveSource, "UpdateColors");
-    PublishColorPipeline = context.Pipeline(gpu::SolveSource, "PublishColors");
+    static_assert(std::size(Kernels) == PassCount, "one kernel per pass, in the enum's order");
+    for (uint32_t pass = 0; pass < PassCount; ++pass)
+        Pipelines[pass] = context.Pipeline(gpu::SolveSource, Kernels[pass].Name, Kernels[pass].Prefix);
 
     NS::Error *error{};
     auto descriptor = mtl::Make<MTL4::ArgumentTableDescriptor>();
@@ -111,7 +93,8 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
 
 Solver::~Solver() { Context.Queue->removeResidencySet(Residency.get()); }
 
-void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, MTL::ComputePipelineState *pipeline, uint32_t threads) const {
+void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads) const {
+    MTL::ComputePipelineState *pipeline = Pipelines[pass].get();
     // Every pass reads what the one before it wrote, so every one of them earns its barrier.
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     encoder->setComputePipelineState(pipeline);
@@ -145,42 +128,46 @@ void Solver::Step(World &world, const StepSettings &settings) {
         .JointCount = joints,
         .MaxColors = colors,
     };
-    Table->setAddress(world.Poses.Address(), PosesAt);
-    Table->setAddress(world.InitialPoses.Address(), InitialAt);
-    Table->setAddress(world.InertialPoses.Address(), InertialAt);
-    Table->setAddress(world.Velocities.Address(), VelocitiesAt);
-    Table->setAddress(world.Masses.Address(), MassesAt);
-    Table->setAddress(world.Contacts.Address(), ContactsAt);
-    Table->setAddress(world.BodyShapes.Address(), BodyShapesAt);
-    Table->setAddress(Params.Address(), ParamsAt);
-    Table->setAddress(world.Shapes.Address(), ShapesAt);
-    Table->setAddress(world.PreviousVelocities.Address(), PreviousVelocitiesAt);
-    Table->setAddress(world.Frictions.Address(), FrictionsAt);
-    Table->setAddress(world.SolvedPoses.Address(), SolvedAt);
-    Table->setAddress(world.Colors.Address(), ColorsAt);
-    Table->setAddress(world.NextColors.Address(), NextColorsAt);
-    Table->setAddress(world.Restitutions.Address(), RestitutionsAt);
-    Table->setAddress(world.Joints.Address(), JointsAt);
-    Table->setAddress(world.Incoming.Address(), IncomingAt);
-    Table->setAddress(world.IncomingSlots.Address(), IncomingSlotsAt);
-    Table->setAddress(world.Filters.Address(), FiltersAt);
-    Table->setAddress(world.Jointed.Address(), JointedAt);
-    Table->setAddress(world.Quiet.Address(), QuietAt);
-    Table->setAddress(world.RestPoses.Address(), RestPosesAt);
-    Table->setAddress(world.NextQuiet.Address(), NextQuietAt);
-    Table->setAddress(world.ContactEvents.Address(), ContactEventsAt);
-    Table->setAddress(world.ContactEventCounts.Address(), ContactEventCountsAt);
-    Table->setAddress(world.ContactRefusals.Address(), ContactRefusalsAt);
-    Table->setAddress(world.ShapeVertices.Address(), ShapeVerticesAt);
-    Table->setAddress(world.Triangles.Address(), TrianglesAt);
-    Table->setAddress(world.BvhNodes.Address(), BvhNodesAt);
-    Table->setAddress(world.HullFaces.Address(), HullFacesAt);
+    // Every buffer the kernels declare, at the slot it declares it in, so this list is the argument
+    // table's layout rather than a mirror of one. Params and the colour cursor are the solver's own,
+    // and the cursor is pointed at one colour's slot at a time by Encode.
+    const uint64_t bindings[]{
+        world.Poses.Address(), // 0
+        world.InitialPoses.Address(), // 1
+        world.InertialPoses.Address(), // 2
+        world.Velocities.Address(), // 3
+        world.Masses.Address(), // 4
+        world.Contacts.Address(), // 5
+        world.BodyShapes.Address(), // 6
+        Params.Address(), // 7
+        world.Shapes.Address(), // 8
+        world.PreviousVelocities.Address(), // 9
+        world.Frictions.Address(), // 10
+        world.SolvedPoses.Address(), // 11
+        world.Colors.Address(), // 12
+        world.NextColors.Address(), // 13
+        ColorCursor.Address(), // 14
+        world.Restitutions.Address(), // 15
+        world.Joints.Address(), // 16
+        world.Incoming.Address(), // 17
+        world.IncomingSlots.Address(), // 18
+        world.Filters.Address(), // 19
+        world.Jointed.Address(), // 20
+        world.Quiet.Address(), // 21
+        world.RestPoses.Address(), // 22
+        world.NextQuiet.Address(), // 23
+        world.ContactEvents.Address(), // 24
+        world.ContactEventCounts.Address(), // 25
+        world.ContactRefusals.Address(), // 26
+        world.ShapeVertices.Address(), // 27
+        world.Triangles.Address(), // 28
+        world.BvhNodes.Address(), // 29
+        world.HullFaces.Address(), // 30
+    };
+    static_assert(sizeof(bindings) / sizeof(bindings[0]) == BindingCount, "one address per slot the table holds");
+    for (uint32_t slot = 0; slot < BindingCount; ++slot) Table->setAddress(bindings[slot], slot);
 
-    Encode({.Bodies = bodies,
-            .Joints = joints,
-            .Iterations = settings.Iterations,
-            .Colors = colors,
-            .ColoringPasses = settings.ColoringPasses});
+    Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses});
 
     // Queue signalling is what safely publishes the GPU's writes to the host, per Architecture.md.
     const MTL4::CommandBuffer *list[]{Commands.get()};
@@ -204,47 +191,47 @@ void Solver::Encode(const Recording &recording) {
 
     // A colour pass per colour, so the cursor comes back in phase at the end of every sweep and the
     // step always starts on colour zero without anyone having to reset it.
-    const auto sweep = [&](MTL::ComputePipelineState *primal) {
+    const auto sweep = [&](Pass primal) {
         for (uint32_t color = 0; color < recording.Colors; ++color) {
             Table->setAddress(ColorCursor.Address() + color * sizeof(uint32_t), CursorAt);
             Dispatch(encoder, primal, bodies);
-            Dispatch(encoder, PublishPipeline.get(), bodies);
+            Dispatch(encoder, PublishPass, bodies);
         }
     };
 
-    Dispatch(encoder, IntegratePipeline.get(), bodies);
+    Dispatch(encoder, IntegratePass, bodies);
     // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from,
     // and only then does WarmStart move the body to its starting guess - which is the order the
     // reference solves in and the only one where the Taylor series is expanded about the pose it is
     // measured at.
-    Dispatch(encoder, CollectPipeline.get(), bodies);
+    Dispatch(encoder, CollectPass, bodies);
     // Gather each body's contacts-as-B into a run of its own, so nothing below has to sweep the pool.
-    Dispatch(encoder, CountIncomingPipeline.get(), slots);
-    Dispatch(encoder, ScanIncomingPipeline.get(), 1);
-    Dispatch(encoder, FillIncomingPipeline.get(), slots);
-    Dispatch(encoder, SortIncomingPipeline.get(), bodies);
-    if (joints > 0) Dispatch(encoder, PrepareJointsPipeline.get(), joints);
-    Dispatch(encoder, WarmStartPipeline.get(), bodies);
+    Dispatch(encoder, CountIncomingPass, slots);
+    Dispatch(encoder, ScanIncomingPass, 1);
+    Dispatch(encoder, FillIncomingPass, slots);
+    Dispatch(encoder, SortIncomingPass, bodies);
+    if (joints > 0) Dispatch(encoder, PrepareJointsPass, joints);
+    Dispatch(encoder, WarmStartPass, bodies);
     for (uint32_t pass = 0; pass < recording.ColoringPasses; ++pass) {
-        Dispatch(encoder, ColorPipeline.get(), bodies);
-        Dispatch(encoder, PublishColorPipeline.get(), bodies);
+        Dispatch(encoder, ColorPass, bodies);
+        Dispatch(encoder, PublishColorPass, bodies);
     }
     for (uint32_t iteration = 0; iteration < recording.Iterations; ++iteration) {
-        sweep(SolvePipeline.get());
-        Dispatch(encoder, DualPipeline.get(), slots);
-        if (joints > 0) Dispatch(encoder, JointDualPipeline.get(), joints);
+        sweep(SolvePass);
+        Dispatch(encoder, DualPass, slots);
+        if (joints > 0) Dispatch(encoder, JointDualPass, joints);
     }
     // Velocity comes from the motion the iterations above produced, and is taken before the pass
     // below, so removing leftover penetration does not hand the body the energy that motion implies.
-    Dispatch(encoder, FinalizePipeline.get(), bodies);
+    Dispatch(encoder, FinalizePass, bodies);
     // Restitution, which is a velocity pass on that velocity rather than a row inside the solve - see
     // Restitution for why a gapped contact leaves it no choice. It runs before sleeping is counted,
     // since a body just handed a rebound is not a body that has come to rest.
     for (uint32_t pass = 0; pass < RestitutionPasses; ++pass) {
-        Dispatch(encoder, RestitutionPipeline.get(), slots);
-        Dispatch(encoder, ApplyRestitutionPipeline.get(), bodies);
+        Dispatch(encoder, RestitutionPass, slots);
+        Dispatch(encoder, ApplyRestitutionPass, bodies);
     }
-    sweep(StabilizePipeline.get());
+    sweep(StabilizePass);
     // Whose turn it is to sleep is settled at the very end of a step, after the stabilization sweep, so
     // a body's sleep state is one answer for every kernel of a step. Published before the sweep
     // instead, a body the spread wakes runs a stabilization pass for a step it slept through: it was
@@ -252,9 +239,9 @@ void Solver::Encode(const Recording &recording) {
     // contact duals still carry the upward force balancing gravity - so the pass moves it M g / H out
     // of its rest pose with no velocity, and the body above inherits that as penetration at full
     // penalty. A settled ten-coin stack collapsed from nothing else.
-    Dispatch(encoder, CountQuietPipeline.get(), bodies);
-    Dispatch(encoder, SpreadWakingPipeline.get(), bodies);
-    Dispatch(encoder, PublishWakingPipeline.get(), bodies);
+    Dispatch(encoder, CountQuietPass, bodies);
+    Dispatch(encoder, SpreadWakingPass, bodies);
+    Dispatch(encoder, PublishWakingPass, bodies);
 
     encoder->endEncoding();
     Commands->endCommandBuffer();

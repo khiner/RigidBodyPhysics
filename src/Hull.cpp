@@ -109,8 +109,7 @@ std::vector<Face> BuildFaces(std::span<const float3> points, float epsilon) {
     // Wind the base away from the fourth point, and the other three faces follow from its edges.
     const bool flip = dot(base.Normal, points[fourth]) - base.Offset > 0;
     const uint32_t a = first, b = flip ? third : second, c = flip ? second : third;
-    std::vector<Face> faces{MakeFace(points, a, b, c), MakeFace(points, b, a, fourth),
-                            MakeFace(points, c, b, fourth), MakeFace(points, a, c, fourth)};
+    std::vector<Face> faces{MakeFace(points, a, b, c), MakeFace(points, b, a, fourth), MakeFace(points, c, b, fourth), MakeFace(points, a, c, fourth)};
 
     std::vector<std::pair<uint32_t, uint32_t>> rim;
     for (uint32_t i = 0; i < points.size(); ++i) {
@@ -224,9 +223,7 @@ std::vector<Loop> MergeCoplanar(std::span<const float3> points, std::span<const 
         if (loop.Corner.size() != rim.size()) {
             for (const uint32_t member : members)
                 if (has_area(member))
-                    loops.push_back({.Corner = {faces[member].Corner[0], faces[member].Corner[1], faces[member].Corner[2]},
-                                     .Normal = faces[member].Normal,
-                                     .Offset = faces[member].Offset});
+                    loops.push_back({.Corner = {faces[member].Corner[0], faces[member].Corner[1], faces[member].Corner[2]}, .Normal = faces[member].Normal, .Offset = faces[member].Offset});
             continue;
         }
         loops.push_back(std::move(loop));
@@ -311,8 +308,7 @@ CookedHull CookHull(std::span<const float3> points) {
     // frames came out with a different number of faces.
     float carried = 0;
     for (const float3 point : points) carried = std::max(carried, std::abs(point.x) + std::abs(point.y) + std::abs(point.z));
-    const float epsilon = std::max(1e-6f * std::max({high.x - low.x, high.y - low.y, high.z - low.z, 1e-6f}),
-                                   3 * std::numeric_limits<float>::epsilon() * carried);
+    const float epsilon = std::max(1e-6f * std::max({high.x - low.x, high.y - low.y, high.z - low.z, 1e-6f}), 3 * std::numeric_limits<float>::epsilon() * carried);
 
     const float3 origin = 0.5f * (low + high);
     std::vector<float3> centred;
@@ -358,10 +354,7 @@ CookedHull CookHull(std::span<const float3> points) {
     if (dot(cross(x, y), z) < 0) x = -x;
 
     // A moment of inertia is the spread away from an axis, so each one is what the other two carry.
-    CookedHull cooked{.Volume = float(volume),
-                      .Inertia = {float(spread.y + spread.z), float(spread.x + spread.z), float(spread.x + spread.y)},
-                      .Frame = {.Position = origin + float3{float(center.x), float(center.y), float(center.z)},
-                                .Orientation = QuatFromAxes(x, y, z)}};
+    CookedHull cooked{.Volume = float(volume), .Inertia = {float(spread.y + spread.z), float(spread.x + spread.z), float(spread.x + spread.y)}, .Frame = {.Position = origin + float3{float(center.x), float(center.y), float(center.z)}, .Orientation = QuatFromAxes(x, y, z)}};
     // Only the points the hull actually kept, in the frame it was moved into: the vertex a support
     // function has to search is a corner of the solid, and an interior point can never be one.
     std::vector<uint32_t> corners;

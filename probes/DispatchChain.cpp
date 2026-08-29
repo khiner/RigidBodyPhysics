@@ -52,19 +52,28 @@ kernel void Step(device float *data [[buffer(0)]], constant StepParams &p [[buff
 }
 )";
 
-struct StepParams { uint32_t Count, Work; };
+struct StepParams {
+    uint32_t Count, Work;
+};
 
 constexpr uint32_t ThreadsPerGroup = 256;
 
-enum class Mode { Barrier, Encoders, Buffers, NoBarrier };
+enum class Mode { Barrier,
+                  Encoders,
+                  Buffers,
+                  NoBarrier };
 constexpr Mode Modes[]{Mode::Barrier, Mode::Encoders, Mode::Buffers, Mode::NoBarrier};
 constexpr std::string_view ModeNames[]{"encoder barrier", "encoder per pass", "buffer per pass", "no barrier"};
 std::string_view Name(Mode mode) { return ModeNames[size_t(mode)]; }
 
 // Seconds. Committed is absolute until the GPU stamps are folded against it.
-struct Sample { double Committed, Encode, Commit, Start, Gpu, Readable; };
+struct Sample {
+    double Committed, Encode, Commit, Start, Gpu, Readable;
+};
 
-struct Stats { double Gpu50, Gpu99, Encode50, Start50, Readable50; };
+struct Stats {
+    double Gpu50, Gpu99, Encode50, Start50, Readable50;
+};
 
 constexpr uint32_t WarmupIterations = 64;
 constexpr double RampSeconds = 0.25; // back-to-back submission until the GPU clocks settle
@@ -78,7 +87,9 @@ struct AutoreleasePool {
     ~AutoreleasePool() { objc_autoreleasePoolPop(Token); }
 };
 
-void WaitUntil(MTL::SharedEvent *event, uint64_t value) { while (!event->waitUntilSignaledValue(value, 1000)) {} }
+void WaitUntil(MTL::SharedEvent *event, uint64_t value) {
+    while (!event->waitUntilSignaledValue(value, 1000)) {}
+}
 
 template<typename T> NS::SharedPtr<T> Make() { return NS::TransferPtr(T::alloc()->init()); }
 
@@ -255,9 +266,7 @@ struct Probe {
         for (auto &sample : samples) sample.Start -= sample.Committed;
 
         const auto steady = std::span<const Sample>(samples).subspan(WarmupIterations);
-        return {.Gpu50 = Pct(steady, &Sample::Gpu, .5), .Gpu99 = Pct(steady, &Sample::Gpu, .99),
-                .Encode50 = Pct(steady, &Sample::Encode, .5), .Start50 = Pct(steady, &Sample::Start, .5),
-                .Readable50 = Pct(steady, &Sample::Readable, .5)};
+        return {.Gpu50 = Pct(steady, &Sample::Gpu, .5), .Gpu99 = Pct(steady, &Sample::Gpu, .99), .Encode50 = Pct(steady, &Sample::Encode, .5), .Start50 = Pct(steady, &Sample::Start, .5), .Readable50 = Pct(steady, &Sample::Readable, .5)};
     }
 
     // A chain of `chain` increments from zero must land on exactly `chain` if the ordering held.
@@ -295,11 +304,9 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> chains;
     for (uint32_t chain = 1; chain <= max_chain; chain *= 2) chains.push_back(chain);
 
-    std::println("--- dependent dispatch chains on {}, {} threadgroups x {} threads, work {}, {} iterations ---",
-                 probe.Device->name()->utf8String(), groups, ThreadsPerGroup, work, iterations);
+    std::println("--- dependent dispatch chains on {}, {} threadgroups x {} threads, work {}, {} iterations ---", probe.Device->name()->utf8String(), groups, ThreadsPerGroup, work, iterations);
     std::println("Submitted back to back onto a ramped GPU, which is the cheapest a link ever gets.");
-    std::println("{:<17} {:>6} {:>10} {:>10} {:>10} {:>12} {:>12}", "mode", "chain", "gpu p50", "gpu p99",
-                 "per link", "cpu encode", "commit->read");
+    std::println("{:<17} {:>6} {:>10} {:>10} {:>10} {:>12} {:>12}", "mode", "chain", "gpu p50", "gpu p99", "per link", "cpu encode", "commit->read");
     std::vector<std::pair<Mode, double>> per_link;
     for (auto mode : Modes) {
         double first = 0, last = 0;
@@ -308,10 +315,8 @@ int main(int argc, char **argv) {
             const auto stats = probe.Measure(mode, chain, groups, work, iterations);
             if (chain == chains.front()) first = stats.Gpu50;
             last = stats.Gpu50;
-            const auto link = chain == chains.front() ? std::string("-")
-                                                     : std::format("{:.2f}u", PerLink(first, stats.Gpu50, chains.front(), chain));
-            std::println("{:<17} {:>6} {:>9.1f}u {:>9.1f}u {:>10} {:>11.1f}u {:>11.1f}u", Name(mode), chain,
-                         stats.Gpu50, stats.Gpu99, link, stats.Encode50, stats.Readable50);
+            const auto link = chain == chains.front() ? std::string("-") : std::format("{:.2f}u", PerLink(first, stats.Gpu50, chains.front(), chain));
+            std::println("{:<17} {:>6} {:>9.1f}u {:>9.1f}u {:>10} {:>11.1f}u {:>11.1f}u", Name(mode), chain, stats.Gpu50, stats.Gpu99, link, stats.Encode50, stats.Readable50);
         }
         per_link.emplace_back(mode, PerLink(first, last, chains.front(), max_chain));
     }
@@ -322,13 +327,11 @@ int main(int argc, char **argv) {
         probe.Ramp();
         const auto solo = probe.Measure(Mode::Barrier, 1, work_groups, work, iterations);
         const auto chained = probe.Measure(Mode::Barrier, max_chain, work_groups, work, iterations);
-        std::println("{:<10} {:>10} {:>9.1f}u {:>9.1f}u {:>11.2f}u", work_groups, work_groups * ThreadsPerGroup,
-                     solo.Gpu50, chained.Gpu50, PerLink(solo.Gpu50, chained.Gpu50, 1, max_chain));
+        std::println("{:<10} {:>10} {:>9.1f}u {:>9.1f}u {:>11.2f}u", work_groups, work_groups * ThreadsPerGroup, solo.Gpu50, chained.Gpu50, PerLink(solo.Gpu50, chained.Gpu50, 1, max_chain));
     }
 
     std::println("\n--- the same chain paid out on a tick, so the GPU idles in between ---");
-    std::println("{:<14} {:>10} {:>10} {:>10} {:>13} {:>13}", "tick", "gpu p50", "gpu p99", "per link",
-                 "commit->start", "commit->read");
+    std::println("{:<14} {:>10} {:>10} {:>10} {:>13} {:>13}", "tick", "gpu p50", "gpu p99", "per link", "commit->start", "commit->read");
     double tick_link = 0;
     for (auto tick : TickRates) {
         probe.Ramp();
@@ -337,8 +340,7 @@ int main(int argc, char **argv) {
         const auto link = PerLink(solo.Gpu50, chained.Gpu50, 1, max_chain);
         if (tick == 60) tick_link = link;
         const auto label = tick == 0 ? std::string("back to back") : std::format("{:g} Hz", tick);
-        std::println("{:<14} {:>9.1f}u {:>9.1f}u {:>9.2f}u {:>12.1f}u {:>12.1f}u", label, chained.Gpu50,
-                     chained.Gpu99, link, chained.Start50, chained.Readable50);
+        std::println("{:<14} {:>9.1f}u {:>9.1f}u {:>9.2f}u {:>12.1f}u {:>12.1f}u", label, chained.Gpu50, chained.Gpu99, link, chained.Start50, chained.Readable50);
     }
 
     std::println("\n--- ordering check, chain {} of increments from zero ---", max_chain);
@@ -347,9 +349,7 @@ int main(int argc, char **argv) {
 
     std::println("\n--- budget ---");
     for (auto [mode, link] : per_link)
-        std::println("{:<17} {:>7.2f} us per link ramped: {:>6.0f} links in a 16.67 ms tick, {:>6.0f} in 8.33 ms, {:>5.0f} in 2.00 ms",
-                     Name(mode), link, 16.667e3 / link, 8.333e3 / link, 2e3 / link);
-    std::println("{:<17} {:>7.2f} us per link on a 60 Hz tick: {:>6.0f} links in a 16.67 ms tick",
-                 Name(Mode::Barrier), tick_link, 16.667e3 / tick_link);
+        std::println("{:<17} {:>7.2f} us per link ramped: {:>6.0f} links in a 16.67 ms tick, {:>6.0f} in 8.33 ms, {:>5.0f} in 2.00 ms", Name(mode), link, 16.667e3 / link, 8.333e3 / link, 2e3 / link);
+    std::println("{:<17} {:>7.2f} us per link on a 60 Hz tick: {:>6.0f} links in a 16.67 ms tick", Name(Mode::Barrier), tick_link, 16.667e3 / tick_link);
     return 0;
 }

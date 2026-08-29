@@ -4,6 +4,7 @@
 #include "Mesh.h"
 
 #include <algorithm>
+#include <numbers>
 #include <utility>
 
 namespace {
@@ -20,9 +21,18 @@ Index TakeSlot(std::vector<Index> &free, uint32_t &used, uint32_t capacity, uint
     ++overflow;
     return NoIndex;
 }
+
+// A free slot at the end of a pool is a thread in every dispatch and a slot every sweep over the pool
+// looks at, so the tail comes back while it is free. `live` answers for the last slot; one that is
+// neither live nor on the free list is a body retired this step, which has to keep its place until the
+// next step has reported what left it, and stops the trim there.
+void TrimTail(uint32_t &used, std::vector<Index> &free, const auto &live) {
+    while (used > 0 && !live(used - 1) && std::erase(free, used - 1) != 0) --used;
+}
 } // namespace
 
 BodyMass MassProperties(const Shape &shape, float density, std::span<const float3> shape_vertices) {
+    constexpr float Pi = std::numbers::pi_v<float>;
     // A plane is unbounded, a mesh is a surface with no inside, and a zero-density body is static by
     // request. All three get zero inverse quantities, which is what keeps them fixed without the solve
     // needing to branch on a flag.
@@ -43,9 +53,8 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
         // the ends: their own second moment, plus the parallel axis carry, comes to h^2 + 3hr/4 once
         // the offset of a hemisphere's center of mass from its flat face cancels out of the algebra.
         const float radius = shape.Radius, half = shape.HalfExtents.y;
-        const float pi = 3.14159265358979f;
-        const float cylinder = density * pi * radius * radius * 2 * half;
-        const float caps = density * 4.f / 3 * pi * radius * radius * radius;
+        const float cylinder = density * Pi * radius * radius * 2 * half;
+        const float caps = density * 4.f / 3 * Pi * radius * radius * radius;
         const float along = cylinder * radius * radius / 2 + caps * 2.f / 5 * radius * radius;
         const float across = cylinder * (radius * radius / 4 + half * half / 3) +
             caps * (2.f / 5 * radius * radius + half * half + 3.f / 4 * half * radius);
@@ -55,7 +64,7 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
     if (shape.Kind == ShapeSphere) {
         // Solid sphere about its center: m = rho 4/3 pi r^3, and I = 2/5 m r^2 about every axis.
         const float radius = shape.Radius;
-        const float mass = density * 4.f / 3 * 3.14159265358979f * radius * radius * radius;
+        const float mass = density * 4.f / 3 * Pi * radius * radius * radius;
         const float inertia = 2.f / 5 * mass * radius * radius;
         return {.InvInertiaLocal = 1 / float3{inertia, inertia, inertia}, .InvMass = 1 / mass};
     }
@@ -70,41 +79,60 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
 
 World::World(const mtl::Context &context, WorldLimits limits) {
     auto *device = context.Device.get();
-    Poses = {device, limits.Bodies};
-    Velocities = {device, limits.Bodies};
-    Masses = {device, limits.Bodies};
-    BodyShapes = {device, limits.Bodies};
-    Shapes = {device, limits.Shapes};
-    ShapeVertices = {device, limits.ShapeVertices};
-    HullFaces = {device, limits.HullFaces};
-    Triangles = {device, limits.Triangles};
-    BvhNodes = {device, limits.BvhNodes};
-    Frictions = {device, limits.Bodies};
-    Restitutions = {device, limits.Bodies};
-    Filters = {device, limits.Bodies};
-    Jointed = {device, limits.Bodies * JointsPerBody};
-    InitialPoses = {device, limits.Bodies};
-    InertialPoses = {device, limits.Bodies};
-    PreviousVelocities = {device, limits.Bodies};
-    SolvedPoses = {device, limits.Bodies};
-    RestPoses = {device, limits.Bodies};
-    Quiet = {device, limits.Bodies};
-    NextQuiet = {device, limits.Bodies};
-    Colors = {device, limits.Bodies};
-    NextColors = {device, limits.Bodies};
+    // Metal 4 has no implicit residency tracking, so everything a kernel can reach lives in one set
+    // attached to the queue for the world's lifetime - and taken off it again when that ends, which is
+    // what the destructor is for. Allocated and made resident in the same breath, since a buffer that
+    // is one and not the other says nothing: the queue simply stops making things resident and the
+    // next step never returns.
+    NS::Error *error{};
+    Residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
+    const auto make = [&]<typename T>(mtl::Buffer<T> &buffer, uint32_t capacity) {
+        buffer = {device, capacity};
+        Residency->addAllocation(buffer.Handle.get());
+    };
+    // In the order World declares them, one per line, so the header's grouping by access pattern
+    // reads the same here.
+    make(Poses, limits.Bodies);
+    make(Velocities, limits.Bodies);
+    make(Masses, limits.Bodies);
+    make(BodyShapes, limits.Bodies);
+    make(Shapes, limits.Shapes);
+    make(ShapeVertices, limits.ShapeVertices);
+    make(HullFaces, limits.HullFaces);
+    make(Triangles, limits.Triangles);
+    make(BvhNodes, limits.BvhNodes);
+    make(Frictions, limits.Bodies);
+    make(Restitutions, limits.Bodies);
+    make(Filters, limits.Bodies);
+    make(Jointed, limits.Bodies * JointsPerBody);
+    make(InitialPoses, limits.Bodies);
+    make(InertialPoses, limits.Bodies);
+    make(PreviousVelocities, limits.Bodies);
+    make(SolvedPoses, limits.Bodies);
+    make(RestPoses, limits.Bodies);
+    make(Quiet, limits.Bodies);
+    make(NextQuiet, limits.Bodies);
+    make(Colors, limits.Bodies);
+    make(NextColors, limits.Bodies);
+    make(Contacts, limits.Bodies * ContactsPerBody);
+    make(Incoming, limits.Bodies);
+    make(IncomingSlots, limits.Bodies * ContactsPerBody);
+    make(ContactEvents, limits.Bodies * EventsPerBody);
+    make(ContactEventCounts, limits.Bodies);
+    make(ContactRefusals, limits.Bodies);
+    make(Joints, limits.Joints);
+    Residency->commit();
+    Residency->requestResidency();
+    Queue = context.Queue;
+    Queue->addResidencySet(Residency.get());
+
+    // What a kernel or the host reads before anything has written it. Colouring is incremental, a
+    // contact run is read for what it held last step, and Wake walks the incoming list.
     std::ranges::fill(Colors.All(), 0u);
-    Contacts = {device, limits.Bodies * ContactsPerBody};
-    std::ranges::fill(Contacts.All(), Contact{});
-    Incoming = {device, limits.Bodies};
-    IncomingSlots = {device, limits.Bodies * ContactsPerBody};
-    ContactEvents = {device, limits.Bodies * EventsPerBody};
-    ContactEventCounts = {device, limits.Bodies};
     std::ranges::fill(ContactEventCounts.All(), 0u);
-    ContactRefusals = {device, limits.Bodies};
     std::ranges::fill(ContactRefusals.All(), 0u);
-    Joints = {device, limits.Joints};
+    std::ranges::fill(Contacts.All(), Contact{});
     std::ranges::fill(Joints.All(), Joint{});
-    // Read by Wake before the first step has written one, so it has to mean something from the start.
     std::ranges::fill(Incoming.All(), Adjacency{});
 
     VertexPool.Capacity = limits.ShapeVertices;
@@ -113,18 +141,6 @@ World::World(const mtl::Context &context, WorldLimits limits) {
     NodePool.Capacity = limits.BvhNodes;
     LiveBodies.assign(limits.Bodies, 0);
     LiveShapes.assign(limits.Shapes, 0);
-
-    // Metal 4 has no implicit residency tracking, so everything a kernel can reach lives in one set
-    // attached to the queue for the world's lifetime - and taken off it again when that ends, which is
-    // what the destructor is for.
-    NS::Error *error{};
-    Residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
-    for (auto *buffer : {Poses.Handle.get(), Velocities.Handle.get(), Masses.Handle.get(), BodyShapes.Handle.get(), Shapes.Handle.get(), ShapeVertices.Handle.get(), HullFaces.Handle.get(), Triangles.Handle.get(), BvhNodes.Handle.get(), Frictions.Handle.get(), Restitutions.Handle.get(), Filters.Handle.get(), Jointed.Handle.get(), InitialPoses.Handle.get(), InertialPoses.Handle.get(), PreviousVelocities.Handle.get(), SolvedPoses.Handle.get(), RestPoses.Handle.get(), Quiet.Handle.get(), NextQuiet.Handle.get(), Colors.Handle.get(), NextColors.Handle.get(), Contacts.Handle.get(), Joints.Handle.get(), Incoming.Handle.get(), IncomingSlots.Handle.get(), ContactEvents.Handle.get(), ContactEventCounts.Handle.get(), ContactRefusals.Handle.get()})
-        Residency->addAllocation(buffer);
-    Residency->commit();
-    Residency->requestResidency();
-    Queue = context.Queue;
-    Queue->addResidencySet(Residency.get());
 }
 
 World::~World() {
@@ -150,7 +166,7 @@ Index World::RunPool::Take(uint32_t count) {
 }
 
 void World::RunPool::Give(Index start, uint32_t count) {
-    if (count == 0) return;
+    if (count == 0 || start == NoIndex) return; // a run the pool refused, so there is nothing to give back
     // Back onto the tail if that is where it came from, so a shape added and taken away again leaves
     // the pool exactly as it was rather than as a hole at the end of it.
     if (start + count == Used) {
@@ -202,25 +218,24 @@ Index World::AddShape(const Shape &shape) {
 
 Index World::AddHull(std::span<const float3> points, Pose *frame) {
     const CookedHull cooked = CookHull(points);
-    const uint32_t count = cooked.Vertices.size();
+    const uint32_t count = cooked.Vertices.size(), face_count = cooked.Faces.size();
     if (count == 0) return NoIndex; // no solid, so no shape to make of it
     if (frame != nullptr) *frame = cooked.Frame;
-    if (count > MaxHullVertices) return ++Overflow.ShapeVertices, NoIndex;
-    const Index first = VertexPool.Take(count);
-    if (first == NoIndex) return ++Overflow.ShapeVertices, NoIndex;
-    const uint32_t face_count = cooked.Faces.size();
+    // Both runs up front, and whichever pool refused first is the one the refusal is counted against.
+    const Index first = count > MaxHullVertices ? NoIndex : VertexPool.Take(count);
     const Index first_face = FacePool.Take(face_count);
-    if (first_face == NoIndex) {
-        VertexPool.Give(first, count);
-        return ++Overflow.HullFaces, NoIndex;
-    }
-    for (uint32_t i = 0; i < count; ++i) ShapeVertices[first + i] = cooked.Vertices[i];
-    for (uint32_t i = 0; i < face_count; ++i) HullFaces[first_face + i] = cooked.Faces[i];
-    const Index shape = AddShape({.FirstVertex = first, .VertexCount = count, .FirstFace = first_face, .FaceCount = face_count, .Kind = ShapeHull});
-    if (shape == NoIndex) { // the shape pool refused it, so give both runs back
+    uint32_t *refused = nullptr;
+    if (first == NoIndex) refused = &Overflow.ShapeVertices;
+    else if (first_face == NoIndex) refused = &Overflow.HullFaces;
+    const Index shape = refused != nullptr ? NoIndex : AddShape({.FirstVertex = first, .VertexCount = count, .FirstFace = first_face, .FaceCount = face_count, .Kind = ShapeHull});
+    if (shape == NoIndex) { // whoever refused it, give back every run this took
         VertexPool.Give(first, count);
         FacePool.Give(first_face, face_count);
+        if (refused != nullptr) ++*refused;
+        return NoIndex;
     }
+    std::ranges::copy(cooked.Vertices, ShapeVertices.All().begin() + first);
+    std::ranges::copy(cooked.Faces, HullFaces.All().begin() + first_face);
     return shape;
 }
 
@@ -228,21 +243,24 @@ Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> i
     const CookedMesh cooked = CookMesh(points, indices);
     if (cooked.Triangles.empty()) return NoIndex; // no surface, so no shape to make of it
     const uint32_t vertices = cooked.Vertices.size(), triangles = cooked.Triangles.size(), nodes = cooked.Nodes.size();
+    // All three runs up front, as AddHull takes its two, so one exit gives back whatever was taken.
     const Index first_vertex = VertexPool.Take(vertices);
-    if (first_vertex == NoIndex) return ++Overflow.ShapeVertices, NoIndex;
     const Index first_triangle = TrianglePool.Take(triangles);
-    if (first_triangle == NoIndex) {
-        VertexPool.Give(first_vertex, vertices);
-        return ++Overflow.Triangles, NoIndex;
-    }
     const Index root = NodePool.Take(nodes);
-    if (root == NoIndex) {
+    uint32_t *refused = nullptr;
+    if (first_vertex == NoIndex) refused = &Overflow.ShapeVertices;
+    else if (first_triangle == NoIndex) refused = &Overflow.Triangles;
+    else if (root == NoIndex) refused = &Overflow.BvhNodes;
+    const Index shape = refused != nullptr ? NoIndex : AddShape({.FirstVertex = first_vertex, .VertexCount = vertices, .FirstTriangle = first_triangle, .RootNode = root, .TriangleCount = triangles, .NodeCount = nodes, .Kind = ShapeMesh});
+    if (shape == NoIndex) {
         VertexPool.Give(first_vertex, vertices);
         TrianglePool.Give(first_triangle, triangles);
-        return ++Overflow.BvhNodes, NoIndex;
+        NodePool.Give(root, nodes);
+        if (refused != nullptr) ++*refused;
+        return NoIndex;
     }
 
-    for (uint32_t i = 0; i < vertices; ++i) ShapeVertices[first_vertex + i] = cooked.Vertices[i];
+    std::ranges::copy(cooked.Vertices, ShapeVertices.All().begin() + first_vertex);
     // Triangles index the pool absolutely, so a kernel reads a corner without knowing whose mesh it is.
     for (uint32_t i = 0; i < triangles; ++i) {
         Triangle triangle = cooked.Triangles[i];
@@ -252,20 +270,7 @@ Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> i
         Triangles[first_triangle + i] = triangle;
     }
     // Nodes stay relative to their own root, since a traversal starts there and knows where it is.
-    for (uint32_t i = 0; i < nodes; ++i) BvhNodes[root + i] = cooked.Nodes[i];
-
-    const Index shape = AddShape({.FirstVertex = first_vertex,
-                                  .VertexCount = vertices,
-                                  .FirstTriangle = first_triangle,
-                                  .RootNode = root,
-                                  .TriangleCount = triangles,
-                                  .NodeCount = nodes,
-                                  .Kind = ShapeMesh});
-    if (shape == NoIndex) { // the shape pool refused it, so give back everything it took
-        VertexPool.Give(first_vertex, vertices);
-        TrianglePool.Give(first_triangle, triangles);
-        NodePool.Give(root, nodes);
-    }
+    std::ranges::copy(cooked.Nodes, BvhNodes.All().begin() + root);
     return shape;
 }
 
@@ -289,7 +294,7 @@ Index World::AddBody(const BodyDesc &desc) {
     Frictions[index] = desc.Friction;
     Restitutions[index] = desc.Restitution;
     Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith};
-    for (uint32_t i = 0; i < JointsPerBody; ++i) Jointed[index * JointsPerBody + i] = NoIndex;
+    std::ranges::fill(JointedRun(index), NoIndex);
     Masses[index] = desc.Shape == NoIndex ? StaticMass : MassProperties(Shapes[desc.Shape], desc.Density, ShapeVertices.All());
     return index;
 }
@@ -302,11 +307,11 @@ Index World::AddJoint(const JointDesc &desc) {
     // The world point, remembered in each body's own frame, and the rotation between them as it
     // stands - so a joint holds whatever pose the bodies were in when it was made.
     if (!desc.Collide) { // remember each as the other's, so neither generates contacts against it
-        for (const auto pair : {std::pair{desc.BodyA, desc.BodyB}, std::pair{desc.BodyB, desc.BodyA}}) {
-            uint32_t at = 0;
-            while (at < JointsPerBody && Jointed[pair.first * JointsPerBody + at] != NoIndex) ++at;
-            if (at == JointsPerBody) ++Overflow.Jointed;
-            else Jointed[pair.first * JointsPerBody + at] = pair.second;
+        for (const auto [owner, partner] : {std::pair{desc.BodyA, desc.BodyB}, std::pair{desc.BodyB, desc.BodyA}}) {
+            const auto run = JointedRun(owner);
+            const auto gap = std::ranges::find(run, NoIndex);
+            if (gap == run.end()) ++Overflow.Jointed;
+            else *gap = partner;
         }
     }
     Joints[index] = {
@@ -361,14 +366,9 @@ bool World::RemoveJoint(Index joint) {
     if (joint >= NumJoints || !Joints[joint].Active) return false;
     const Joint &held = Joints[joint];
     if (held.Suppresses) { // undo exactly what AddJoint wrote, which is one entry each way and no more
-        for (const auto pair : {std::pair{held.BodyA, held.BodyB}, std::pair{held.BodyB, held.BodyA}}) {
-            for (uint32_t at = 0; at < JointsPerBody; ++at) {
-                if (Jointed[pair.first * JointsPerBody + at] != pair.second) continue;
-                // A hole rather than a compaction: the kernel that reads this run sweeps all of it and
-                // AddJoint fills at the first gap, so neither cares where the gap is.
-                Jointed[pair.first * JointsPerBody + at] = NoIndex;
-                break;
-            }
+        for (const auto [owner, partner] : {std::pair{held.BodyA, held.BodyB}, std::pair{held.BodyB, held.BodyA}}) {
+            const auto run = JointedRun(owner);
+            if (const auto at = std::ranges::find(run, partner); at != run.end()) *at = NoIndex;
         }
     }
     // Whatever the joint was holding up is now falling, and neither end will hear it from anything else.
@@ -377,12 +377,9 @@ bool World::RemoveJoint(Index joint) {
     Joints[joint].Active = 0;
     FreeJoints.push_back(joint);
     // A joint carries nothing from one step to the next that a kernel has to read first, so its slot
-    // is free at once. Give the tail back while it is free: every body scans the whole joint pool once
-    // a colour once an iteration, which is the most expensive place a dead slot could sit.
-    while (NumJoints > 0 && !Joints[NumJoints - 1].Active) {
-        std::erase(FreeJoints, NumJoints - 1);
-        --NumJoints;
-    }
+    // is free at once - and every body scans the whole joint pool once a colour once an iteration,
+    // which is the most expensive place a dead slot could sit.
+    TrimTail(NumJoints, FreeJoints, [this](Index at) { return Joints[at].Active != 0; });
     return true;
 }
 
@@ -399,10 +396,7 @@ bool World::RemoveShape(Index shape) {
     }
     LiveShapes[shape] = 0;
     FreeShapes.push_back(shape);
-    while (NumShapes > 0 && !LiveShapes[NumShapes - 1]) {
-        std::erase(FreeShapes, NumShapes - 1);
-        --NumShapes;
-    }
+    TrimTail(NumShapes, FreeShapes, [this](Index at) { return LiveShapes[at] != 0; });
     return true;
 }
 
@@ -429,11 +423,7 @@ void World::OnStepped() {
     // tenant. One step of a slot standing idle buys both.
     for (const Index body : RetiredBodies) FreeBodies.push_back(body);
     RetiredBodies.clear();
-    // And a free slot at the end of the pool is a thread in every dispatch, so give the tail back while
-    // it is free. After the promotion above and not before it: a body still waiting for its removals to
-    // be reported has to keep its place in the dispatch to report them.
-    while (NumBodies > 0 && !LiveBodies[NumBodies - 1]) {
-        if (std::erase(FreeBodies, NumBodies - 1) == 0) break; // retired rather than free
-        --NumBodies;
-    }
+    // And only then the tail, since a body still waiting for its removals to be reported has to keep
+    // its place in the dispatch to report them.
+    TrimTail(NumBodies, FreeBodies, [this](Index at) { return LiveBodies[at] != 0; });
 }

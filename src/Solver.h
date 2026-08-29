@@ -70,11 +70,38 @@ private:
         uint32_t Bodies{}, Joints{}, Iterations{}, Colors{}, ColoringPasses{};
     };
 
+    // The kernels a step is made of. Named here, spelled once in the table Solver.cpp builds them from,
+    // and dispatched by name below - so a pass exists in two places rather than in three.
+    enum Pass : uint32_t {
+        IntegratePass,
+        CollectPass,
+        CountIncomingPass,
+        ScanIncomingPass,
+        FillIncomingPass,
+        SortIncomingPass,
+        PrepareJointsPass,
+        WarmStartPass,
+        ColorPass,
+        PublishColorPass,
+        SolvePass,
+        PublishPass,
+        DualPass,
+        JointDualPass,
+        FinalizePass,
+        RestitutionPass,
+        ApplyRestitutionPass,
+        StabilizePass, // SolveBodies again, compiled with the C0 term kept
+        CountQuietPass,
+        SpreadWakingPass,
+        PublishWakingPass,
+        PassCount,
+    };
+
     void Encode(const Recording &); // which is the whole of what it reads, as above
-    void Dispatch(MTL4::ComputeCommandEncoder *, MTL::ComputePipelineState *, uint32_t threads) const;
+    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads) const;
 
     const mtl::Context &Context;
-    NS::SharedPtr<MTL::ComputePipelineState> IntegratePipeline, CollectPipeline, WarmStartPipeline, PrepareJointsPipeline, JointDualPipeline, SpreadWakingPipeline, PublishWakingPipeline, CountIncomingPipeline, ScanIncomingPipeline, FillIncomingPipeline, SortIncomingPipeline, SolvePipeline, StabilizePipeline, PublishPipeline, ColorPipeline, PublishColorPipeline, DualPipeline, FinalizePipeline, RestitutionPipeline, ApplyRestitutionPipeline, CountQuietPipeline;
+    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[PassCount];
     NS::SharedPtr<MTL4::ArgumentTable> Table;
     NS::SharedPtr<MTL4::CommandAllocator> Allocator;
     NS::SharedPtr<MTL4::CommandBuffer> Commands;

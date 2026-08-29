@@ -24,6 +24,15 @@ std::vector<float3> CubePoints(float side, float3 at = {0, 0, 0}) {
     return points;
 }
 
+// A cube of side two off the origin and turned, which is where a modeller leaves a mesh and is not
+// where a body's pose can hold it - so it is the shape both frame tests are about.
+std::vector<float3> TurnedCube() {
+    std::vector<float3> points = CubePoints(2, float3{7, -3, 11});
+    const float4 turn = QuatFromRotationVector(float3{0.3f, -0.7f, 0.2f});
+    for (float3 &point : points) point = Rotate(turn, point);
+    return points;
+}
+
 // A hull's faces have to be faces of the hull: every vertex on or behind each face's plane, every
 // vertex on at least one of them, every face wound so its normal points out, and every face convex.
 // The whole of what the merge has to preserve, and it needs no closed form to say it.
@@ -47,7 +56,7 @@ void CheckFaces(const CookedHull &cooked) {
             ++uses[index];
             CHECK(dot(face.Normal, cooked.Vertices[index]) == doctest::Approx(face.Offset).epsilon(1e-3).scale(0));
             const float3 a = cooked.Vertices[face.Corner[i]], b = cooked.Vertices[face.Corner[(i + 1) % face.Count]],
-                        c = cooked.Vertices[face.Corner[(i + 2) % face.Count]];
+                         c = cooked.Vertices[face.Corner[(i + 2) % face.Count]];
             CHECK(dot(cross(b - a, c - b), face.Normal) >= -slack * reach);
         }
         // Named by the lowest index it holds, so which triangle the builder started from cannot be read
@@ -113,8 +122,7 @@ TEST_CASE("the cook gives back the faces the builder cut up") {
         // handed to how far from the origin they were authored. Where the second is coarser the first
         // has to give way, or a face flat in one frame is two faces in another - a frame leaking into
         // the geometry, and what a modeller's export looks like.
-        const std::vector<float3> wedge{float3{-0.4f, -0.15f, -0.3f}, float3{0.5f, -0.15f, -0.3f}, float3{0.5f, -0.15f, 0.35f},
-                                        float3{-0.4f, -0.15f, 0.35f}, float3{-0.2f, 0.25f, -0.1f}, float3{0.3f, 0.25f, 0.2f}};
+        const std::vector<float3> wedge = WedgePoints();
         std::vector<uint32_t> counts;
         for (const bool turn : {false, true}) {
             CAPTURE(turn);
@@ -137,16 +145,7 @@ TEST_CASE("the cook gives back the faces the builder cut up") {
         // doing. The bottom is two facets meeting at a shallow angle and they have to stay two.
         for (const float degrees : {3.f, 0.3f, 0.03f, 0.01f}) {
             CAPTURE(degrees);
-            const float rise = 0.1f * std::tan(degrees * std::numbers::pi_v<float> / 180);
-            std::vector<float3> points;
-            for (const float z : {-0.5f, 0.5f}) {
-                points.push_back(float3{-0.5f, -0.1f, z});
-                points.push_back(float3{0.4f, -0.1f, z});
-                points.push_back(float3{0.5f, -0.1f + rise, z});
-                points.push_back(float3{-0.5f, 0.1f, z});
-                points.push_back(float3{0.5f, 0.1f, z});
-            }
-            const CookedHull cooked = CookHull(points);
+            const CookedHull cooked = CookHull(ChamferedPlate(0.1f * std::tan(degrees * std::numbers::pi_v<float> / 180)));
             CheckFaces(cooked);
             uint32_t downward = 0;
             for (const HullFace &face : cooked.Faces) downward += face.Normal.y < -0.5f ? 1 : 0;
@@ -172,10 +171,7 @@ TEST_CASE("a hull is cooked into its own frame, whatever frame it arrives in") {
     // Off the origin and turned, which is where a modeller leaves a mesh and is not where a body's
     // pose can hold it: the engine's transforms are centred on the centre of mass and its inertia is
     // the diagonal in the body frame, so the cook has to establish both.
-    std::vector<float3> points = CubePoints(2, float3{7, -3, 11});
-    const float4 turn = QuatFromRotationVector(float3{0.3f, -0.7f, 0.2f});
-    for (float3 &point : points) point = Rotate(turn, point);
-
+    const std::vector<float3> points = TurnedCube();
     const CookedHull cooked = CookHull(points);
     CHECK(cooked.Vertices.size() == 8);
     CHECK(cooked.Volume == doctest::Approx(8).epsilon(1e-4));
@@ -241,17 +237,12 @@ TEST_CASE("a cooked hull says where its frame sits in the one its points arrived
     // Cooking moves the points, and nothing but the cook can work out the transform between the two -
     // it falls out of an integration over the solid and a diagonalization of what that found. The
     // check is an identity: every cooked vertex, taken back through the frame, lands where it came from.
-    std::vector<float3> points = CubePoints(2, float3{7, -3, 11});
-    const float4 turn = QuatFromRotationVector(float3{0.3f, -0.7f, 0.2f});
-    for (float3 &point : points) point = Rotate(turn, point);
-
+    const std::vector<float3> points = TurnedCube();
     const CookedHull cooked = CookHull(points);
     REQUIRE(cooked.Vertices.size() == 8);
     for (const float3 vertex : cooked.Vertices) {
         const float3 back = cooked.Frame.Position + Rotate(cooked.Frame.Orientation, vertex);
-        float nearest = INFINITY;
-        for (const float3 point : points) nearest = std::min(nearest, float(simd::distance(back, point)));
-        CHECK(nearest < 1e-4f);
+        CHECK(NearestTo(back, points) < 1e-4f);
     }
     // And the other way, which is the direction a caller uses it in: a corner of the geometry as given,
     // taken into the frame the body's pose is the pose of, is a corner of the cooked hull. Which corner
@@ -259,8 +250,6 @@ TEST_CASE("a cooked hull says where its frame sits in the one its points arrived
     // frame Jacobi lands on is its own business.
     for (uint32_t corner = 0; corner < 8; ++corner) {
         const float3 there = Rotate(QuatConjugate(cooked.Frame.Orientation), points[corner] - cooked.Frame.Position);
-        float nearest = INFINITY;
-        for (const float3 vertex : cooked.Vertices) nearest = std::min(nearest, float(simd::distance(there, vertex)));
-        CHECK(nearest < 1e-4f);
+        CHECK(NearestTo(there, cooked.Vertices) < 1e-4f);
     }
 }

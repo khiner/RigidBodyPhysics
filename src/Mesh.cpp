@@ -80,8 +80,7 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
     std::map<std::tuple<int64_t, int64_t, int64_t>, uint32_t> welded;
     std::vector<uint32_t> where(points.size());
     for (uint32_t i = 0; i < points.size(); ++i) {
-        const auto key = std::tuple{int64_t(std::llround(points[i].x / grain)), int64_t(std::llround(points[i].y / grain)),
-                                    int64_t(std::llround(points[i].z / grain))};
+        const auto key = std::tuple{int64_t(std::llround(points[i].x / grain)), int64_t(std::llround(points[i].y / grain)), int64_t(std::llround(points[i].z / grain))};
         const auto [at, fresh] = welded.try_emplace(key, uint32_t(cooked.Vertices.size()));
         if (fresh) cooked.Vertices.push_back(points[i]);
         where[i] = at->second;
@@ -91,8 +90,7 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         if (indices[i] >= points.size() || indices[i + 1] >= points.size() || indices[i + 2] >= points.size()) return {};
         const Triangle triangle{where[indices[i]], where[indices[i + 1]], where[indices[i + 2]], 0};
         if (triangle.A == triangle.B || triangle.B == triangle.C || triangle.A == triangle.C) continue; // welded flat
-        if (length(cross(cooked.Vertices[triangle.B] - cooked.Vertices[triangle.A],
-                         cooked.Vertices[triangle.C] - cooked.Vertices[triangle.A])) <= 0) continue;
+        if (length(cross(cooked.Vertices[triangle.B] - cooked.Vertices[triangle.A], cooked.Vertices[triangle.C] - cooked.Vertices[triangle.A])) <= 0) continue;
         cooked.Triangles.push_back(triangle);
     }
     if (cooked.Triangles.empty()) return {};

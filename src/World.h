@@ -2,11 +2,11 @@
 
 #include "gpu/Shared.h"
 
+#include "metal/Buffer.h"
+#include "metal/Context.h"
 #include <cmath>
 #include <span>
 #include <vector>
-#include "metal/Buffer.h"
-#include "metal/Context.h"
 
 namespace mtl {
 struct Context;
@@ -24,6 +24,11 @@ struct WorldLimits {
     uint32_t Triangles = 65536;
     uint32_t BvhNodes = 65536;
 };
+
+// A pose at a place, facing the way it was made. Worth a name because a designated initializer that
+// gives only the position leaves the orientation at zero, which is not a rotation and not a mistake
+// anything downstream can see - it arrives as a body that has quietly collapsed.
+inline Pose At(float3 position, float4 turn = {0, 0, 0, 1}) { return {.Position = position, .Orientation = turn}; }
 
 // Density in kg/m^3 - water is 1000. Zero density makes the body static: it keeps its pose and takes
 // part in collision, but nothing moves it.
@@ -192,6 +197,11 @@ private:
         Index Take(uint32_t count); // NoIndex when nothing free fits and the tail has no room either
         void Give(Index start, uint32_t count);
     };
+
+    // The slots holding who this body is jointed to, and so does not collide with - a fixed run per
+    // body, filled at the first gap and cleared back to one, since the kernel that reads it sweeps all
+    // of it and neither end cares where the gap is.
+    std::span<Index> JointedRun(Index body) const { return Jointed.All().subspan(body * JointsPerBody, JointsPerBody); }
 
     // Everything a removed body was touching, woken. Nothing else will: waking spreads from a body
     // that is moving to the ones it touches, and what has just gone is not moving.

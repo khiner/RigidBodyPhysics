@@ -9,10 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <doctest/doctest.h>
 #include <set>
 #include <utility>
 #include <vector>
-#include <doctest/doctest.h>
 
 namespace {
 // Two triangles making the quad a-b-c-d, wound so their normals point along `out`. Written this way
@@ -78,8 +78,7 @@ TEST_CASE("a ridge is a feature and a valley is not") {
     // the surface where something can strike it, and a valley is a place nothing can reach without
     // touching one of the two faces that make it first.
     const auto fold = [](float height) {
-        const std::vector<float3> points{float3{-1, 0, -1}, float3{1, 0, -1}, float3{-1, height, 0},
-                                         float3{1, height, 0}, float3{-1, 0, 1}, float3{1, 0, 1}};
+        const std::vector<float3> points{float3{-1, 0, -1}, float3{1, 0, -1}, float3{-1, height, 0}, float3{1, height, 0}, float3{-1, 0, 1}, float3{1, 0, 1}};
         std::vector<uint32_t> indices;
         Quad(indices, points, 0, 1, 3, 2, float3{0, 1, 0});
         Quad(indices, points, 2, 3, 5, 4, float3{0, 1, 0});

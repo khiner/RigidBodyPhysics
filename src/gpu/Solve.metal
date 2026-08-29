@@ -56,15 +56,6 @@ static float3x3 QuatToMatrix(float4 q) {
     return float3x3(Rotate(q, float3(1, 0, 0)), Rotate(q, float3(0, 1, 0)), Rotate(q, float3(0, 0, 1)));
 }
 
-// Any orthonormal frame whose first axis is the normal. Which tangents come out does not matter, only
-// that the same normal always produces the same pair, so warm-started friction stays meaningful.
-static float3x3 ContactBasis(float3 normal) {
-    float3 tangent = abs(normal.x) > abs(normal.z) ? float3(-normal.y, normal.x, 0) : float3(0, -normal.z, normal.y);
-    const float len = length(tangent);
-    tangent = len > 1e-8f ? tangent / len : float3(1, 0, 0);
-    return float3x3(normal, tangent, cross(normal, tangent));
-}
-
 // Solve H x = -g for a symmetric positive definite H, by LDL^T without pivoting. H is definite by
 // construction: the inertial term puts mass on the whole diagonal before any contact adds to it.
 static void SolveBlock(thread float H[Dof][Dof], thread float g[Dof], thread float out[Dof]) {
@@ -84,6 +75,25 @@ static void SolveBlock(thread float H[Dof][Dof], thread float g[Dof], thread flo
     for (uint i = Dof; i-- > 0;) {
         out[i] = y[i];
         for (uint k = i + 1; k < Dof; ++k) out[i] -= H[k][i] * out[k];
+    }
+}
+
+// One constraint row into a body's 6x6 block: its force onto the gradient, and its outer product
+// scaled by the row's stiffness onto the Hessian. The Jacobian is a direction and the moment it makes
+// about the body's own centre, so a row is named by `axis` and `arm` rather than spelled out, and
+// `side` is +1 where the row measures this body as A and -1 as B.
+static void AddRow(
+    thread float H[Dof][Dof], thread float g[Dof], float3 axis, float3 arm, float side, float force, float stiffness
+) {
+    const float3 angular = cross(arm, axis);
+    float row[Dof];
+    for (uint k = 0; k < 3; ++k) {
+        row[k] = side * axis[k];
+        row[3 + k] = side * angular[k];
+    }
+    for (uint i = 0; i < Dof; ++i) {
+        g[i] += row[i] * force;
+        for (uint j = 0; j < Dof; ++j) H[i][j] += stiffness * row[i] * row[j];
     }
 }
 
@@ -261,23 +271,11 @@ static uint PolySupport(Poly poly, device const float3 *pool, float3 direction) 
     const float3 local = Rotate(QuatConjugate(poly.Orientation), direction);
     if (poly.Kind == ShapeBox) return (local.x > 0 ? 1u : 0u) | (local.y > 0 ? 2u : 0u) | (local.z > 0 ? 4u : 0u);
     if (poly.Kind == ShapeCapsule) return local.y > 0 ? 1u : 0u;
-    if (poly.Kind == ShapeMesh) {
-        uint best = 0;
-        float furthest = -INFINITY;
-        for (uint i = 0; i < 3; ++i) {
-            const float reach = dot(pool[poly.Corner[i]], local);
-            if (reach > furthest) {
-                furthest = reach;
-                best = i;
-            }
-        }
-        return best;
-    }
-    if (poly.Kind != ShapeHull) return 0;
+    // A hull's corners and a triangle's are both a scan, and LocalVertex is what tells them apart.
     uint best = 0;
     float furthest = -INFINITY;
-    for (uint i = 0; i < poly.Count; ++i) {
-        const float reach = dot(pool[poly.First + i], local);
+    for (uint i = 0, count = PolyCount(poly); i < count; ++i) {
+        const float reach = dot(LocalVertex(poly, pool, i), local);
         if (reach > furthest) {
             furthest = reach;
             best = i;
@@ -417,6 +415,9 @@ static void ClosestOnSegments(float3 p0, float3 p1, float3 q0, float3 q1, thread
 // different arithmetic, so it lands either side of zero on rounding alone. Called exactly, a corner a
 // rounding error outside is dropped and replaced by a cut point in the same place under a different
 // name, so each corner appears twice and the pair fight over one piece of geometry.
+//
+// Clips in place through the caller's scratch, since every caller clips against plane after plane and
+// the result of one is the input of the next.
 static uint ClipAgainst(
     thread float3 *poly, thread uint *names, uint count, float3 normal, float offset, uint plane,
     float tolerance, uint limit, thread float3 *out, thread uint *out_names
@@ -440,6 +441,10 @@ static uint ClipAgainst(
         out[kept] = from + (to - from) * at;
         out_names[kept] = (names[i] & names[next]) | plane;
         ++kept;
+    }
+    for (uint i = 0; i < kept; ++i) {
+        poly[i] = out[i];
+        names[i] = out_names[i];
     }
     return kept;
 }
@@ -1020,10 +1025,6 @@ static uint ConvexManifold(
             float3 unit; // out of the reference face, so what is kept is inside it
             if (!SidePlane(reference, reference_count, e, reference_plane, unit)) continue;
             poly_count = ClipAgainst(poly, poly_names, poly_count, unit, dot(unit, reference[e]), 1u << (8 + e), tolerance, MaxClipPoints, clipped, clipped_names);
-            for (uint i = 0; i < poly_count; ++i) {
-                poly[i] = clipped[i];
-                poly_names[i] = clipped_names[i];
-            }
         }
     } else if (incident_count == 1) {
         // One point, which the loop below would otherwise take on trust. It is on the reference face
@@ -1912,10 +1913,6 @@ kernel void CollectContacts(
                                 // them are both built from the same half extents, so an incidence there is
                                 // exact rather than rounded.
                                 poly_count = ClipAgainst(poly, names, poly_count, side_normal, side_offset, plane, 0, MaxFacePoints, clipped, clipped_names);
-                                for (uint i = 0; i < poly_count; ++i) {
-                                    poly[i] = clipped[i];
-                                    names[i] = clipped_names[i];
-                                }
                             }
                         }
 
@@ -2038,10 +2035,10 @@ kernel void CollectContacts(
                     }
                     // Eq. 15: separation resolved in the contact basis, plus a margin on the normal row so
                     // contacts engage just before they touch rather than just after.
-                    const float3x3 basis = ContactBasis(normal);
+                    const ContactBasis basis = MakeContactBasis(normal);
                     const float3 gap = (pose.Position + Rotate(pose.Orientation, contact.AnchorA)) -
                         (target_pose.Position + Rotate(target_pose.Orientation, contact.AnchorB));
-                    contact.C0 = float3(dot(basis[0], gap), dot(basis[1], gap), dot(basis[2], gap)) + float3(p.ContactMargin, 0, 0);
+                    contact.C0 = float3(dot(basis.Axis[0], gap), dot(basis.Axis[1], gap), dot(basis.Axis[2], gap)) + float3(p.ContactMargin, 0, 0);
                     if (at == count) ++count;
                 }
             }
@@ -2305,6 +2302,27 @@ static float NormalOffset(Contact contact, constant StepParams &p) {
 #endif
 }
 
+// Eq. 15's constraint in the contact basis: the separation the step began with, plus what the two
+// bodies have displaced since. `arm_a` and `arm_b` are the anchors turned by the pose the step began
+// from, so the Jacobian this differentiates to is the fixed one.
+//
+// The primal sweep and the dual update both come through here. They have to agree to the letter, or
+// Eq. 16 ramps the penalty against a constraint nothing is solving.
+static float3 ContactConstraint(
+    Contact contact, constant StepParams &p, ContactBasis basis, float3 arm_a, float3 arm_b,
+    Displacement moved_a, Displacement moved_b
+) {
+    const float offset = NormalOffset(contact, p);
+    float3 c;
+    for (uint r = 0; r < 3; ++r) {
+        const float3 axis = basis.Axis[r];
+        c[r] = (r == 0 ? offset : contact.C0[r] * (1 - ConstraintAlpha)) +
+            dot(axis, moved_a.Linear) + dot(cross(arm_a, axis), moved_a.Angular) -
+            dot(axis, moved_b.Linear) - dot(cross(arm_b, axis), moved_b.Angular);
+    }
+    return c;
+}
+
 // What a contact row asked for, clamped to what a contact can actually do: row 0 can only push, and
 // rows 1 and 2 together cannot exceed the friction cone. Takes the requested force rather than the
 // terms it is made of, since both callers need that unclamped force for Eq. 16's ramp gate as well.
@@ -2320,6 +2338,17 @@ static float3 ContactForce(float3 requested, float friction) {
     return force;
 }
 
+// The other body a contact is between.
+static Index ContactPartner(Contact contact, uint body) { return contact.BodyA == body ? contact.BodyB : contact.BodyA; }
+
+// And at the other end of a joint - NoIndex where the joint is not this body's, or where the far end
+// cannot move and so constrains nothing this body does.
+static Index JointPartner(Joint joint, uint body, device const BodyMass *masses) {
+    if (!joint.Active || (joint.BodyA != body && joint.BodyB != body)) return NoIndex;
+    const Index other = joint.BodyA == body ? joint.BodyB : joint.BodyA;
+    return masses[other].InvMass > 0 ? other : NoIndex;
+}
+
 // Walking a body's contacts: its own run, which is every contact where it is A, then the list gathered
 // this step, which is every contact where it is B. Between them that is all of them, without a look at
 // anybody else's slots, and neither is longer than the bodies this one touches.
@@ -2331,6 +2360,13 @@ static uint ContactSlot(thread uint &i, uint own, uint start, device const uint 
     if (contacts[slot].Active) return slot;
     if (i < ContactsPerBody) i = ContactsPerBody - 1;
     return NoIndex;
+}
+
+// The lowest colour a mask does not hold, capped at the width of the mask itself.
+static uint LowestFree(uint taken) {
+    uint at = 0;
+    while (at < 31 && (taken & (1u << at)) != 0) ++at;
+    return at;
 }
 
 // One neighbour of a body being coloured, counted in the first sweep and read for its colour in the
@@ -2387,23 +2423,20 @@ kernel void UpdateColors(
     // Two sweeps over everything this body touches, since degree has to be whole before any
     // neighbour's priority can be judged against it. See NoteNeighbour for the two masks.
     uint degree = 0, taken = 0, taken_all = 0;
-    const uint own = body * ContactsPerBody, incoming_count = incoming[body].Count, incoming_start = incoming[body].Start;
+    const Adjacency neighbours = incoming[body];
     for (uint sweep = 0; sweep < 2; ++sweep) {
-        for (uint i = 0; i < ContactsPerBody + incoming_count; ++i) {
-            const uint slot = ContactSlot(i, own, incoming_start, incoming_slots, contacts);
+        for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
+            const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
             if (slot == NoIndex) continue;
-            const Contact contact = contacts[slot];
-            const Index other = contact.BodyA == body ? contact.BodyB : contact.BodyA;
+            const Index other = ContactPartner(contacts[slot], body);
             if (masses[other].InvMass == 0) continue;
             NoteNeighbour(sweep, other, colors[other], body, my_quiet && quiet[other] > 0, degree, taken, taken_all);
         }
         // A joint couples two bodies exactly as a contact does, so it constrains the colouring the
         // same way. Colouring from contacts alone lets a jointed pair share a colour and race in place.
         for (uint index = 0; index < p.JointCount; ++index) {
-            const Joint joint = joints[index];
-            if (!joint.Active || (joint.BodyA != body && joint.BodyB != body)) continue;
-            const Index other = joint.BodyA == body ? joint.BodyB : joint.BodyA;
-            if (masses[other].InvMass == 0) continue;
+            const Index other = JointPartner(joints[index], body, masses);
+            if (other == NoIndex) continue;
             NoteNeighbour(sweep, other, colors[other], body, my_quiet && quiet[other] > 0, degree, taken, taken_all);
         }
         degree = min(degree, MaxColorDegree);
@@ -2414,15 +2447,13 @@ kernel void UpdateColors(
         // Conflicted: off to the lowest colour no prioritized neighbour holds, and where the cap
         // leaves nothing, stay - the pair aliases onto a colour being solved and is Jacobi for the
         // step, which the snapshot allows.
-        uint best = 0;
-        while (best < 31 && (taken & (1u << best)) != 0) ++best;
+        const uint best = LowestFree(taken);
         if (best < p.MaxColors) chosen = best;
     } else if (my_quiet) {
         // Quiet and unconflicted: compact downwards where a colour sits entirely free, which is what
         // lets a settled colouring improve at all - a proper colouring has no conflicts, and conflict
         // used to be the only reason a body ever moved.
-        uint best = 0;
-        while (best < 31 && (taken_all & (1u << best)) != 0) ++best;
+        const uint best = LowestFree(taken_all);
         if (best < mine) chosen = best;
     }
     next[body] = (degree << ColorDegreeShift) | chosen;
@@ -2482,9 +2513,9 @@ kernel void SolveBodies(
     }
 
     // Everything this body is in, which neither depends on how many bodies there are - see ContactSlot.
-    const uint own = body * ContactsPerBody, incoming_count = incoming[body].Count, incoming_start = incoming[body].Start;
-    for (uint i = 0; i < ContactsPerBody + incoming_count; ++i) {
-        const uint slot = ContactSlot(i, own, incoming_start, incoming_slots, contacts);
+    const Adjacency neighbours = incoming[body];
+    for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
+        const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
         if (slot == NoIndex) continue;
         const Contact contact = contacts[slot];
         const bool mine_is_a = contact.BodyA == body;
@@ -2500,23 +2531,9 @@ kernel void SolveBodies(
         const Displacement moved_b = Since(mine_is_a ? poses[contact.BodyB] : pose, start_b);
         const float3 arm = mine_is_a ? arm_a : arm_b;
         const float side = mine_is_a ? 1 : -1;
-        const float3x3 basis = ContactBasis(contact.Normal);
-        const float offset = NormalOffset(contact, p);
+        const ContactBasis basis = MakeContactBasis(contact.Normal);
+        const float3 constraint = ContactConstraint(contact, p, basis, arm_a, arm_b, moved_a, moved_b);
 
-        float jacobian[3][Dof];
-        float c[3];
-        for (uint r = 0; r < 3; ++r) {
-            const float3 axis = basis[r], angular = cross(arm, axis);
-            for (uint k = 0; k < 3; ++k) {
-                jacobian[r][k] = side * axis[k];
-                jacobian[r][3 + k] = side * angular[k];
-            }
-            c[r] = (r == 0 ? offset : contact.C0[r] * (1 - ConstraintAlpha)) +
-                dot(axis, moved_a.Linear) + dot(cross(arm_a, axis), moved_a.Angular) -
-                dot(axis, moved_b.Linear) - dot(cross(arm_b, axis), moved_b.Angular);
-        }
-
-        const float3 constraint = float3(c[0], c[1], c[2]);
         const float3 requested = contact.Penalty * constraint + contact.Lambda;
         const float3 force = ContactForce(requested, contact.Friction);
 
@@ -2532,13 +2549,8 @@ kernel void SolveBodies(
             stiffness[r] = clamp((force[r] - contact.Lambda[r]) / constraint[r], 0.f, contact.Penalty[r]);
         }
 
-        for (uint r = 0; r < 3; ++r) {
-            for (uint row = 0; row < Dof; ++row) {
-                g[row] += jacobian[r][row] * force[r];
-                // Eq. 17. The second-order term is dropped, as the reference drops it for contacts.
-                for (uint col = 0; col < Dof; ++col) H[row][col] += stiffness[r] * jacobian[r][row] * jacobian[r][col];
-            }
-        }
+        // The second-order term of Eq. 17 is dropped, as the reference drops it for contacts.
+        for (uint r = 0; r < 3; ++r) AddRow(H, g, basis.Axis[r], arm, side, force[r], stiffness[r]);
     }
 
     // Joints, which unlike contacts are measured at the pose the sweep has reached rather than
@@ -2562,19 +2574,7 @@ kernel void SolveBodies(
             linear[r] = reach[r] - joint.C0Linear[r] * (hard ? ConstraintAlpha : 0);
             force[r] = joint.PenaltyLinear[r] * linear[r] + (hard ? joint.LambdaLinear[r] : 0);
         }
-        for (uint r = 0; r < 3; ++r) {
-            const float3 axis = UnitAxis(r);
-            const float3 angular_part = cross(arm, axis);
-            float row[Dof];
-            for (uint k = 0; k < 3; ++k) {
-                row[k] = side * axis[k];
-                row[3 + k] = side * angular_part[k];
-            }
-            for (uint i = 0; i < Dof; ++i) {
-                g[i] += row[i] * force[r];
-                for (uint j = 0; j < Dof; ++j) H[i][j] += joint.PenaltyLinear[r] * row[i] * row[j];
-            }
-        }
+        for (uint r = 0; r < 3; ++r) AddRow(H, g, UnitAxis(r), arm, side, force[r], joint.PenaltyLinear[r]);
 
         // Sec. 3.5's geometric stiffness, which the reference keeps for joints and drops for contacts:
         // the arm turns as the body does, so the same force asks for a different torque, and that
@@ -2654,17 +2654,8 @@ kernel void UpdateDuals(
     const Displacement own = Since(poses[body], start), other = Since(poses[other_body], other_start);
     const float3 arm = Rotate(start.Orientation, contact.AnchorA);
     const float3 other_arm = Rotate(other_start.Orientation, contact.AnchorB);
-    const float3x3 basis = ContactBasis(contact.Normal);
-    const float offset = NormalOffset(contact, p); // identically, as in the primal, or Eq. 16 ramps
-                                                   // the penalty against a constraint nothing is solving
-
-    float3 c;
-    for (uint r = 0; r < 3; ++r) {
-        const float3 axis = basis[r];
-        c[r] = (r == 0 ? offset : contact.C0[r] * (1 - ConstraintAlpha)) +
-            dot(axis, own.Linear) + dot(cross(arm, axis), own.Angular) -
-            dot(axis, other.Linear) - dot(cross(other_arm, axis), other.Angular);
-    }
+    const ContactBasis basis = MakeContactBasis(contact.Normal);
+    const float3 c = ContactConstraint(contact, p, basis, arm, other_arm, own, other);
 
     // What the rows asked for before the cone clamped them. Eq. 16 ramps a row only while it is
     // strictly inside its bounds, and the clamp puts a sliding contact exactly on the cone, so asking
@@ -2770,9 +2761,9 @@ kernel void ApplyRestitution(
     const float4 orientation = poses[body].Orientation;
     const float3x3 inverse_inertia = InverseInertia(orientation, mass.InvInertiaLocal);
     float3 linear = float3(0), angular = float3(0);
-    const uint own = body * ContactsPerBody, count = incoming[body].Count, start = incoming[body].Start;
-    for (uint i = 0; i < ContactsPerBody + count; ++i) {
-        const uint slot = ContactSlot(i, own, start, incoming_slots, contacts);
+    const Adjacency neighbours = incoming[body];
+    for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
+        const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
         if (slot == NoIndex) continue;
         const Contact contact = contacts[slot];
         if (contact.BounceDelta == 0) continue;
@@ -2833,19 +2824,16 @@ kernel void SpreadWaking(
     next[body] = least;
     if (masses[body].InvMass == 0 || least == 0) return;
 
-    const uint own = body * ContactsPerBody, count = incoming[body].Count, start = incoming[body].Start;
-    for (uint i = 0; i < ContactsPerBody + count; ++i) {
-        const uint slot = ContactSlot(i, own, start, incoming_slots, contacts);
+    const Adjacency neighbours = incoming[body];
+    for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
+        const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
         if (slot == NoIndex) continue;
-        const Contact contact = contacts[slot];
-        const Index other = contact.BodyA == body ? contact.BodyB : contact.BodyA;
+        const Index other = ContactPartner(contacts[slot], body);
         if (masses[other].InvMass > 0) least = min(least, quiet[other]);
     }
     for (uint index = 0; index < p.JointCount; ++index) {
-        const Joint joint = joints[index];
-        if (!joint.Active || (joint.BodyA != body && joint.BodyB != body)) continue;
-        const Index other = joint.BodyA == body ? joint.BodyB : joint.BodyA;
-        if (masses[other].InvMass > 0) least = min(least, quiet[other]);
+        const Index other = JointPartner(joints[index], body, masses);
+        if (other != NoIndex) least = min(least, quiet[other]);
     }
     next[body] = least;
 }

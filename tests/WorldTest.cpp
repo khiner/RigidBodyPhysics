@@ -2,17 +2,13 @@
 // refusing rather than growing.
 
 #include "World.h"
+#include "Shapes.h"
 
 #include <algorithm>
-#include <cmath>
+#include <numbers>
 #include <vector>
 
 #include <doctest/doctest.h>
-
-namespace {
-constexpr Shape UnitBox{.HalfExtents = {0.5f, 0.5f, 0.5f}, .Kind = ShapeBox};
-constexpr Shape GroundPlane{.Normal = {0, 1, 0}, .Offset = 0, .Kind = ShapePlane};
-} // namespace
 
 TEST_CASE("a solid box gets the mass and inertia its density implies") {
     // A 1 m cube of water masses 1000 kg, and a cube's inertia is m * (e^2 + e^2) / 12 on every axis.
@@ -33,7 +29,7 @@ TEST_CASE("a solid sphere gets the mass and inertia its density implies") {
     constexpr float Radius = 0.5f;
     constexpr Shape UnitSphere{.Radius = Radius, .Kind = ShapeSphere};
     const auto mass = MassProperties(UnitSphere, 1000);
-    const float expected = 1000 * 4.f / 3 * 3.14159265358979f * Radius * Radius * Radius;
+    const float expected = 1000 * 4.f / 3 * std::numbers::pi_v<float> * Radius * Radius * Radius;
     CHECK(1 / mass.InvMass == doctest::Approx(expected));
     for (uint32_t axis = 0; axis < 3; ++axis)
         CHECK(1 / mass.InvInertiaLocal[axis] == doctest::Approx(2.f / 5 * expected * Radius * Radius));
@@ -55,14 +51,13 @@ TEST_CASE("a capsule's mass properties bracket the shapes it is made of") {
     constexpr Shape Degenerate{.HalfExtents = {0, 0, 0}, .Radius = Radius, .Kind = ShapeCapsule};
     CHECK(1 / MassProperties(Degenerate, 1000).InvMass == doctest::Approx(1 / MassProperties(Sphere, 1000).InvMass));
     for (uint32_t axis = 0; axis < 3; ++axis)
-        CHECK(MassProperties(Degenerate, 1000).InvInertiaLocal[axis] ==
-              doctest::Approx(MassProperties(Sphere, 1000).InvInertiaLocal[axis]));
+        CHECK(MassProperties(Degenerate, 1000).InvInertiaLocal[axis] == doctest::Approx(MassProperties(Sphere, 1000).InvInertiaLocal[axis]));
 
     constexpr Shape Pill{.HalfExtents = {0, 1, 0}, .Radius = Radius, .Kind = ShapeCapsule};
     const auto mass = MassProperties(Pill, 1000);
     // Mass is the cylinder plus the sphere its two caps make.
-    const float pi = 3.14159265358979f;
-    const float expected = 1000 * pi * Radius * Radius * 2 + 1000 * 4.f / 3 * pi * Radius * Radius * Radius;
+    constexpr float Pi = std::numbers::pi_v<float>;
+    const float expected = 1000 * Pi * Radius * Radius * 2 + 1000 * 4.f / 3 * Pi * Radius * Radius * Radius;
     CHECK(1 / mass.InvMass == doctest::Approx(expected));
     // Long and thin: it resists turning end over end far more than turning about its own length.
     CHECK(1 / mass.InvInertiaLocal[0] > 4 / mass.InvInertiaLocal[1]);
@@ -84,7 +79,7 @@ TEST_CASE("bodies and shapes take stable indices") {
     CHECK(plane == 1);
     CHECK(world.ShapeCount() == 2);
 
-    const auto falling = world.AddBody({.Pose = {.Position = {0, 5, 0}, .Orientation = {0, 0, 0, 1}}, .Shape = box});
+    const auto falling = world.AddBody({.Pose = At(float3{0, 5, 0}), .Shape = box});
     const auto ground = world.AddBody({.Shape = plane});
     CHECK(falling == 0);
     CHECK(ground == 1);
@@ -165,14 +160,8 @@ TEST_CASE("runs given back next to each other are one run again") {
     // the two runs merged: neither of them alone is long enough for it.
     const mtl::Context context;
     World world{context, {.ShapeVertices = 16}};
-    std::vector<float3> cube;
-    for (uint32_t corner = 0; corner < 8; ++corner)
-        cube.push_back(float3{(corner & 1) ? 1.f : -1.f, (corner & 2) ? 1.f : -1.f, (corner & 4) ? 1.f : -1.f});
-    std::vector<float3> prism; // a hexagonal prism, which is twelve corners and no interior points
-    for (uint32_t i = 0; i < 6; ++i) {
-        const float angle = float(i) * 2 * 3.14159265358979f / 6;
-        for (const float y : {-1.f, 1.f}) prism.push_back(float3{std::cos(angle), y, std::sin(angle)});
-    }
+    const std::vector<float3> cube = CubeCorners(2);
+    const std::vector<float3> prism = PrismPoints(6, 1, 1); // twelve corners and no interior points
 
     const auto first = world.AddHull(cube), second = world.AddHull(cube);
     REQUIRE(first != NoIndex);

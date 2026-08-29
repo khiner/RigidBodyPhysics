@@ -17,6 +17,7 @@ using namespace metal;
 // MSL spells this float4(xyz, w) and simd needs a call, so both sides get the name the shared text uses.
 inline float4 MakeFloat4(float3 xyz, float w) { return float4(xyz, w); }
 #else
+#include <cmath>
 #include <cstdint>
 #include <simd/simd.h>
 
@@ -28,6 +29,7 @@ using simd::cross;
 using simd::dot;
 using simd::length;
 using simd::normalize;
+using std::abs; // the scalar one, so `abs` in the shared text below means what MSL means by it
 
 #define GPU_CONSTANT constexpr
 
@@ -233,6 +235,25 @@ struct Contact {
     uint Stick; // held the friction cone last step, so its anchors are kept for static friction
     uint Active;
 };
+
+// The frame a contact's three rows are resolved in: its normal, then the two tangents friction acts
+// along. Which pair of tangents comes out does not matter, only that the same normal always produces
+// the same pair - a stuck contact's dual is held in this frame from one step to the next, and a basis
+// that turned between steps would hand it back arguing along a different direction.
+//
+// Shared rather than the solve's own, because anything reading a contact's force back out as a vector
+// has to resolve it in the frame the solve applied it in. RbpScenes slide reports exactly that, and a
+// tool that merely looks like it agrees is worse than no tool.
+struct ContactBasis {
+    float3 Axis[3];
+};
+
+inline ContactBasis MakeContactBasis(float3 normal) {
+    float3 tangent = abs(normal.x) > abs(normal.z) ? float3{-normal.y, normal.x, 0} : float3{0, -normal.z, normal.y};
+    const float len = length(tangent);
+    tangent = len > 1e-8f ? tangent / len : float3{1, 0, 0};
+    return {{normal, tangent, cross(normal, tangent)}};
+}
 
 // What happened to a contact between one step and the next, which is the distinction warm starting
 // already draws: this step's points are matched against last step's by feature, so an unmatched point
