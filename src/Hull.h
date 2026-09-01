@@ -5,30 +5,37 @@
 #include <span>
 #include <vector>
 
-// A convex hull, in the frame the engine's conventions require rather than the one it was handed.
-//
-// Every other shape is an analytic solid already centred and axis aligned by its own definition. A
-// hull arrives in whatever frame the modeller left it in, so section 1.1's conventions - transforms
-// centred on the centre of mass, inertia diagonal in the body frame - have to be established: the
-// mass properties are integrated and the vertices moved onto the centre of mass and principal axes.
-//
-// So a body's pose is the pose of *this* frame, not of the points as given. The transform between the
-// two comes back with the hull, since nothing else can work it out - it falls out of an integration
-// over the solid and a diagonalization of what that integral found.
+namespace rbp {
+
+// A convex hull in its body frame: centred on the centre of mass, with the inertia tensor diagonal.
+// The input points may be in any frame, so cooking integrates the mass properties and moves the vertices onto the centre of mass and principal axes.
+// A body's pose is the pose of this frame rather than of the input points, and `Frame` carries the transform between the two.
 struct CookedHull {
-    std::vector<float3> Vertices; // empty when the points were degenerate - flat, collinear, or fewer than four
-    // The real faces, recovered from the triangles the builder cut them into, each naming its corners
-    // by their index in `Vertices` - see HullFace in Shared.h for why the cook is where that happens.
+    std::vector<float3> Vertices; // empty for degenerate input: flat, collinear, or fewer than four points
+    // Polygonal faces, merged back from the builder's triangles, with corners as indices into `Vertices`.
     std::vector<HullFace> Faces;
-    float Volume{}; // so mass is Volume times density
-    float3 Inertia{}; // principal moments at unit density, which scale with it the same way
-    // Where the cooked frame sits in the frame the points arrived in: its origin is the centre of mass
-    // and its axes are the principal ones. So a point of the cooked hull is `Frame.Position +
-    // Rotate(Frame.Orientation, vertex)` back in the caller's frame, and a body holding this shape puts
-    // the geometry as given at its own pose composed with this.
+    float Volume{}; // mass is Volume times density
+    float3 Inertia{}; // principal moments at unit density, linear in density
+    // Simplification error from fitting `MaxHullVertices`: no corner of the exact hull lies more than this far outside a face of this one.
+    // Zero means the two are the same solid.
+    float Tolerance{};
+    // The cooked frame in the input frame, so a cooked vertex maps back as `Frame.Position + Rotate(Frame.Orientation, vertex)`.
     Pose Frame{.Position = {0, 0, 0}, .Orientation = {0, 0, 0, 1}};
 };
 
-// Fewer than four points, or points that all lie on one plane or line, make no solid and come back
-// as an empty hull. A hull is a body's shape and a body needs a volume.
+// The eigendecomposition of a symmetric 3x3: the diagonal values, and the rotation whose columns are the axes.
+// The axes are made right handed, so the result is a rotation rather than a reflection.
+struct Diagonalized {
+    simd::double3 Values;
+    simd::double3 Axis[3]; // the columns of the rotation
+    float4 Orientation; // the same rotation as a quaternion
+};
+// Exposed for World::AddCompound, which runs over a compound's children the arithmetic the hull cook runs over tetrahedra.
+// The body frame it produces means the same as CookedHull::Frame.
+Diagonalized DiagonalizeSymmetric(const double (&symmetric)[3][3]);
+
+// Returns an empty hull for degenerate input: fewer than four points, or points all on one plane or line.
+// Input with more corners than `MaxHullVertices` is simplified rather than refused, and every field of the result then describes the simplified hull.
 CookedHull CookHull(std::span<const float3> points);
+
+} // namespace rbp

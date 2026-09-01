@@ -4,15 +4,16 @@
 #include <cmath>
 #include <map>
 
+namespace rbp {
+
 namespace {
-// Triangles per leaf. Small enough that a leaf is a few narrowphase calls rather than a scan, large
-// enough that the tree is not mostly pointers.
+// Triangles per leaf.
+// Small enough that a leaf is a few narrowphase calls rather than a scan, large enough that the tree is not mostly nodes.
 constexpr uint32_t LeafSize = 4;
 
-// How far from flat two faces have to fold before the edge between them is a feature. Below this they
-// are the same surface as far as anything sliding over them is concerned, and calling the seam a
-// feature is what makes a body catch on nothing. A degree, which is well above the noise in a normal
-// computed from three points and well below any crease that is really there.
+// How far from flat two faces must fold before the edge between them is a feature.
+// Below this they are one surface to anything sliding over them, and marking the seam a feature would make a body catch on it.
+// One degree, above the noise in a normal computed from three points and below any real crease.
 constexpr float ActiveEdgeSine = 0.0175f;
 
 float3 Normal(const std::vector<float3> &points, const Triangle &triangle) {
@@ -21,8 +22,8 @@ float3 Normal(const std::vector<float3> &points, const Triangle &triangle) {
     return area > 0 ? turn / area : float3{0, 0, 0};
 }
 
-// The mesh's triangles in the order a tree over them wants, and the tree. Split on the longest axis of
-// the centroids at their median, which needs no cost model and is deterministic for a given input.
+// Reorders the triangles into tree order and builds the tree.
+// Split on the longest axis of the centroids at their median, which needs no cost model and is deterministic for a given input.
 uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &points, std::vector<BvhNode> &nodes, uint32_t first, uint32_t count) {
     const uint32_t self = nodes.size();
     nodes.push_back({});
@@ -56,8 +57,7 @@ uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &poin
         return centre(a)[axis] < centre(b)[axis];
     });
 
-    // The left child is built first and so lands immediately after this node, which is why only the
-    // right one needs an index of its own.
+    // The left child is built first and lands immediately after this node, so only the right one needs an index of its own.
     Build(triangles, points, nodes, first, half);
     nodes[self].First = Build(triangles, points, nodes, first + half, count - half);
     nodes[self].Count = 0;
@@ -72,8 +72,8 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         low = simd::min(low, point);
         high = simd::max(high, point);
     }
-    // Coincident to within a millionth of the mesh's own size is the same corner. Two points either
-    // side of a grid line at that scale stay apart, which costs a seam its recognition and nothing else.
+    // Points within a millionth of the mesh's own size are the same corner.
+    // Two points either side of a grid line at that scale stay apart, which costs one seam its recognition and nothing else.
     const float grain = 1e-6f * std::max({high.x - low.x, high.y - low.y, high.z - low.z, 1e-6f});
 
     CookedMesh cooked;
@@ -95,7 +95,7 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
     }
     if (cooked.Triangles.empty()) return {};
 
-    // Which triangles meet along each edge, so each one can be asked whether the surface folds there.
+    // Which triangles meet along each edge, so each triangle can test whether the surface folds there.
     std::map<std::pair<Index, Index>, std::vector<uint32_t>> along;
     for (uint32_t t = 0; t < cooked.Triangles.size(); ++t) {
         const Triangle &triangle = cooked.Triangles[t];
@@ -112,16 +112,14 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         for (uint32_t e = 0; e < 3; ++e) {
             const Index from = corner[e], to = corner[(e + 1) % 3];
             const auto &shared = along[{std::min(from, to), std::max(from, to)}];
-            // An edge no one else has is the boundary of an open surface, and one that three or more
-            // triangles meet along is not a surface at all. Both are features by default: something can
-            // reach them, and nothing else is going to answer for them.
+            // An edge belonging to one triangle is the boundary of an open surface, and an edge three or more triangles meet along is not a surface.
+            // Both are active by default, being reachable and covered by no other rule.
             bool active = shared.size() != 2;
             for (const uint32_t other : shared) {
                 if (other == t) continue;
                 const Triangle &neighbour = cooked.Triangles[other];
-                // Whichever of the neighbour's corners is not on the shared edge says which way it
-                // folds: behind this triangle's plane is a ridge, which something can hit, and level
-                // with it or in front of it is a seam or a valley, which nothing can reach on its own.
+                // The neighbour's corner off the shared edge gives the fold direction.
+                // Behind this triangle's plane is a ridge a body can hit, and level with it or in front is a seam or a valley out of reach.
                 for (const Index far : {neighbour.A, neighbour.B, neighbour.C}) {
                     if (far == from || far == to) continue;
                     const float3 offset = cooked.Vertices[far] - cooked.Vertices[from];
@@ -130,10 +128,8 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
                 }
             }
             if (active) triangle.ActiveEdges |= 1u << e;
-            // And who answers for what lies along it. The lower-numbered of the two, so that exactly
-            // one of them does - and so that where several triangles meet at a corner, the lowest
-            // numbered of them owns both of its edges through that corner and a point landing there
-            // is still held by something.
+            // And which triangle owns points lying along the edge: the lower-numbered of the two, so exactly one does.
+            // A point at a corner several triangles meet at is then still owned.
             if (shared.size() != 2 || t == std::min(shared[0], shared[1])) triangle.OwnedEdges |= 1u << e;
         }
     }
@@ -141,3 +137,5 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
     Build(cooked.Triangles, cooked.Vertices, cooked.Nodes, 0, cooked.Triangles.size());
     return cooked;
 }
+
+} // namespace rbp
