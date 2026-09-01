@@ -1,7 +1,5 @@
-// Cooking a triangle mesh. Two questions have to be answered before a mesh can be collided at all,
-// and neither can be answered per triangle at runtime: which triangles are anywhere near a body, and
-// which of their edges are features of the shape rather than seams of the tessellation. These check
-// both against surfaces whose answers are obvious by eye.
+// Cooking a triangle mesh.
+// Two properties are computed up front rather than per triangle at runtime: which triangles lie near a body, and which edges are features rather than seams.
 
 #include "Mesh.h"
 #include "World.h"
@@ -14,10 +12,11 @@
 #include <utility>
 #include <vector>
 
+using namespace rbp;
+
 namespace {
-// Two triangles making the quad a-b-c-d, wound so their normals point along `out`. Written this way
-// rather than with the winding spelled out, so a test says what surface it means rather than which
-// order its corners happen to be in.
+// The quad a-b-c-d as two triangles wound so their normals point along `out`.
+// A test then specifies a facing direction rather than a corner order.
 void Quad(std::vector<uint32_t> &indices, const std::vector<float3> &points, uint32_t a, uint32_t b, uint32_t c, uint32_t d, float3 out) {
     for (const auto triple : {std::array{a, b, c}, std::array{a, c, d}}) {
         const float3 turn = cross(points[triple[1]] - points[triple[0]], points[triple[2]] - points[triple[0]]);
@@ -32,7 +31,7 @@ uint32_t Find(const CookedMesh &mesh, float3 at) {
     return ~0u;
 }
 
-// Whether the edge between these two points is a feature, and that every triangle along it agrees.
+// Whether the edge between these two points is a feature, checking the bit is the same on every triangle along it.
 bool EdgeActive(const CookedMesh &mesh, float3 from, float3 to) {
     const uint32_t a = Find(mesh, from), b = Find(mesh, to);
     REQUIRE(a != ~0u);
@@ -45,7 +44,7 @@ bool EdgeActive(const CookedMesh &mesh, float3 from, float3 to) {
             if (std::min(from_index, to_index) != std::min(Index(a), Index(b)) ||
                 std::max(from_index, to_index) != std::max(Index(a), Index(b))) continue;
             const bool bit = (triangle.ActiveEdges & (1u << e)) != 0;
-            if (found) CHECK(bit == active); // both sides of an edge have to say the same thing about it
+            if (found) CHECK(bit == active); // the edge bit is identical on both triangles
             found = true;
             active = bit;
         }
@@ -63,8 +62,8 @@ TEST_CASE("a flat quad's diagonal is a seam and its boundary is not") {
 
     REQUIRE(mesh.Vertices.size() == 4);
     REQUIRE(mesh.Triangles.size() == 2);
-    // The diagonal is where the quad was cut in two and there is no fold across it, so nothing can hit
-    // it. Every edge on the outside is where the surface stops, which is something anything can hit.
+    // The diagonal has no fold across it, so it is a seam.
+    // Every outside edge bounds the surface, so it is a feature.
     CHECK(!EdgeActive(mesh, points[0], points[2]));
     CHECK(EdgeActive(mesh, points[0], points[1]));
     CHECK(EdgeActive(mesh, points[1], points[2]));
@@ -73,10 +72,8 @@ TEST_CASE("a flat quad's diagonal is a seam and its boundary is not") {
 }
 
 TEST_CASE("a ridge is a feature and a valley is not") {
-    // The same two quads either side of the same shared edge, folded the two ways round. Which one is
-    // a feature is not about how sharp the fold is but about which way it goes: a ridge stands out of
-    // the surface where something can strike it, and a valley is a place nothing can reach without
-    // touching one of the two faces that make it first.
+    // The same two quads folded each way round.
+    // A ridge is a feature because a body strikes it directly, and a valley is reached only after touching a face.
     const auto fold = [](float height) {
         const std::vector<float3> points{float3{-1, 0, -1}, float3{1, 0, -1}, float3{-1, height, 0}, float3{1, height, 0}, float3{-1, 0, 1}, float3{1, 0, 1}};
         std::vector<uint32_t> indices;
@@ -95,9 +92,8 @@ TEST_CASE("a ridge is a feature and a valley is not") {
 }
 
 TEST_CASE("a mesh authored with a corner per face is welded back together") {
-    // What a renderer hands over: every triangle with its own copies of its corners, so nothing shares
-    // an index with anything. Untouched, no two triangles would be seen to share an edge and every seam
-    // in the mesh would be taken for a feature.
+    // The form a renderer produces.
+    // Unwelded, no two triangles share an edge and every seam would count as a feature.
     std::vector<float3> points;
     std::vector<uint32_t> indices;
     for (const auto corner : {float3{0, 0, 0}, float3{1, 0, 0}, float3{1, 0, 1}, float3{0, 0, 0}, float3{1, 0, 1}, float3{0, 0, 1}}) {
@@ -105,13 +101,13 @@ TEST_CASE("a mesh authored with a corner per face is welded back together") {
         points.push_back(corner);
     }
     const CookedMesh loose = CookMesh(points, indices);
-    CHECK(loose.Vertices.size() == 4); // six corners, four places
+    CHECK(loose.Vertices.size() == 4); // six authored corners weld to four vertices
     CHECK(loose.Triangles.size() == 2);
-    CHECK(!EdgeActive(loose, float3{0, 0, 0}, float3{1, 0, 1})); // and the seam is recognised as one
+    CHECK(!EdgeActive(loose, float3{0, 0, 0}, float3{1, 0, 1})); // the shared diagonal is a seam
 }
 
 TEST_CASE("the tree covers every triangle exactly once") {
-    // A grid, big enough that the tree has to split rather than fitting in one leaf.
+    // A grid large enough that the tree splits rather than fitting in one leaf.
     std::vector<float3> points;
     std::vector<uint32_t> indices;
     constexpr uint32_t Side = 8;
@@ -123,14 +119,14 @@ TEST_CASE("the tree covers every triangle exactly once") {
 
     const CookedMesh mesh = CookMesh(points, indices);
     REQUIRE(mesh.Triangles.size() == 2 * Side * Side);
-    REQUIRE(mesh.Nodes.size() > 1); // it split
+    REQUIRE(mesh.Nodes.size() > 1);
 
     std::set<uint32_t> covered;
     float3 low{INFINITY, INFINITY, INFINITY}, high{-INFINITY, -INFINITY, -INFINITY};
     for (const BvhNode &node : mesh.Nodes) {
         CHECK(simd::all(node.Low <= node.High));
         if (node.Count == 0) {
-            CHECK(node.First < mesh.Nodes.size()); // the right child, the left being the node after this
+            CHECK(node.First < mesh.Nodes.size()); // First is the right child, the left child being the next node
             continue;
         }
         for (uint32_t i = 0; i < node.Count; ++i) {
@@ -138,7 +134,7 @@ TEST_CASE("the tree covers every triangle exactly once") {
             CHECK(covered.insert(node.First + i).second); // no triangle in two leaves
             const Triangle &triangle = mesh.Triangles[node.First + i];
             for (const Index corner : {triangle.A, triangle.B, triangle.C}) {
-                // A leaf's box has to hold what is in it, or a body over it is never told about it.
+                // A leaf's box must contain its triangles, or a body overlapping them is never tested against them.
                 CHECK(simd::all(mesh.Vertices[corner] >= node.Low - 1e-5f));
                 CHECK(simd::all(mesh.Vertices[corner] <= node.High + 1e-5f));
                 low = simd::min(low, mesh.Vertices[corner]);
@@ -147,7 +143,7 @@ TEST_CASE("the tree covers every triangle exactly once") {
         }
     }
     CHECK(covered.size() == mesh.Triangles.size());
-    CHECK(simd::all(mesh.Nodes[0].Low <= low + 1e-5f)); // and the root holds the whole of it
+    CHECK(simd::all(mesh.Nodes[0].Low <= low + 1e-5f)); // the root box contains every vertex
     CHECK(simd::all(mesh.Nodes[0].High >= high - 1e-5f));
 }
 
@@ -167,8 +163,7 @@ TEST_CASE("a body given a mesh is static whatever density it asks for") {
     const auto shape = world.AddMesh(points, indices);
     REQUIRE(shape != NoIndex);
 
-    // A mesh is a surface with no inside: there is no volume to weigh and no centre of mass to turn
-    // about, so a body wearing one keeps its pose whatever it was asked to weigh.
+    // A mesh is a surface with no interior, so it has no volume and no centre of mass.
     const auto body = world.AddBody({.Shape = shape, .Density = 1000});
     CHECK(world.Masses[body].InvMass == 0);
     for (uint32_t axis = 0; axis < 3; ++axis) CHECK(world.Masses[body].InvInertiaLocal[axis] == 0);

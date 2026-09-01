@@ -1,4 +1,4 @@
-// The quaternion helpers in the shared header, against rotations whose answers are known by hand.
+// The quaternion helpers in the shared header, checked against rotations worked out by hand.
 // Y-up right-handed, so a positive rotation about +Y takes +X to -Z.
 
 #include "gpu/Shared.h"
@@ -6,6 +6,8 @@
 #include <cmath>
 
 #include <doctest/doctest.h>
+
+using namespace rbp;
 
 namespace {
 constexpr float4 Identity{0, 0, 0, 1};
@@ -23,7 +25,7 @@ TEST_CASE("the identity quaternion rotates nothing") {
 
 TEST_CASE("a quarter turn about Y takes +X to -Z") {
     CheckNear(Rotate(AboutY(M_PI_2), float3{1, 0, 0}), float3{0, 0, -1});
-    CheckNear(Rotate(AboutY(M_PI_2), float3{0, 1, 0}), float3{0, 1, 0}); // the axis itself is fixed
+    CheckNear(Rotate(AboutY(M_PI_2), float3{0, 1, 0}), float3{0, 1, 0}); // the axis of rotation is fixed
 }
 
 TEST_CASE("multiplying quaternions composes their rotations") {

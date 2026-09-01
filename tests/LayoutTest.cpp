@@ -1,6 +1,6 @@
-// The Metal compiler and clang are given the same struct text, and this checks they agreed about it.
-// Every shared struct's size and alignment is read back from a kernel and compared against the host's,
-// so a layout that drifts fails here rather than as unexplained garbage in a solve.
+// The Metal compiler and clang compile the same struct text, and this checks the two layouts match.
+// Every shared struct's size and alignment is read back from a kernel and compared against the host's.
+// A layout drift fails here rather than corrupting a solve.
 
 #include "GpuSource.h"
 #include "gpu/Shared.h"
@@ -10,6 +10,8 @@
 #include <algorithm>
 
 #include <doctest/doctest.h>
+
+using namespace rbp;
 
 namespace {
 struct Layout {
@@ -62,7 +64,8 @@ TEST_CASE("shared structs have the same layout on host and device") {
     encoder->endEncoding();
     command_buffer->endCommandBuffer();
 
-    // Queue signalling is what safely publishes GPU writes to the CPU. Kernel-written flags are not reliable.
+    // Queue signalling publishes GPU writes to the CPU.
+    // Kernel-written flags are unreliable for this.
     auto done = NS::TransferPtr(context.Device->newSharedEvent());
     const MTL4::CommandBuffer *list[]{command_buffer.get()};
     context.Queue->commit(list, 1);
