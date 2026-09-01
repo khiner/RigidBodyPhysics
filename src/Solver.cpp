@@ -5,38 +5,32 @@
 #include <algorithm>
 #include <string_view>
 
+namespace rbp {
+
 namespace {
-// The one argument-table slot a step rebinds, and how many there are in all. Every other slot is
-// bound once in Step, from the list there - which is why the numbers live in that list and in
-// Solve.metal's [[buffer(n)]] indices and nowhere else.
+// The one argument-table slot a step rebinds, and the total slot count.
+// Every other slot is bound once from the list in Step, the only place the slot numbers appear outside Solve.metal's [[buffer(n)]] indices.
 constexpr uint32_t CursorAt = 14;
 constexpr uint32_t BindingCount = 31;
 
-// How many times the restitution pass sweeps its contacts. It is Jacobi - every contact computes an
-// impulse from one velocity snapshot and a gather applies them - so a manifold's points each answer for
-// the whole approach on the first pass, and the ones after share it out between them.
-//
-// Four because that is where it stops moving. A box dropped flat comes out the same to five figures at
-// one pass and at sixteen, its four points being symmetric, and dropped tilted onto a corner it leaves
-// 0.114 of its arrival speed after one pass, 0.0972 after two and 0.0976 after four, with eight and
-// sixteen bit-identical to four.
+// Sweeps of the restitution pass over its contacts.
+// The pass is Jacobi: every contact computes an impulse from one velocity snapshot, and a gather applies them.
+// Each point of a manifold therefore takes the whole approach speed on the first sweep, and later sweeps divide it between them.
+// Four is convergence, with eight and sixteen bit-identical.
 constexpr uint32_t RestitutionPasses = 4;
 
-// How many colour passes a sweep needs. Colouring is incremental, so what it settled on last step is
-// what it will want this one, and a spare on top is what it grows into as the scene closes up - one a
-// step, which is as fast as an incremental colouring moves anyway.
-//
-// Read off the world rather than remembered here, so a step stays a pure function of the world it is
-// handed and two runs of a scene still agree to the bit.
+// The number of colors a sweep dispatches.
+// Coloring is incremental, so last step's count carries over, plus one spare for the contacts a closing scene adds.
+// Counted from the world rather than cached in the solver, so a step stays a pure function of the world it is given.
 uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
     uint32_t used = 1;
     for (uint32_t body = 0; body < world.BodyCount(); ++body)
-        if (world.Masses[body].InvMass > 0) used = std::max(used, ColorOf(world.Colors[body]) + 1);
+        if (Moves(world.Masses[body])) used = std::max(used, ColorOf(world.Colors[body]) + 1);
     return std::clamp(used + 1, 1u, std::min(settings.MaxColors, MaxSupportedColors));
 }
 
-// The kernel each pass runs, in the order Solver::Pass names them. A prefix is where a #define goes
-// when one kernel text has to be compiled more than one way.
+// The kernel each pass runs, in the order of Solver::Pass.
+// A prefix supplies a #define when one kernel text is compiled more than one way.
 constexpr struct {
     const char *Name;
     std::string_view Prefix;
@@ -79,8 +73,8 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
     Done = NS::TransferPtr(context.Device->newSharedEvent());
 
     Params = {context.Device.get(), 1};
-    // One slot per colour, holding its own index, so a colour pass is selected by which slot the
-    // cursor binding points at rather than by a kernel dispatched between colours to count.
+    // One slot per color, holding its own index, so a color pass is selected by the slot the cursor binding points at.
+    // No counting kernel is dispatched between colors.
     ColorCursor = {context.Device.get(), MaxSupportedColors};
     for (uint32_t color = 0; color < MaxSupportedColors; ++color) ColorCursor[color] = color;
     Residency = NS::TransferPtr(context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
@@ -91,11 +85,14 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
     context.Queue->addResidencySet(Residency.get());
 }
 
-Solver::~Solver() { Context.Queue->removeResidencySet(Residency.get()); }
+Solver::~Solver() {
+    Context.Queue->removeResidencySet(Residency.get());
+    mtl::Drain(Context.Queue.get()); // see mtl::Drain
+}
 
 void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads) const {
     MTL::ComputePipelineState *pipeline = Pipelines[pass].get();
-    // Every pass reads what the one before it wrote, so every one of them earns its barrier.
+    // Every pass reads the previous pass's writes, so every dispatch takes a barrier.
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     encoder->setComputePipelineState(pipeline);
     const auto group = std::min<uint32_t>(threads, pipeline->maxTotalThreadsPerThreadgroup());
@@ -106,8 +103,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
     const uint32_t bodies = world.BodyCount();
     if (bodies == 0) return;
     const uint32_t joints = world.JointCount();
-    // Eight colour passes for a scene that only ever uses two is most of a step's dispatches spent on
-    // nothing. A stack is a chain, so it needs two.
+    // A scene using two colors would otherwise spend most of a step's dispatches on six empty color passes.
     const uint32_t colors = ColorsNeeded(world, settings);
 
     Params[0] = {
@@ -128,9 +124,8 @@ void Solver::Step(World &world, const StepSettings &settings) {
         .JointCount = joints,
         .MaxColors = colors,
     };
-    // Every buffer the kernels declare, at the slot it declares it in, so this list is the argument
-    // table's layout rather than a mirror of one. Params and the colour cursor are the solver's own,
-    // and the cursor is pointed at one colour's slot at a time by Encode.
+    // Every buffer the kernels declare, at its declared slot.
+    // This list is the argument table's layout, not a copy kept alongside one.
     const uint64_t bindings[]{
         world.Poses.Address(), // 0
         world.InitialPoses.Address(), // 1
@@ -169,28 +164,25 @@ void Solver::Step(World &world, const StepSettings &settings) {
 
     Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses});
 
-    // Queue signalling is what safely publishes the GPU's writes to the host, per Architecture.md.
+    // Queue signalling publishes the GPU's writes to the host safely, per Architecture.md.
     const MTL4::CommandBuffer *list[]{Commands.get()};
     Context.Queue->commit(list, 1);
     Context.Queue->signalEvent(Done.get(), ++Signal);
     while (!Done->waitUntilSignaledValue(Signal, 1000)) {}
-    // The step is over and the world is the host's again, which is what a body removed during the last
-    // one has been waiting for. See World::OnStepped.
+    // The GPU is done with the world, so a removal deferred during the step applies now. See World::OnStepped.
     world.OnStepped();
 }
 
 void Solver::Encode(const Recording &recording) {
     const uint32_t bodies = recording.Bodies, joints = recording.Joints;
     const uint32_t slots = bodies * ContactsPerBody;
-    // Safe to recycle the memory the last recording lived in: every step waits for its own completion,
-    // so nothing the GPU still holds is in there.
+    // Recycling the previous recording's memory is safe because every step waits for its own completion.
     Allocator->reset();
     Commands->beginCommandBuffer(Allocator.get());
     auto *encoder = Commands->computeCommandEncoder();
     encoder->setArgumentTable(Table.get());
 
-    // A colour pass per colour, so the cursor comes back in phase at the end of every sweep and the
-    // step always starts on colour zero without anyone having to reset it.
+    // One pass per color, so the cursor returns to color zero at the end of every sweep with no reset.
     const auto sweep = [&](Pass primal) {
         for (uint32_t color = 0; color < recording.Colors; ++color) {
             Table->setAddress(ColorCursor.Address() + color * sizeof(uint32_t), CursorAt);
@@ -200,12 +192,10 @@ void Solver::Encode(const Recording &recording) {
     };
 
     Dispatch(encoder, IntegratePass, bodies);
-    // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from,
-    // and only then does WarmStart move the body to its starting guess - which is the order the
-    // reference solves in and the only one where the Taylor series is expanded about the pose it is
-    // measured at.
+    // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from, before WarmStart moves the body to its starting guess.
+    // This is the reference's order, and the only one that expands the Taylor series about the pose the constraint was measured at.
     Dispatch(encoder, CollectPass, bodies);
-    // Gather each body's contacts-as-B into a run of its own, so nothing below has to sweep the pool.
+    // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
     Dispatch(encoder, CountIncomingPass, slots);
     Dispatch(encoder, ScanIncomingPass, 1);
     Dispatch(encoder, FillIncomingPass, slots);
@@ -221,24 +211,19 @@ void Solver::Encode(const Recording &recording) {
         Dispatch(encoder, DualPass, slots);
         if (joints > 0) Dispatch(encoder, JointDualPass, joints);
     }
-    // Velocity comes from the motion the iterations above produced, and is taken before the pass
-    // below, so removing leftover penetration does not hand the body the energy that motion implies.
+    // Velocity is taken from the motion the iterations above produced, before the stabilization sweep, so removing leftover penetration adds no velocity.
     Dispatch(encoder, FinalizePass, bodies);
-    // Restitution, which is a velocity pass on that velocity rather than a row inside the solve - see
-    // Restitution for why a gapped contact leaves it no choice. It runs before sleeping is counted,
-    // since a body just handed a rebound is not a body that has come to rest.
+    // Restitution runs as a velocity pass rather than as a row inside the solve. See Restitution for the gapped-contact case that requires it.
+    // It runs before quiet counting, because a body given a rebound this step is not at rest.
     for (uint32_t pass = 0; pass < RestitutionPasses; ++pass) {
         Dispatch(encoder, RestitutionPass, slots);
         Dispatch(encoder, ApplyRestitutionPass, bodies);
     }
     sweep(StabilizePass);
-    // Whose turn it is to sleep is settled at the very end of a step, after the stabilization sweep, so
-    // a body's sleep state is one answer for every kernel of a step. Published before the sweep
-    // instead, a body the spread wakes runs a stabilization pass for a step it slept through: it was
-    // asleep at Integrate, so its inertial target is its frozen pose with no gravity in it, while its
-    // contact duals still carry the upward force balancing gravity - so the pass moves it M g / H out
-    // of its rest pose with no velocity, and the body above inherits that as penetration at full
-    // penalty. A settled ten-coin stack collapsed from nothing else.
+    // Sleep state is settled at the very end of a step, after the stabilization sweep, so every kernel of a step sees one sleep state per body.
+    // Published before the sweep, a body woken by the spread would run a stabilization pass for a step it slept through.
+    // Asleep at Integrate its inertial target is its frozen pose with no gravity in it, while its contact duals still carry the force balancing gravity.
+    // The pass then shifts it out of rest and the body above penetrates it.
     Dispatch(encoder, CountQuietPass, bodies);
     Dispatch(encoder, SpreadWakingPass, bodies);
     Dispatch(encoder, PublishWakingPass, bodies);
@@ -246,3 +231,5 @@ void Solver::Encode(const Recording &recording) {
     encoder->endEncoding();
     Commands->endCommandBuffer();
 }
+
+} // namespace rbp
