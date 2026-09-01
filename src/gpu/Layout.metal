@@ -1,5 +1,4 @@
-// Reports what the Metal compiler made of every shared struct, so a host test can compare it against
-// what clang made of the same text. This is the check that keeps Shared.h honest.
+// Reports the size and alignment the Metal compiler gives every shared struct, for a host test to compare against clang's from the same text.
 
 kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i != 0) return;
