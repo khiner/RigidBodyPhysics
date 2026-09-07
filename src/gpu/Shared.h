@@ -187,6 +187,7 @@ struct Shape {
     uint HasMaterial = 0;
     CollisionMask Mask{};
     uint HasFilter = 0;
+    ulong UserData = 0; // opaque collider identity, preserved when shapes are copied
 };
 
 inline CollisionMask ResolveFilter(Shape shape, CollisionMask inherited) { return shape.HasFilter ? shape.Mask : inherited; }
@@ -303,6 +304,8 @@ struct Contact {
     float3 AnchorA; // in body A's frame
     float3 AnchorB; // in body B's frame
     float3 Normal; // world, out of B towards A
+    float3 PointA, PointB; // fresh geometric points in body frames, independent of retained friction anchors
+    float NominalArea = -1, NominalExtent = 0; // unreduced projected patch; area -1 when reporting was disabled
     float3 C0;
     float3 Lambda; // the force each row is applying, and the dual the solve converges
     float3 Penalty;
@@ -484,6 +487,7 @@ struct StepParams {
     uint JointCount;
     // A body with no free color below this keeps its own and solves Jacobi against its neighbour, which the double buffering supports.
     uint MaxColors;
+    uint ReportContacts; // retain unreduced manifold geometry for the host contact stream
 };
 
 inline float4 QuatConjugate(float4 q) { return MakeFloat4(-q.xyz, q.w); }

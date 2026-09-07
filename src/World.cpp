@@ -380,12 +380,13 @@ void World::EndContacts(Index body) {
     const auto end = [this](Contact &contact) {
         if (TrackContacts)
             Changes.push_back({
-                .A = {contact.BodyA, Spawns[contact.BodyA]},
-                .B = {contact.BodyB, Spawns[contact.BodyB]},
+                .A = IdOf(contact.BodyA),
+                .B = IdOf(contact.BodyB),
                 .Feature = contact.Feature,
                 .SubShape = contact.SubShape,
                 .Children = contact.Children,
                 .Kind = ContactRemoved,
+                .Step = CompletedSteps,
             });
         contact.Active = false;
     };
@@ -476,25 +477,39 @@ void World::UpdateSensorOverlaps() {
 // A live contact's event takes its excitation record by position rather than by search.
 // CollectContacts writes one event per live slot in slot order before EndUnclaimed appends the removals.
 // A body's added and persisted events are therefore its contact run, in order.
-void World::DrainContactEvents() {
+void World::DrainContactEvents(float delta_time) {
     if (!TrackContacts) return;
+    const auto side = [this](Index body, uint32_t child, float3 point, float3 anchor) -> ContactSide {
+        const Index root = BodyShapes[body];
+        const auto user_data = Shapes[Shapes[root].Kind == ShapeCompound ? Child(root, child) : root].UserData;
+        return {InitialPoses[body], Poses[body], Velocities[body], point, anchor, user_data, Masses[body].InvMass};
+    };
     for (Index body = 0; body < NumBodies; ++body) {
         uint32_t live = 0;
         for (uint32_t i = 0; i < ContactEventCounts[body]; ++i) {
             const ContactEvent &event = ContactEvents[body * EventsPerBody + i];
             ContactChange change{
-                .A = {event.BodyA, Spawns[event.BodyA]},
-                .B = {event.BodyB, Spawns[event.BodyB]},
+                .A = IdOf(event.BodyA),
+                .B = IdOf(event.BodyB),
                 .Feature = event.Feature,
                 .SubShape = event.SubShape,
                 .Children = event.Children,
                 .Kind = ContactEventKind(event.Kind),
+                .Step = CompletedSteps,
+                .DeltaTime = delta_time,
             };
             if (change.Kind != ContactRemoved) {
                 const Contact &contact = Contacts[body * ContactsPerBody + live++];
                 change.Lambda = contact.Lambda;
                 change.Approach = contact.Approach;
                 change.BounceImpulse = contact.BounceImpulse;
+                change.SideA = side(event.BodyA, OwnChild(event.Children), contact.PointA, contact.AnchorA);
+                change.SideB = side(event.BodyB, OtherChild(event.Children), contact.PointB, contact.AnchorB);
+                change.Normal = contact.Normal;
+                change.Friction = contact.Friction;
+                change.Restitution = contact.Restitution;
+                change.NominalArea = contact.NominalArea;
+                change.NominalExtent = contact.NominalExtent;
             }
             Changes.push_back(change);
         }
@@ -579,6 +594,7 @@ Index World::CopyShape(Shape copy) {
         }
         const Index result = AddMesh(ShapeVertices.All().subspan(copy.FirstVertex, copy.VertexCount), indices, copy.Local);
         if (result != NoIndex) {
+            Shapes[result].UserData = copy.UserData;
             Shapes[result].Surface = copy.Surface;
             Shapes[result].HasMaterial = copy.HasMaterial;
             Shapes[result].Mask = copy.Mask;
@@ -960,10 +976,11 @@ bool World::SetBodyShape(Index body, Index shape, float density, std::optional<A
     return true;
 }
 
-void World::OnStepped() {
+void World::OnStepped(float delta_time) {
+    ++CompletedSteps;
     UpdateSensorOverlaps();
     // The step's events first, so the queue holds every event of the step before RemoveBody or SetBodyShape can append a synthesized removal.
-    DrainContactEvents();
+    DrainContactEvents(delta_time);
     // A body removed between steps is not recycled until a step has run.
     // The event runs the previous step wrote still name it until this step overwrites them, and a slot standing idle for the step keeps those readable.
     // BodyId's spawn counter covers anything held longer.

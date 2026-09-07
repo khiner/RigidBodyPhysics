@@ -125,6 +125,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
         .BodyCount = bodies,
         .JointCount = joints,
         .MaxColors = colors,
+        .ReportContacts = world.TrackContacts,
     };
     // Every buffer the kernels declare, at its declared slot.
     // This list is the argument table's layout, not a copy kept alongside one.
@@ -172,7 +173,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
     Context.Queue->signalEvent(Done.get(), ++Signal);
     while (!Done->waitUntilSignaledValue(Signal, 1000)) {}
     // The GPU is done with the world, so a removal deferred during the step applies now. See World::OnStepped.
-    world.OnStepped();
+    world.OnStepped(settings.DeltaTime);
 }
 
 void Solver::Encode(const Recording &recording, World &world) {

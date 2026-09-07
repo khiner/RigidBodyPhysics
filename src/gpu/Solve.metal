@@ -1138,6 +1138,44 @@ static uint WeldManifold(thread float3 *here, thread float3 *there, thread uint 
     return kept;
 }
 
+// Project the unreduced patch onto its tangent plane. Gift wrapping handles unordered points,
+// including interior and collinear points. Stationary patches use their diameter as extent.
+static float2 ManifoldGeometry(thread const float3 *points, uint count, float3 normal, Pose a, Pose b, Velocity va, Velocity vb) {
+    if (count < 2) return float2(0);
+    float3 center = float3(0);
+    for (uint i = 0; i < count; ++i) center += points[i];
+    center /= count;
+    const float3 relative = va.Linear + cross(va.Angular, center - a.Position) - (vb.Linear + cross(vb.Angular, center - b.Position));
+    const float3 slip = relative - normal * dot(relative, normal);
+    const ContactBasis basis = MakeContactBasis(normal);
+    float2 projected[MaxClipPoints];
+    uint first = 0;
+    for (uint i = 0; i < count; ++i) {
+        const float3 offset = points[i] - points[0];
+        projected[i] = float2(dot(offset, basis.Axis[1]), dot(offset, basis.Axis[2]));
+        if (projected[i].x < projected[first].x || (projected[i].x == projected[first].x && projected[i].y < projected[first].y)) first = i;
+    }
+    const float speed = length(slip);
+    const float2 direction = speed > 1e-6f ? float2(dot(slip, basis.Axis[1]), dot(slip, basis.Axis[2])) / speed : float2(0);
+    float extent = 0, twice_area = 0;
+    uint at = first;
+    for (uint edge = 0; edge < count; ++edge) {
+        uint next = (at + 1) % count;
+        for (uint i = 0; i < count; ++i) {
+            const float2 a = projected[next] - projected[at], b = projected[i] - projected[at];
+            // Extent is attained at hull vertices, so this walk also finds the widest span.
+            extent = max(extent, speed > 1e-6f ? abs(dot(b, direction)) : length(b));
+            const float turn = a.x * b.y - a.y * b.x;
+            if (turn < 0 || (turn == 0 && dot(b, b) > dot(a, a))) next = i;
+        }
+        const float2 a = projected[at], b = projected[next];
+        twice_area += a.x * b.y - a.y * b.x;
+        at = next;
+        if (all(projected[at] == projected[first])) break;
+    }
+    return float2(0.5f * abs(twice_area), extent);
+}
+
 // The four points of a manifold with the largest area between them, Gregorius's reduction (GDC 2015).
 // The talk is kept at ~/acoustic_solver_papers/2015_gregorius_robust-contact-creation.pdf.
 // Four points hold a face contact against turning as well as sliding.
@@ -1369,11 +1407,12 @@ kernel void CollectContacts(
     const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
 
     uint count = 0;
-// A sleeping body's pairs against equally frozen partners are carried forward verbatim.
-// Neither pose has moved, so every anchor, C0 and dual is still exact.
-// Coverage survives because an approaching body is awake and its pairs are re-collided from whichever side owns them.
-// Sleep state is settled once a step, so both sides agree on frozen without communicating.
-// Frozen rather than static or asleep: a kinematic body is moved by nothing here yet is moving, and an undriven static body has not moved either.
+    // A sleeping body's pairs against equally frozen partners are carried forward verbatim.
+    // Neither pose has moved, so every anchor, C0 and dual is still exact.
+    // Coverage survives because an approaching body is awake and its pairs are re-collided from whichever side owns them.
+    // Sleep state is settled once a step, so both sides agree on frozen without communicating.
+    // Frozen rather than static or asleep: a kinematic body is moved by nothing here yet is moving, and an undriven static body has not moved either.
+    bool measure_cached = false;
 #if SENSOR_PASS
     const bool frozen = false;
 #else
@@ -1391,6 +1430,12 @@ kernel void CollectContacts(
             // A compacting copy, and j never runs ahead of count.
             slots[count] = slots[j];
             slots[count].Active = true;
+            slots[count].Approach = slots[count].BounceImpulse = slots[count].BounceDelta = 0;
+            // Reporting enabled after sleep measures geometry without replacing cached solver rows.
+            if (p.ReportContacts && slots[count].NominalArea < 0) {
+                slots[count].NominalArea = slots[count].NominalExtent = 0;
+                measure_cached = true;
+            }
             inherited[count] = j;
             ++count;
         }
@@ -1414,7 +1459,8 @@ kernel void CollectContacts(
             const Index other_shape = body_shapes[other];
             if (other == body || other_shape == NoIndex) continue;
             // The pairs the carry above holds, two frozen poses producing nothing new.
-            if (frozen && Frozen(masses[other], velocities[other], quiet[other], p)) continue;
+            const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
+            if (cached_pair && !measure_cached) continue;
             // One manifold per pair, owned by the lower-indexed body, as the references do.
             // Generating it from both sides gives two independent constraint sets with two sets of duals for one physical contact.
             // Jacobi's symmetry hides that and Gauss-Seidel does not.
@@ -1535,6 +1581,7 @@ kernel void CollectContacts(
                         // set changes.
                         uint features[MaxClipPoints];
                         uint found = 0;
+                        float2 patch{-1, 0};
 
                         const bool hulled = shape.Kind == ShapeHull || target.Kind == ShapeHull;
                         if (target.Kind == ShapeMesh) {
@@ -1569,6 +1616,10 @@ kernel void CollectContacts(
                             if (searched)
                                 found = ConvexManifold(face, own_poly, hull_vertices, hull_faces, reach, float3(0), points_there, points_here, features, normal);
                             normal = -normal;
+#if !SENSOR_PASS
+                            // Seam ownership removes solver points without shrinking the geometric patch.
+                            if (p.ReportContacts) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
+#endif
 
                             // A point one seam cut is cut by the triangle across it too, so both would hold one piece of geometry with a dual each.
                             // Dropping it from both loses nothing, only the tessellation having put it there.
@@ -1939,6 +1990,17 @@ kernel void CollectContacts(
 
                         // No two rows on one piece of geometry, then the four worth keeping.
                         found = WeldManifold(points_here, points_there, features, found, weld);
+#if !SENSOR_PASS
+                        if (p.ReportContacts && patch.x < 0) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
+#endif
+                        if (cached_pair) {
+                            for (uint k = 0; k < count; ++k)
+                                if (slots[k].BodyB == other && slots[k].Children == children && slots[k].SubShape == sub_shape) {
+                                    slots[k].NominalArea = patch.x;
+                                    slots[k].NominalExtent = patch.y;
+                                }
+                            continue;
+                        }
                         found = ReduceManifold(points_here, points_there, features, found, normal);
 
                         // Whether either side has siblings, the only way two manifolds of one pair can land on the same geometry.
@@ -1984,6 +2046,10 @@ kernel void CollectContacts(
                             device Contact &contact = slots[at];
                             contact.AnchorA = anchor_a;
                             contact.AnchorB = anchor_b;
+                            contact.PointA = anchor_a;
+                            contact.PointB = anchor_b;
+                            contact.NominalArea = patch.x;
+                            contact.NominalExtent = patch.y;
                             contact.Normal = normal;
                             contact.BodyA = body;
                             contact.BodyB = other;

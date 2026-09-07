@@ -136,6 +136,25 @@ struct BodyId {
     bool operator==(const BodyId &) const = default;
 };
 
+// A geometric manifold, independent of point features and solver ownership order.
+// The adapter assigns lifetime IDs; this key can recur after separation.
+struct ContactManifold {
+    BodyId A, B; // sorted by body slot
+    uint32_t ChildA, ChildB;
+    Index SubShapeA, SubShapeB; // triangle on each side, or NoIndex
+    bool operator==(const ContactManifold &) const = default;
+};
+
+// One side's state copied at the reporting boundary, independent of later world mutations.
+struct ContactSide {
+    Pose InitialPose = IdentityPose; // collision geometry and AVBD force frame
+    Pose Pose = IdentityPose; // end-of-step COM pose
+    Velocity Velocity{}; // end-of-step world velocity
+    float3 Point{}, Anchor{}; // local COM frame: geometric point and possibly retained friction anchor
+    uint64_t UserData = 0; // leaf Shape::UserData, valid after shape removal/replacement
+    float InvMass = 0;
+};
+
 // One change to one contact, in host terms: the kernel's ContactEvent in identities that survive slot reuse.
 // It carries the excitation record read back from the contact as the step left it.
 // Body A owns the manifold, so a pair is reported exactly once. See World::TrackContacts.
@@ -151,7 +170,27 @@ struct ContactChange {
     float3 Lambda{};
     float Approach = 0; // how fast the pair was closing when the step began
     float BounceImpulse = 0; // the normal impulse the restitution pass applied this step
-    // All three are zero on a removal, which has no contact left to read them from.
+    // Removals carry identity and timing only; solved data are zero/default.
+    uint64_t Step = 0; // one-based completed step, or last completed step for a host-side removal
+    float DeltaTime = 0; // seconds; zero for host-side removals
+    ContactSide SideA, SideB;
+    float3 Normal{}; // world, into A
+    float Friction = 0, Restitution = 0;
+    // Projected patch before four-point reduction, in m^2 and m. Extent follows initial slip
+    // at the patch centroid, or is its diameter when stationary. Shared by all points of a manifold.
+    float NominalArea = 0, NominalExtent = 0;
+
+    ContactManifold Manifold() const {
+        return A.Slot < B.Slot ? ContactManifold{A, B, OwnChild(Children), OtherChild(Children), NoIndex, SubShape} : ContactManifold{B, A, OtherChild(Children), OwnChild(Children), SubShape, NoIndex};
+    }
+    // AVBD constraint force in newtons, including support. B receives its negative.
+    float3 ForceOnA() const {
+        const auto basis = MakeContactBasis(Normal);
+        return -(Lambda.x * basis.Axis[0] + Lambda.y * basis.Axis[1] + Lambda.z * basis.Axis[2]);
+    }
+    // Constraint impulse estimate plus the velocity pass's impulse, in N s.
+    // Momentum agreement depends on solver convergence; post-stabilization contributes no impulse.
+    float3 ImpulseOnA() const { return DeltaTime * ForceOnA() + BounceImpulse * Normal; }
 };
 
 // One overlapping collider pair. Identities remain valid across body-slot reuse.
@@ -248,7 +287,7 @@ struct World {
     void Wake(Index body);
 
     // Called by Solver::Step once the step's commands have completed. See RemoveBody.
-    void OnStepped();
+    void OnStepped(float delta_time);
 
     // While set, OnStepped copies each step's event runs into a CPU-side queue.
     // That copy happens inside Step, so the queue holds every event of the step before the host can mutate anything.
@@ -364,7 +403,7 @@ private:
     // A sustained excitation that ends without a removal rings for ever.
     void EndContacts(Index body);
     // The step's event runs, translated and appended to the queue. See TrackContacts.
-    void DrainContactEvents();
+    void DrainContactEvents(float delta_time);
     void UpdateSensorOverlaps();
     void EndSensorOverlaps(Index);
     // Releases the pool runs and the slot itself, without RemoveShape's checks on remaining users.
@@ -391,6 +430,7 @@ private:
     // Host-side state, read by no kernel.
     std::vector<uint32_t> Spawns;
     std::vector<ContactChange> Changes;
+    uint64_t CompletedSteps = 0;
     std::vector<SensorOverlap> SensorOverlaps;
     std::vector<SensorChange> SensorChanges;
 };
