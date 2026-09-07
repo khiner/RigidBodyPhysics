@@ -148,7 +148,7 @@ inline AuthoredMass WheelMass(float mass = 20) {
 // Mass properties of a shape already in `world`.
 // A compound reads its children out of the world's pools, so both spans are always passed.
 inline BodyMass MassOf(const World &world, Index shape, float density) {
-    return MassProperties(world.Shapes[shape], density, world.ShapeVertices.All(), world.Shapes.All());
+    return MassProperties(world.Shapes[shape], density, world.ShapeVertices.All(), world.Shapes.All(), world.CompoundChildren.All());
 }
 
 // The count of active contacts in the whole world, and in one body's own run.

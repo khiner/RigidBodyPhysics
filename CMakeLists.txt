@@ -71,6 +71,7 @@ target_sources(rbp PRIVATE ${GeneratedGpuSource})
 # probes/VectorMiscompile.cpp reproduces it, re-checkable with OPT=-O2 ./run VectorMiscompile.
 # Set on the target because the later flag wins, so an embedding host's -O2 cannot override it.
 target_compile_options(rbp PRIVATE -O1)
+target_compile_features(rbp PUBLIC cxx_std_23)
 target_include_directories(rbp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/gen)
 target_include_directories(rbp SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib/metal-cpp)
 target_link_libraries(rbp PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")

@@ -195,7 +195,7 @@ void Stack(std::span<char *> args) {
 struct PileChurn {
     // The whole identity CollectContacts matches a warm start on: feature, triangle, and pair of leaves.
     // No part of it is a slot index.
-    using Name = std::tuple<Index, Index, uint32_t, Index, uint32_t>;
+    using Name = std::tuple<Index, Index, uint32_t, Index, uint64_t>;
     struct Row {
         float3 At; // the point in world space, used to match two names at one place
         float Push; // the normal dual, negated, so a loaded row reads positive
@@ -764,8 +764,8 @@ void Compound(std::span<char *> args) {
     const Index over_seam = AddSlider(jointed, speed), over_two = AddSlider(separate, speed), over_none = AddSlider(seamless, speed);
     std::println("a box slid at {:g} m/s across a floor of two boxes, against the same floor as one - the kick is how far it left the height the control kept", speed);
     std::print("  the join the two halves share, as the faces each of them found buried (the weld buried {} between the two bodies):", welded);
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i) {
-        const Index child = ChildOf(jointed.Shapes[floor_shape], i);
+    for (uint32_t i = 0; i < jointed.Shapes[floor_shape].VertexCount; ++i) {
+        const Index child = jointed.Child(floor_shape, i);
         if (child == NoIndex) break;
         std::print("  child {} mask {:#06b}", i, InternalFaces(jointed.Shapes[child]));
     }
@@ -803,7 +803,7 @@ void Compound(std::span<char *> args) {
     AddGround(eight);
     constexpr float Cube = 0.2f;
     std::vector<Index> cubes;
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i)
+    for (uint32_t i = 0; i < 8; ++i)
         cubes.push_back(eight.AddShape({.HalfExtents = {Cube, Cube, Cube}, .Kind = ShapeBox, .Local = At(float3{2.5f * Cube * (float(i) - 3.5f), 0, 0})}));
     Pose row_frame{};
     const Index row_shape = AddCompound(eight, cubes, row_frame, "row of eight");

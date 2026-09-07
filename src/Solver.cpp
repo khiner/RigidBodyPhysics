@@ -56,6 +56,7 @@ constexpr struct {
     {"CountQuiet"},
     {"SpreadWaking"},
     {"PublishWaking"},
+    {"CollectSensorContacts", "#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
 };
 } // namespace
 
@@ -102,6 +103,7 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
 void Solver::Step(World &world, const StepSettings &settings) {
     const uint32_t bodies = world.BodyCount();
     if (bodies == 0) return;
+    world.RefreshFilters();
     const uint32_t joints = world.JointCount();
     // A scene using two colors would otherwise spend most of a step's dispatches on six empty color passes.
     const uint32_t colors = ColorsNeeded(world, settings);
@@ -137,12 +139,12 @@ void Solver::Step(World &world, const StepSettings &settings) {
         Params.Address(), // 7
         world.Shapes.Address(), // 8
         world.PreviousVelocities.Address(), // 9
-        world.Frictions.Address(), // 10
+        world.Materials.Address(), // 10
         world.SolvedPoses.Address(), // 11
         world.Colors.Address(), // 12
         world.NextColors.Address(), // 13
         ColorCursor.Address(), // 14
-        world.Restitutions.Address(), // 15
+        world.CompoundChildren.Address(), // 15
         world.Joints.Address(), // 16
         world.Incoming.Address(), // 17
         world.IncomingSlots.Address(), // 18
@@ -162,7 +164,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
     static_assert(sizeof(bindings) / sizeof(bindings[0]) == BindingCount, "one address per slot the table holds");
     for (uint32_t slot = 0; slot < BindingCount; ++slot) Table->setAddress(bindings[slot], slot);
 
-    Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses});
+    Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses}, world);
 
     // Queue signalling publishes the GPU's writes to the host safely, per Architecture.md.
     const MTL4::CommandBuffer *list[]{Commands.get()};
@@ -173,7 +175,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
     world.OnStepped();
 }
 
-void Solver::Encode(const Recording &recording) {
+void Solver::Encode(const Recording &recording, World &world) {
     const uint32_t bodies = recording.Bodies, joints = recording.Joints;
     const uint32_t slots = bodies * ContactsPerBody;
     // Recycling the previous recording's memory is safe because every step waits for its own completion.
@@ -227,6 +229,15 @@ void Solver::Encode(const Recording &recording) {
     Dispatch(encoder, CountQuietPass, bodies);
     Dispatch(encoder, SpreadWakingPass, bodies);
     Dispatch(encoder, PublishWakingPass, bodies);
+
+    bool sensors = !world.Overlaps().empty();
+    for (Index body = 0; body < bodies && !sensors; ++body) sensors = world.Alive(body) && world.Filters[body].Sensor;
+    if (sensors) {
+        world.EnsureSensorBuffers();
+        Table->setAddress(world.SensorContacts.Address(), 5);
+        Table->setAddress(world.SensorRefusals.Address(), 26);
+        Dispatch(encoder, SensorPass, bodies);
+    }
 
     encoder->endEncoding();
     Commands->endCommandBuffer();

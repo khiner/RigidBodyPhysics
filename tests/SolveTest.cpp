@@ -70,8 +70,8 @@ float ShapeReach(const World &world, Index shape) {
     // A compound reuses the run fields for its children - see Shape.
     if (it.Kind == ShapeCompound) {
         float reach = 0;
-        for (uint32_t i = 0; i < ChildrenPerCompound; ++i) {
-            const Index child = ChildOf(it, i);
+        for (uint32_t i = 0; i < it.VertexCount; ++i) {
+            const Index child = world.Child(shape, i);
             if (child == NoIndex) break;
             reach = std::max(reach, simd::length(world.Shapes[child].Local.Position) + ShapeReach(world, child));
         }
@@ -142,7 +142,7 @@ float NormalForce(const World &world, Index body) {
 
 // Every active contact, keyed the way warm starting keys them.
 // The leaf pair is part of the key because two children of one compound can share a feature against the same partner.
-using ContactKeySet = std::set<std::tuple<Index, Index, uint32_t, uint32_t>>;
+using ContactKeySet = std::set<std::tuple<Index, Index, uint32_t, uint64_t>>;
 
 ContactKeySet ContactKeys(const World &world) {
     ContactKeySet keys;
@@ -4379,7 +4379,7 @@ TEST_CASE_FIXTURE(OnDevice, "a compound of one child is that child") {
         CheckManifolds(wrapped);
         // Compared through the geometry rather than the origin, since the compound moved its own.
         const Pose mine = ComposePose(alone.Poses[one], alone.Shapes[bare].Local);
-        const Pose theirs = ComposePose(wrapped.Poses[other], wrapped.Shapes[ChildOf(wrapped.Shapes[compound], 0)].Local);
+        const Pose theirs = ComposePose(wrapped.Poses[other], wrapped.Shapes[wrapped.Child(compound, 0)].Local);
         worst = std::max(worst, float(simd::distance(mine.Position, theirs.Position)));
         worst = std::max(worst, simd::length(RotationVector(QuatMul(mine.Orientation, QuatConjugate(theirs.Orientation)))));
     }
@@ -4462,7 +4462,7 @@ TEST_CASE_FIXTURE(OneWorld, "a table stands on its four legs at the height its l
     CHECK(world.ContactRefusals[body] == 0);
 
     // `frame` maps the top back to where the host authored it.
-    const Index top = ChildOf(world.Shapes[table], 0);
+    const Index top = world.Child(table, 0);
     REQUIRE(top != NoIndex);
     const Pose local = world.Shapes[top].Local;
     const float3 at = WorldPoint(pose, local.Position);
@@ -4506,7 +4506,7 @@ TEST_CASE_FIXTURE(OneWorld, "eight leaves on a plane each get a manifold of thei
     constexpr float Cube = 0.2f;
     AddGround(world, {.Friction = 0.5f});
     std::vector<Index> cubes;
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i)
+    for (uint32_t i = 0; i < 8; ++i)
         cubes.push_back(world.AddShape({.HalfExtents = {Cube, Cube, Cube}, .Kind = ShapeBox, .Local = At(float3{2.5f * Cube * (float(i) - 3.5f), 0, 0})}));
     Pose frame{};
     const Index row = world.AddCompound(cubes, &frame);
@@ -4515,13 +4515,13 @@ TEST_CASE_FIXTURE(OneWorld, "eight leaves on a plane each get a manifold of thei
     REQUIRE(body != NoIndex);
 
     Run(solver, world, 200);
-    CHECK(ActiveContacts(world, body) == ChildrenPerCompound * ManifoldPoints); // four points per leaf, eight leaves
+    CHECK(ActiveContacts(world, body) == 8 * ManifoldPoints); // four points per leaf, eight leaves
     CHECK(world.ContactRefusals[body] == 0);
     const Pose pose = world.Poses[body];
     CheckResting(float(pose.Position.y) + Half - Cube);
     CHECK(simd::length(RotationVector(pose.Orientation)) < 1e-4f); // level rather than standing on a few of them
     const std::set<uint32_t> leaves = LeavesTouching(world, body);
-    CHECK(leaves.size() == ChildrenPerCompound);
+    CHECK(leaves.size() == 8);
 }
 
 TEST_CASE_FIXTURE(OnDevice, "the join two coplanar siblings share is not a wall") {
@@ -4543,8 +4543,8 @@ TEST_CASE_FIXTURE(OnDevice, "the join two coplanar siblings share is not a wall"
     const Index floor = jointed.AddCompound(parts, &frame);
     REQUIRE(floor != NoIndex);
     // Each half has exactly the one face of itself the other covers.
-    CHECK(InternalFaces(jointed.Shapes[ChildOf(jointed.Shapes[floor], 0)]) == 1u << BoxFaceIndex(0, true));
-    CHECK(InternalFaces(jointed.Shapes[ChildOf(jointed.Shapes[floor], 1)]) == 1u << BoxFaceIndex(0, false));
+    CHECK(InternalFaces(jointed.Shapes[jointed.Child(floor, 0)]) == 1u << BoxFaceIndex(0, true));
+    CHECK(InternalFaces(jointed.Shapes[jointed.Child(floor, 1)]) == 1u << BoxFaceIndex(0, false));
     jointed.AddBody({.Pose = At(frame.Position), .Shape = floor, .Density = 0, .Friction = 0.5f});
     for (const float side : {-1.f, 1.f})
         separate.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}),
@@ -4588,4 +4588,282 @@ TEST_CASE_FIXTURE(OnDevice, "a scene holding a compound steps to bit-identical s
                                    .Shape = box, .Friction = 0.5f}) != NoIndex);
         Run(solver, world, 200);
     });
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: material policies and collider overrides reach the contact") {
+    const Material floor{.StaticFriction = 0.8f, .DynamicFriction = 0.2f, .Restitution = 0.2f, .FrictionCombine = CombineMinimum, .RestitutionCombine = CombineMultiply};
+    AddGround(world, {.Surface = floor});
+    Shape box = UnitBox;
+    box.HasMaterial = true;
+    box.Surface = {.StaticFriction = 0.4f, .DynamicFriction = 0.1f, .Restitution = 0.6f, .FrictionCombine = CombineAverage, .RestitutionCombine = CombineMaximum};
+    const auto body = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = world.AddShape(box), .Surface = Material{}});
+    solver.Step(world);
+    REQUIRE(ActiveContacts(world, body) > 0);
+    for (const auto &contact : world.Contacts.All())
+        if (contact.Active) {
+            CHECK(contact.Friction == doctest::Approx(0.6f));
+            CHECK(contact.Restitution == doctest::Approx(0.6f));
+        }
+    world.Velocities[body].Linear = {1, 0, 0};
+    world.Wake(body);
+    solver.Step(world);
+    for (const auto &contact : world.Contacts.All())
+        if (contact.Active)
+            CHECK(contact.Friction == doctest::Approx(0.15f));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: a drive pushes against its independent stop") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto anchor = world.AddBody({.Shape = shape, .Density = 0});
+    const auto body = world.AddBody({.Shape = shape, .Density = 1});
+    JointDesc joint{.BodyA = body, .BodyB = anchor, .Linear = {AxisLimited, AxisLocked, AxisLocked}, .LinearLimitLow = {-0.5f, 0, 0}, .LinearLimitHigh = {0.5f, 0, 0}};
+    joint.Drives[0] = {.Enabled = 1, .Speed = 1, .MaxForce = 10, .Damping = 10};
+    REQUIRE(world.AddJoint(joint) != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}};
+    for (int i = 0; i < 180; ++i) solver.Step(world, settings);
+    CHECK(world.Poses[body].Position.x == doctest::Approx(0.5f).epsilon(0.01));
+    CHECK(std::abs(world.Velocities[body].Linear.x) < 0.01f);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: independently authored joint frames align") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto anchor = world.AddBody({.Shape = shape, .Density = 0});
+    const auto body = world.AddBody({.Shape = shape, .Density = 1});
+    const auto turn = QuatFromRotationVector(float3{0, 0, 0.6f});
+    REQUIRE(world.AddJoint({.BodyA = body, .BodyB = anchor, .FrameA = turn, .FrameB = float4{0, 0, 0, 1}, .Angular = {AxisLocked, AxisLocked, AxisLocked}}) != NoIndex);
+    for (int i = 0; i < 120; ++i) solver.Step(world, {.Gravity = {0, 0, 0}});
+    CHECK(length(RotationVector(QuatMul(world.Poses[body].Orientation, turn))) < 0.002f);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: a radial limit bounds distance rather than each coordinate") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto anchor = world.AddBody({.Shape = shape, .Density = 0});
+    const auto body = world.AddBody({.Shape = shape, .Density = 1});
+    JointDesc joint{.BodyA = body, .BodyB = anchor, .Linear = {AxisLimited, AxisFree, AxisFree}, .LinearLimitLow = {0, 0, 0}, .LinearLimitHigh = {1, 0, 0}};
+    joint.LinearLimitAxes[0] = 7;
+    REQUIRE(world.AddJoint(joint) != NoIndex);
+    for (int i = 0; i < 240; ++i) solver.Step(world, {.Gravity = {3, 4, 0}});
+    const auto at = world.Poses[body].Position;
+    CHECK(length(at) == doctest::Approx(1).epsilon(0.005));
+    CHECK(at.x == doctest::Approx(0.6f).epsilon(0.01));
+    CHECK(at.y == doctest::Approx(0.8f).epsilon(0.01));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: a cone limit bounds combined swing") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto anchor = world.AddBody({.Shape = shape, .Density = 0});
+    const auto body = world.AddBody({.Shape = shape, .Density = 1});
+    JointDesc joint{.BodyA = body, .BodyB = anchor, .Angular = {AxisFree, AxisLimited, AxisFree}, .LimitLow = {0, 0, 0}, .LimitHigh = {0, 0.4f, 0}};
+    joint.AngularLimitAxes[1] = 6;
+    joint.Drives[4] = {.Enabled = 1, .Speed = 1, .MaxForce = 1, .Damping = 1};
+    joint.Drives[5] = joint.Drives[4];
+    REQUIRE(world.AddJoint(joint) != NoIndex);
+    for (int i = 0; i < 180; ++i) solver.Step(world, {.Gravity = {0, 0, 0}});
+    const auto axis = Rotate(world.Poses[body].Orientation, float3{1, 0, 0});
+    CHECK(std::acos(std::clamp(axis.x, -1.f, 1.f)) == doctest::Approx(0.4f).epsilon(0.02));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: sensors report actual overlap without changing motion") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto sensor = world.AddBody({.Shape = shape, .Density = 0, .Sensor = true});
+    const auto body = world.AddBody({.Pose = At(float3{-2, 0, 0}), .Velocity = {.Linear = {1, 0, 0}}, .Shape = shape, .Density = 1});
+    world.TrackSensors = true;
+    const StepSettings settings{.Gravity = {0, 0, 0}};
+    solver.Step(world, settings);
+    CHECK(world.Overlaps().empty());
+    for (int i = 0; i < 100; ++i) solver.Step(world, settings);
+    REQUIRE(world.Overlaps().size() == 1);
+    REQUIRE(world.TakeSensorChanges().size() == 1);
+    CHECK(std::ranges::none_of(world.Contacts.All(), [](const Contact &contact) { return contact.Active; }));
+    CHECK(world.Velocities[body].Linear.x == doctest::Approx(1).epsilon(0.001));
+    REQUIRE(world.RemoveBody(sensor));
+    REQUIRE(world.Overlaps().empty());
+    const auto changes = world.TakeSensorChanges();
+    REQUIRE(changes.size() == 1);
+    CHECK_FALSE(changes[0].Entered);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: sensors include static pairs and respect filters and teleports") {
+    const auto shape = world.AddShape(UnitBox);
+    world.AddBody({.Shape = shape, .Density = 0, .Layer = 1, .CollidesWith = 2, .Sensor = true});
+    const auto body = world.AddBody({.Shape = shape, .Density = 0, .Layer = 2, .CollidesWith = 1});
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 1);
+    world.Poses[body].Position = {2, 0, 0};
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+    world.Poses[body].Position = {0, 0, 0};
+    world.Filters[body].Collides = 0;
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: compound mesh leaves support a convex body") {
+    const auto mesh = FloorMesh(world, 1, 4);
+    const auto compound = world.AddCompound(std::vector<Index>{mesh});
+    REQUIRE(compound != NoIndex);
+    world.AddBody({.Shape = compound, .Density = 0});
+    const auto box = world.AddBody({.Pose = At(float3{0, 1, 0}), .Shape = world.AddShape(UnitBox)});
+    for (int i = 0; i < 180; ++i) solver.Step(world);
+    CHECK(world.Poses[box].Position.y == doctest::Approx(Half).epsilon(0.005));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: a compound plane follows its collider transform") {
+    Shape plane = GroundPlane;
+    plane.Local = At(float3{0, 2, 0});
+    const auto shape = world.AddShape(plane);
+    const auto compound = world.AddCompound(std::vector<Index>{shape});
+    REQUIRE(compound != NoIndex);
+    world.AddBody({.Shape = compound, .Density = 0});
+    const auto box = world.AddBody({.Pose = At(float3{0, 3, 0}), .Shape = world.AddShape(UnitBox)});
+    for (int i = 0; i < 180; ++i) solver.Step(world);
+    CHECK(world.Poses[box].Position.y == doctest::Approx(2 + Half).epsilon(0.001));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: removing one sensor overlap does not leave stale neighbours") {
+    const auto shape = world.AddShape(UnitBox);
+    world.AddBody({.Shape = shape, .Density = 0, .Sensor = true});
+    const auto first = world.AddBody({.Pose = At(float3{-0.7f, 0, 0}), .Shape = shape, .Density = 0});
+    const auto second = world.AddBody({.Pose = At(float3{0.7f, 0, 0}), .Shape = shape, .Density = 0});
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 2);
+    REQUIRE(world.RemoveBody(first));
+    REQUIRE(world.Overlaps().size() == 1);
+    world.Poses[second].Position = {3, 0, 0};
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: sensor detection preserves solid contact events") {
+    const auto floor = AddGround(world);
+    const auto box = DropBox(world, Half, false);
+    world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = world.AddShape(UnitBox), .Density = 0, .Sensor = true});
+    world.TrackContacts = world.TrackSensors = true;
+    solver.Step(world);
+    CHECK_FALSE(world.Overlaps().empty());
+    const auto changes = world.TakeContactChanges();
+    REQUIRE_FALSE(changes.empty());
+    for (const auto &change : changes) {
+        CHECK(change.Kind == ContactAdded);
+        CHECK(change.A == world.IdOf(box));
+        CHECK(change.B == world.IdOf(floor));
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: shape overrides replace body defaults") {
+    Shape plane = GroundPlane, cube = UnitBox;
+    plane.HasFilter = cube.HasFilter = 1;
+    plane.Mask = {1, 2};
+    cube.Mask = {2, 1};
+    world.AddBody({.Shape = world.AddShape(plane), .Density = 0, .Layer = 0, .CollidesWith = 0});
+    const auto body = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = world.AddShape(cube), .Layer = 0, .CollidesWith = 0});
+    solver.Step(world);
+    CHECK(ActiveContacts(world, body) > 0);
+    CHECK(world.Filters[body].Layer == 0);
+    CHECK(world.Filters[body].Aggregate.Layer == 2);
+}
+
+TEST_CASE_FIXTURE(OnDevice, "collider filters: aggregate acceptance still requires an exact mutual leaf match") {
+    for (bool sensor : {false, true}) {
+        World world{context, {.Bodies = 4, .Shapes = 32}};
+        const auto compound = [&](bool other) {
+            std::vector<Index> children;
+            for (uint32_t i = 0; i < 2; ++i) {
+                Shape shape = UnitBox;
+                shape.Local = At(float3{i ? 0.75f : -0.75f, 0, 0});
+                shape.HasFilter = 1;
+                shape.Mask = other ? CollisionMask{4u << i, i ? 1u : 2u} : CollisionMask{1u << i, 4u << i};
+                children.push_back(world.AddShape(shape));
+            }
+            return world.AddCompound(children);
+        };
+        const auto a = compound(false), b = compound(true);
+        const auto body_a = world.AddBody({.Shape = a, .Density = 1, .Sensor = sensor});
+        const auto body_b = world.AddBody({.Shape = b, .Density = 1});
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        CHECK(Allows(world.Filters[body_a].Aggregate, world.Filters[body_b].Aggregate));
+        CHECK(ActiveContacts(world, body_a) == 0);
+        CHECK(world.Overlaps().empty());
+        // Swapping permissions changes exact matches while leaving both aggregate masks unchanged.
+        world.Shapes[world.Child(b, 0)].Mask.Collides = 1;
+        world.Shapes[world.Child(b, 1)].Mask.Collides = 2;
+        world.Wake(body_a);
+        world.Wake(body_b);
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        CHECK(world.Filters[body_b].Aggregate.Collides == 3);
+        if (sensor) CHECK(world.Overlaps().size() == 2);
+        else {
+            CHECK(ActiveContacts(world, body_a) > 0);
+            for (const Contact &contact : world.Contacts.All())
+                if (contact.Active) CHECK(OwnChild(contact.Children) == OtherChild(contact.Children));
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: sleeping contacts end when their collider stops accepting them") {
+    const auto floor = AddGround(world);
+    const auto box = DropBox(world, Half, false);
+    world.TrackContacts = true;
+    for (int i = 0; i < 180; ++i) solver.Step(world);
+    REQUIRE(world.Quiet[box] >= StepSettings{}.SleepSteps);
+    world.TakeContactChanges();
+    Shape &shape = world.Shapes[world.BodyShapes[floor]];
+    shape.HasFilter = 1;
+    shape.Mask = {0, 0};
+    solver.Step(world);
+    CHECK(ActiveContacts(world, box) == 0);
+    const auto changes = world.TakeContactChanges();
+    REQUIRE_FALSE(changes.empty());
+    for (const auto &change : changes) CHECK(change.Kind == ContactRemoved);
+    world.Wake(box);
+    for (int i = 0; i < 60; ++i) solver.Step(world);
+    CHECK(world.Poses[box].Position.y < 0);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: an excluded sibling cannot hide a solid face") {
+    Shape left = UnitBox, right = UnitBox;
+    left.Local = At(float3{-0.5f, 0, 0});
+    right.Local = At(float3{0.5f, 0, 0});
+    left.HasFilter = right.HasFilter = 1;
+    left.Mask = {1, 2};
+    right.Mask = {4, 8};
+    const auto compound = world.AddCompound(std::vector<Index>{world.AddShape(left), world.AddShape(right)});
+    REQUIRE(compound != NoIndex);
+    REQUIRE(InternalFaces(world.Shapes[world.Child(compound, 0)]) != 0);
+    const auto wall = world.AddBody({.Shape = compound, .Density = 0});
+    const auto ball = world.AddBody({.Pose = At(float3{0.05f, 0, 0}), .Shape = world.AddShape({.Radius = 0.1f, .Kind = ShapeSphere}),
+                                     .Density = 1, .Layer = 2, .CollidesWith = 1});
+    for (int i = 0; i < 30; ++i) solver.Step(world, {.Gravity = {0, 0, 0}});
+    CHECK(world.Filters[wall].Mixed == 1);
+    CHECK(world.Poses[ball].Position.x > 0.095f);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: copied mesh leaves retain their sensor filtering") {
+    const auto mesh = FloorMesh(world, 1, 4);
+    world.Shapes[mesh].HasFilter = 1;
+    world.Shapes[mesh].Mask = {1, 2};
+    const auto compound = world.AddCompound(std::vector<Index>{mesh});
+    REQUIRE(compound != NoIndex);
+    CHECK(world.Shapes[world.Child(compound, 0)].HasFilter == 1);
+    world.AddBody({.Shape = compound, .Density = 0, .Layer = 0, .CollidesWith = 0, .Sensor = true});
+    const auto box = world.AddBody({.Pose = At(float3{0, Half - 0.01f, 0}), .Shape = world.AddShape(UnitBox), .Layer = 2, .CollidesWith = 1});
+    solver.Step(world, {.Gravity = {0, 0, 0}});
+    CHECK(world.Overlaps().size() == 1);
+    world.Filters[box].Collides = 0;
+    solver.Step(world, {.Gravity = {0, 0, 0}});
+    CHECK(world.Overlaps().empty());
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: shared compounds inherit each body's defaults independently") {
+    const auto compound = world.AddCompound(std::vector<Index>{world.AddShape(UnitBox)});
+    REQUIRE(compound != NoIndex);
+    const auto a = world.AddBody({.Shape = compound, .Density = 0, .Layer = 1, .CollidesWith = 2});
+    const auto b = world.AddBody({.Shape = compound, .Density = 0, .Layer = 4, .CollidesWith = 8});
+    solver.Step(world);
+    CHECK(SameMask(world.Filters[a].Aggregate, {1, 2}));
+    CHECK(SameMask(world.Filters[b].Aggregate, {4, 8}));
+    world.Filters[a].Collides = 16;
+    solver.Step(world);
+    CHECK(SameMask(world.Filters[a].Aggregate, {1, 16}));
+    CHECK(SameMask(world.Filters[b].Aggregate, {4, 8}));
 }

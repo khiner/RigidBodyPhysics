@@ -29,6 +29,7 @@ inline float4 MakeFloat4(float3 xyz, float w) { return float4(xyz, w); }
 #else
 using uint = uint32_t;
 using uchar = uint8_t;
+using ulong = uint64_t;
 using float3 = simd::float3; // 16-byte aligned on both sides, so the layouts agree
 using float4 = simd::float4;
 using simd::cross;
@@ -61,7 +62,7 @@ struct Velocity {
 };
 
 // Inverse quantities, because the solve divides by them, and zero is exactly infinite: a locked axis, expressed with no branch and no flag.
-// The three motion properties are stored here rather than in per-body buffers of their own, all thirty-one Metal bindings being spent.
+// The three motion properties share the mass buffer to keep the argument table compact.
 // They belong to the body rather than to its shape. See World::SetBodyShape.
 struct BodyMass {
     float3 InvInertiaLocal; // diagonal of the inverse inertia tensor, in the body frame
@@ -93,10 +94,33 @@ enum ShapeKind : uint {
     ShapeCompound,
 };
 
-// The most pieces one body may be made of, matching KHR's body of a motion and several collider descendants.
-// Eight is the number of run-descriptor fields in Shape, and the range of the three bits a contact's name spends on a child.
-// More than that is a convex decomposition, which would need a pool of its own. See Shape.
-GPU_CONSTANT uint ChildrenPerCompound = 8;
+// A collider belongs to Layer and accepts members of Collides. Both sides must accept.
+struct CollisionMask {
+    uint Layer = ~0u, Collides = ~0u;
+};
+inline bool Allows(CollisionMask a, CollisionMask b) {
+    return (a.Layer & b.Collides) != 0 && (b.Layer & a.Collides) != 0;
+}
+inline bool SameMask(CollisionMask a, CollisionMask b) { return a.Layer == b.Layer && a.Collides == b.Collides; }
+
+// Explicit policies follow KHR precedence. GeometricMean is the legacy friction default.
+enum CombineMode : uint { CombineAverage,
+                          CombineMinimum,
+                          CombineMaximum,
+                          CombineMultiply,
+                          CombineGeometricMean };
+struct Material {
+    float StaticFriction = 0.5f, DynamicFriction = 0.5f, Restitution = 0;
+    uint FrictionCombine = CombineAverage, RestitutionCombine = CombineAverage;
+};
+inline float Combine(float a, float b, uint mode_a, uint mode_b) {
+    const uint mode = mode_a < mode_b ? mode_a : mode_b;
+    if (mode == CombineAverage) return (a + b) * 0.5f;
+    if (mode == CombineMinimum) return a < b ? a : b;
+    if (mode == CombineMaximum) return a > b ? a : b;
+    if (mode == CombineMultiply) return a * b;
+    return sqrt(a * b);
+}
 
 // The most vertices one hull may have.
 // A support search scans all of them, so this bounds the narrowphase's inner loop, and PhysX picks 64 for the same reason.
@@ -134,14 +158,8 @@ struct HullFace {
 // A mesh presents no manifold of its own, so mesh against mesh and mesh against plane produce no contact.
 // A moving solid concave shape is a set of hulls instead.
 //
-// A compound is several of the kinds above, each at its own Local, and is flat with convex leaves only.
-// A child that is itself a compound, a mesh or a plane is refused.
-// World::AddCompound re-expresses each child's pose in the body frame, so a leaf's Local reads exactly as a lone shape's does.
-// The children are shape indices held in the eight run-descriptor fields below, FirstVertex through NodeCount, because a compound's run is its children.
-// Read them through ChildOf, never by field name.
-// The run carries no count and ends at a NoIndex, as a body's Jointed run does.
-// A children pool would cost a buffer binding, and all thirty-one are spent.
-// FirstTriangle carries one further use of the same fields. See InternalFaces.
+// Compounds are cooked to a flat run of collider leaves in the world's child-index pool.
+// FirstVertex and VertexCount name that run. Authoring depth does not affect GPU traversal.
 struct Shape {
     float3 HalfExtents;
     float3 Normal;
@@ -165,21 +183,21 @@ struct Shape {
     // Moving the tensor onto the shifted, turned origin and diagonalizing it is the host's arithmetic.
     // World::AddBody refuses such a body without one.
     Pose Local = IdentityPose;
+    Material Surface{};
+    uint HasMaterial = 0;
+    CollisionMask Mask{};
+    uint HasFilter = 0;
 };
 
-// Child `i` of a compound, or NoIndex past the end of its run.
-// The eight run-descriptor fields, in declaration order.
-inline Index ChildOf(Shape shape, uint i) {
-    switch (i) {
-        case 0: return shape.FirstVertex;
-        case 1: return shape.VertexCount;
-        case 2: return shape.FirstFace;
-        case 3: return shape.FaceCount;
-        case 4: return shape.FirstTriangle;
-        case 5: return shape.RootNode;
-        case 6: return shape.TriangleCount;
-        default: return shape.NodeCount;
-    }
+inline CollisionMask ResolveFilter(Shape shape, CollisionMask inherited) { return shape.HasFilter ? shape.Mask : inherited; }
+
+// Child indices are pooled independently of shape geometry.
+#ifdef __METAL_VERSION__
+inline Index ChildOf(Shape shape, uint i, device const Index *children) {
+#else
+inline Index ChildOf(Shape shape, uint i, const Index *children) {
+#endif
+    return i < shape.VertexCount ? children[shape.FirstVertex + i] : NoIndex;
 }
 
 // Which of a child's own faces are buried against a sibling, one bit each, and zero for every shape that is not a compound's child.
@@ -201,19 +219,6 @@ inline uint BoxFaceIndex(uint axis, bool positive) { return 2 * axis + (positive
 #ifndef __METAL_VERSION__
 inline void SetInternalFaces(Shape &shape, uint mask) { shape.FirstTriangle = mask; }
 
-// The host's half of the same mapping, beside ChildOf so the two cannot drift apart.
-inline void SetChild(Shape &shape, uint i, Index child) {
-    switch (i) {
-        case 0: shape.FirstVertex = child; break;
-        case 1: shape.VertexCount = child; break;
-        case 2: shape.FirstFace = child; break;
-        case 3: shape.FaceCount = child; break;
-        case 4: shape.FirstTriangle = child; break;
-        case 5: shape.RootNode = child; break;
-        case 6: shape.TriangleCount = child; break;
-        default: shape.NodeCount = child; break;
-    }
-}
 #endif
 
 // One triangle of a mesh, by absolute index into the vertex pool, wound so that (B - A) x (C - A) points out of the surface.
@@ -240,11 +245,14 @@ struct BvhNode {
     uint Count; // triangles in a leaf, and zero in an interior node
 };
 
-// Two bodies collide only when each one's layer is in the other's mask.
-// The bitmask scheme of KHR_physics_rigid_bodies, which MeshEditor already uses.
+// Body defaults and sensor state, with conservative summaries for collider filtering.
 struct Filter {
     uint Layer; // the bits this body belongs to
     uint Collides; // the bits it collides with
+    uint Sensor = 0;
+    // Refreshed before stepping. The union can reject a body pair, never accept a leaf pair.
+    CollisionMask Aggregate{};
+    uint Mixed = 0; // differently filtered leaves cannot unconditionally bury each other's faces
 };
 
 // A body's jointed partners, which by default it does not collide with, because two bodies a joint holds together overlap by design.
@@ -299,6 +307,7 @@ struct Contact {
     float3 Lambda; // the force each row is applying, and the dual the solve converges
     float3 Penalty;
     float Friction;
+    float Restitution;
     // The closing speed at this point when the step began, with neither restitution nor the threshold folded in.
     // One displacement per step cannot carry both an approach and a rebound, so the velocity pass decides the bounce rather than the row.
     float Approach;
@@ -310,18 +319,17 @@ struct Contact {
     // The part of body B's shape it came from: the triangle for a mesh, and NoIndex for a shape of one piece.
     // A contact is matched on this, Feature and Children together.
     Index SubShape;
-    // The leaf of each body's shape that produced it: this body's in bits 0-2, the other's in bits 3-5, both zero for a body of one piece.
+    // Leaf ordinals in the low and high 32 bits, both zero for a shape of one piece.
     // Leaf 3 against leaf 5 is different geometry from leaf 2 against leaf 5, even when both name the same face and corner.
     // The warm start needs this to give each leaf its own dual.
-    // Stored here rather than in Feature, which has two bits left.
-    uint Children;
+    ulong Children;
     uint Stick; // inside the friction cone last step, so its anchors are kept for static friction
     uint Active;
 };
 
-inline uint ChildPair(uint own, uint other) { return own | (other << 3); }
-inline uint OwnChild(uint children) { return children & 7u; }
-inline uint OtherChild(uint children) { return (children >> 3) & 7u; }
+inline ulong ChildPair(uint own, uint other) { return ulong(own) | (ulong(other) << 32); }
+inline uint OwnChild(ulong children) { return uint(children); }
+inline uint OtherChild(ulong children) { return uint(children >> 32); }
 
 // The frame a contact's three rows resolve in: its normal, then the two tangents friction acts along.
 // The particular tangent pair is arbitrary, but one normal must always give the same pair: a stuck contact's dual is carried in this frame between steps.
@@ -351,7 +359,7 @@ struct ContactEvent {
     Index BodyA, BodyB;
     uint Feature;
     Index SubShape; // which triangle of a mesh, and NoIndex for every shape that is one piece
-    uint Children; // and which leaf of each compound, packed as Contact::Children is
+    ulong Children; // and which leaf of each compound, packed as Contact::Children is
     uint Kind;
 };
 
@@ -364,7 +372,7 @@ GPU_CONSTANT uint EventsPerBody = 2 * ContactsPerBody;
 static_assert(ContactsPerBody <= 64, "the claimed-slot mask in CollectContacts is a single ulong");
 
 // The mode of one of a joint's six axes, three linear and three angular, taken in the joint's own frame.
-// An axis is in exactly one mode, so every mode shares the same row of dual and penalty.
+// Each base axis has one mode. Independent drive rows may act alongside it.
 // Linear and angular are the same row, in metres and newtons against radians and newton metres.
 enum JointAxisMode : uint {
     AxisFree,
@@ -372,6 +380,14 @@ enum JointAxisMode : uint {
     AxisDriven, // moved towards a relative speed, within a force bound
     AxisPositioned, // moved towards a relative offset or angle, within the same bound
     AxisLimited, // free between two stops and held outside them, as a contact's one-sided row
+};
+
+// An independent drive row, which may act on an axis that also has a limit.
+struct JointDrive {
+    uint Enabled = 0;
+    float Speed = 0, Target = 0, MaxForce = 0;
+    float Stiffness = 0, Damping = 0;
+    float Lambda = 0, Penalty = 1, Began = 0;
 };
 
 // A joint holds two bodies' anchor points together, and where configured the rotation between them as well.
@@ -394,7 +410,7 @@ struct Joint {
     float3 C0Linear, C0Angular;
     // The twist angle a hinge-like joint has turned through since creation, unwrapped against last step's value.
     // A limit at three half-turns therefore means three half-turns rather than folding into the half turn a quaternion can name.
-    // Zero at creation, and every angular target is measured from that zero.
+    // Initialized against the authored endpoint frames at the first step.
     float Twist;
     float3 LambdaLinear, LambdaAngular; // the force and torque each row is applying
     float3 PenaltyLinear, PenaltyAngular;
@@ -420,6 +436,9 @@ struct Joint {
     Index BodyA, BodyB;
     uint LinearModes, AngularModes; // three bits per axis, one JointAxisMode each
     uint Active;
+    JointDrive Drives[6]{}; // linear XYZ, angular XYZ
+    // A nonzero mask groups a limit's axes into a distance or cone, stored on its first axis.
+    uint LinearLimitAxes[3]{}, AngularLimitAxes[3]{};
     // Whether this joint wrote itself into both bodies' Jointed runs, which suppresses contacts between them.
     // Removal must undo exactly what was written, or it lifts the suppression another joint between the same pair installed.
     uint Suppresses;

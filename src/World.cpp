@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <numbers>
+#include <stdexcept>
 #include <utility>
 
 namespace rbp {
@@ -42,49 +43,49 @@ void RotationMatrix(float4 q, double (&m)[3][3]) {
 }
 
 // A compound's children taken together, in the frame their poses are written in: the volume, its centre, and the inertia tensor about that centre.
-// At unit density, because a compound is one material and density then cancels out of the centre and out of the frame the tensor is diagonal in.
+// At unit density; collider surface materials do not affect mass.
 struct Aggregate {
     double Volume{};
     double3 Center{0, 0, 0};
     double Tensor[3][3]{};
 };
 
-Aggregate WeighChildren(const Shape &compound, std::span<const float3> vertices, std::span<const Shape> shapes) {
-    double volume[ChildrenPerCompound]{}, inertia[ChildrenPerCompound][3][3]{};
-    double3 centre[ChildrenPerCompound]{};
-    uint32_t count = 0;
+Aggregate WeighChildren(const Shape &compound, std::span<const float3> vertices, std::span<const Shape> shapes, std::span<const Index> children) {
+    if (compound.FirstVertex > children.size() || compound.VertexCount > children.size() - compound.FirstVertex)
+        throw std::invalid_argument("Compound mass properties require its child-index pool.");
+    std::vector<Aggregate> pieces;
+    pieces.reserve(compound.VertexCount);
     Aggregate whole;
     double3 moment{0, 0, 0};
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i) {
-        const Index child = ChildOf(compound, i);
-        if (child == NoIndex || child >= shapes.size()) break; // the run's terminator, as Shape describes it
+    for (uint32_t i = 0; i < compound.VertexCount; ++i) {
+        const Index child = ChildOf(compound, i, children.data());
+        if (child == NoIndex || child >= shapes.size()) break;
         const Shape &piece = shapes[child];
         const BodyMass own = MassProperties(piece, 1, vertices, shapes);
-        if (!(own.InvMass > 0)) continue; // no volume, which AddCompound has already refused
-        volume[count] = 1 / double(own.InvMass);
+        if (!(own.InvMass > 0)) continue; // surface leaves contribute no volume
+        Aggregate &mass = pieces.emplace_back();
+        mass.Volume = 1 / double(own.InvMass);
         // A shape's own frame is centred on its centre of mass, so Local's position is where that centre sits in the compound's frame.
         const float3 at = piece.Local.Position;
-        centre[count] = double3{at.x, at.y, at.z};
+        mass.Center = double3{at.x, at.y, at.z};
         double turn[3][3];
         RotationMatrix(piece.Local.Orientation, turn);
         const float3 inverse = own.InvInertiaLocal;
-        const double3 diagonal{inverse.x > 0 ? 1 / double(inverse.x) : 0, inverse.y > 0 ? 1 / double(inverse.y) : 0,
-                               inverse.z > 0 ? 1 / double(inverse.z) : 0};
+        const double3 diagonal{inverse.x > 0 ? 1 / double(inverse.x) : 0, inverse.y > 0 ? 1 / double(inverse.y) : 0, inverse.z > 0 ? 1 / double(inverse.z) : 0};
         for (int r = 0; r < 3; ++r)
             for (int c = 0; c < 3; ++c)
-                for (int k = 0; k < 3; ++k) inertia[count][r][c] += turn[r][k] * diagonal[k] * turn[c][k];
-        moment += volume[count] * centre[count];
-        whole.Volume += volume[count];
-        ++count;
+                for (int k = 0; k < 3; ++k) mass.Tensor[r][c] += turn[r][k] * diagonal[k] * turn[c][k];
+        moment += mass.Volume * mass.Center;
+        whole.Volume += mass.Volume;
     }
     if (whole.Volume <= 0) return whole;
     whole.Center = moment / whole.Volume;
-    for (uint32_t c = 0; c < count; ++c) {
-        const double3 offset = centre[c] - whole.Center;
+    for (const Aggregate &mass : pieces) {
+        const double3 offset = mass.Center - whole.Center;
         const double square = dot(offset, offset);
         for (int r = 0; r < 3; ++r)
             for (int k = 0; k < 3; ++k)
-                whole.Tensor[r][k] += inertia[c][r][k] + volume[c] * ((r == k ? square : 0) - offset[r] * offset[k]);
+                whole.Tensor[r][k] += mass.Tensor[r][k] + mass.Volume * ((r == k ? square : 0) - offset[r] * offset[k]);
     }
     return whole;
 }
@@ -153,7 +154,7 @@ bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
 // Which faces of each piece another piece has buried, one bit each, indexed as the device indexes the face, with the pieces all in one frame.
 // A face counts only where the other's covers the whole of it, so a leg's top is buried in a slab and the slab's own bottom is not.
 // Symmetric, and so independent of the order the pieces come in.
-std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces) {
+std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces, std::span<const CollisionMask> filters = {}) {
     float scale = 1e-6f;
     for (const auto &piece : pieces)
         for (const ShapeFace &face : piece)
@@ -163,7 +164,7 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
     std::vector<uint32_t> masks(pieces.size(), 0);
     for (size_t i = 0; i < pieces.size(); ++i)
         for (size_t j = 0; j < pieces.size(); ++j) {
-            if (j == i) continue;
+            if (j == i || (!filters.empty() && !SameMask(filters[i], filters[j]))) continue;
             for (const ShapeFace &mine : pieces[i])
                 for (const ShapeFace &theirs : pieces[j]) {
                     if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue; // not facing each other
@@ -175,18 +176,17 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
 }
 } // namespace
 
-BodyMass MassProperties(const Shape &shape, float density, std::span<const float3> shape_vertices, std::span<const Shape> shapes) {
+BodyMass MassProperties(const Shape &shape, float density, std::span<const float3> shape_vertices, std::span<const Shape> shapes, std::span<const Index> children) {
     constexpr float Pi = std::numbers::pi_v<float>;
     // A plane is unbounded, a mesh is a surface with no interior, and a zero density is static by request. See StaticMass.
     if (shape.Kind == ShapePlane || shape.Kind == ShapeMesh || density <= 0) return StaticMass;
 
     if (shape.Kind == ShapeCompound) {
         // AddCompound left the children in the frame this diagonalizes to, so the moments come out in the order of the body frame's own axes.
-        const Aggregate whole = WeighChildren(shape, shape_vertices, shapes);
+        const Aggregate whole = WeighChildren(shape, shape_vertices, shapes, children);
         if (whole.Volume <= 0) return StaticMass;
         const double3 moments = DiagonalizeSymmetric(whole.Tensor).Values;
-        return {.InvInertiaLocal = 1 / (float3{float(moments.x), float(moments.y), float(moments.z)} * density),
-                .InvMass = 1 / float(whole.Volume * density)};
+        return {.InvInertiaLocal = 1 / (float3{float(moments.x), float(moments.y), float(moments.z)} * density), .InvMass = 1 / float(whole.Volume * density)};
     }
 
     if (shape.Kind == ShapeHull) {
@@ -230,10 +230,9 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
 BodyMass World::ShapeOrAuthoredMass(Index shape, float density, std::optional<AuthoredMass> authored) const {
     if (authored) {
         const auto [mass, inertia] = *authored;
-        return {.InvInertiaLocal = {inertia.x > 0 ? 1 / inertia.x : 0, inertia.y > 0 ? 1 / inertia.y : 0, inertia.z > 0 ? 1 / inertia.z : 0},
-                .InvMass = mass > 0 ? 1 / mass : 0};
+        return {.InvInertiaLocal = {inertia.x > 0 ? 1 / inertia.x : 0, inertia.y > 0 ? 1 / inertia.y : 0, inertia.z > 0 ? 1 / inertia.z : 0}, .InvMass = mass > 0 ? 1 / mass : 0};
     }
-    return shape == NoIndex ? StaticMass : MassProperties(Shapes[shape], density, ShapeVertices.All(), Shapes.All());
+    return shape == NoIndex ? StaticMass : MassProperties(Shapes[shape], density, ShapeVertices.All(), Shapes.All(), CompoundChildren.All());
 }
 
 // See BodyDesc::Mass.
@@ -245,54 +244,51 @@ bool World::OffsetNeedsAuthoredMass(Index shape, const BodyMass &mass, bool auth
     return at.x != 0 || at.y != 0 || at.z != 0 || turn.x != 0 || turn.y != 0 || turn.z != 0;
 }
 
-World::World(const mtl::Context &context, WorldLimits limits) {
+// Zero initialization makes allocator reuse independent of previous worlds.
+template<typename T> void World::MakeBuffer(mtl::Buffer<T> &buffer, uint32_t capacity) {
+    buffer = {Queue->device(), capacity};
+    std::ranges::fill(buffer.All(), T{});
+    Residency->addAllocation(buffer.Handle.get());
+}
+
+World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Queue) {
     auto *device = context.Device.get();
     // Metal 4 has no implicit residency tracking, so everything a kernel can reach is in one set attached to the queue for the world's lifetime.
     // The destructor takes it off again.
     NS::Error *error{};
     Residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
-    // Every buffer starts zeroed, whatever the pages held before.
-    // A world built after another gets that other's pages back.
-    // A lane the solver reads before writing would otherwise tie run-to-run determinism to the allocations repeating.
-    // The fill happens where the buffer is made.
-    const auto make = [&]<typename T>(mtl::Buffer<T> &buffer, uint32_t capacity) {
-        buffer = {device, capacity};
-        Residency->addAllocation(buffer.Handle.get());
-        std::ranges::fill(buffer.All(), T{});
-    };
     // In the order World declares them, so the header's grouping by access pattern reads the same here.
-    make(Poses, limits.Bodies);
-    make(Velocities, limits.Bodies);
-    make(Masses, limits.Bodies);
-    make(BodyShapes, limits.Bodies);
-    make(Shapes, limits.Shapes);
-    make(ShapeVertices, limits.ShapeVertices);
-    make(HullFaces, limits.HullFaces);
-    make(Triangles, limits.Triangles);
-    make(BvhNodes, limits.BvhNodes);
-    make(Frictions, limits.Bodies);
-    make(Restitutions, limits.Bodies);
-    make(Filters, limits.Bodies);
-    make(Jointed, limits.Bodies * JointsPerBody);
-    make(InitialPoses, limits.Bodies);
-    make(InertialPoses, limits.Bodies);
-    make(PreviousVelocities, limits.Bodies);
-    make(SolvedPoses, limits.Bodies);
-    make(RestPoses, limits.Bodies);
-    make(Quiet, limits.Bodies);
-    make(NextQuiet, limits.Bodies);
-    make(Colors, limits.Bodies);
-    make(NextColors, limits.Bodies);
-    make(Contacts, limits.Bodies * ContactsPerBody);
-    make(Incoming, limits.Bodies);
-    make(IncomingSlots, limits.Bodies * ContactsPerBody);
-    make(ContactEvents, limits.Bodies * EventsPerBody);
-    make(ContactEventCounts, limits.Bodies);
-    make(ContactRefusals, limits.Bodies);
-    make(Joints, limits.Joints);
+    MakeBuffer(Poses, limits.Bodies);
+    MakeBuffer(Velocities, limits.Bodies);
+    MakeBuffer(Masses, limits.Bodies);
+    MakeBuffer(BodyShapes, limits.Bodies);
+    MakeBuffer(Shapes, limits.Shapes);
+    MakeBuffer(ShapeVertices, limits.ShapeVertices);
+    MakeBuffer(HullFaces, limits.HullFaces);
+    MakeBuffer(Triangles, limits.Triangles);
+    MakeBuffer(BvhNodes, limits.BvhNodes);
+    MakeBuffer(Materials, limits.Bodies);
+    MakeBuffer(CompoundChildren, limits.CompoundChildren);
+    MakeBuffer(Filters, limits.Bodies);
+    MakeBuffer(Jointed, limits.Bodies * JointsPerBody);
+    MakeBuffer(InitialPoses, limits.Bodies);
+    MakeBuffer(InertialPoses, limits.Bodies);
+    MakeBuffer(PreviousVelocities, limits.Bodies);
+    MakeBuffer(SolvedPoses, limits.Bodies);
+    MakeBuffer(RestPoses, limits.Bodies);
+    MakeBuffer(Quiet, limits.Bodies);
+    MakeBuffer(NextQuiet, limits.Bodies);
+    MakeBuffer(Colors, limits.Bodies);
+    MakeBuffer(NextColors, limits.Bodies);
+    MakeBuffer(Contacts, limits.Bodies * ContactsPerBody);
+    MakeBuffer(Incoming, limits.Bodies);
+    MakeBuffer(IncomingSlots, limits.Bodies * ContactsPerBody);
+    MakeBuffer(ContactEvents, limits.Bodies * EventsPerBody);
+    MakeBuffer(ContactEventCounts, limits.Bodies);
+    MakeBuffer(ContactRefusals, limits.Bodies);
+    MakeBuffer(Joints, limits.Joints);
     Residency->commit();
     Residency->requestResidency();
-    Queue = context.Queue;
     Queue->addResidencySet(Residency.get());
 
     // The lanes whose empty value is NoIndex rather than zero, which is every lane naming something.
@@ -302,6 +298,7 @@ World::World(const mtl::Context &context, WorldLimits limits) {
     FacePool.Capacity = limits.HullFaces;
     TrianglePool.Capacity = limits.Triangles;
     NodePool.Capacity = limits.BvhNodes;
+    ChildPool.Capacity = limits.CompoundChildren;
     LiveBodies.assign(limits.Bodies, 0);
     LiveShapes.assign(limits.Shapes, 0);
     WeldedShapes.assign(limits.Bodies, NoIndex);
@@ -379,6 +376,7 @@ void World::Wake(Index body) {
 // Every reader stops at the first inactive slot.
 // The surviving order changes, which is safe because a contact is matched by feature rather than by slot.
 void World::EndContacts(Index body) {
+    EndSensorOverlaps(body);
     const auto end = [this](Contact &contact) {
         if (TrackContacts)
             Changes.push_back({
@@ -411,6 +409,68 @@ void World::EndContacts(Index body) {
             run[count].Active = false;
         }
     }
+}
+
+void World::RefreshFilters() {
+    for (Index body = 0; body < NumBodies; ++body) {
+        if (!Alive(body)) continue;
+        Filter &filter = Filters[body];
+        filter.Aggregate = {filter.Layer, filter.Collides};
+        filter.Mixed = 0;
+        const Index index = BodyShapes[body];
+        if (index == NoIndex) continue;
+        const Shape &shape = Shapes[index];
+        const CollisionMask inherited = ResolveFilter(shape, filter.Aggregate);
+        filter.Aggregate = inherited;
+        if (shape.Kind != ShapeCompound) continue;
+        filter.Aggregate = {0, 0};
+        CollisionMask first{};
+        for (uint32_t i = 0; i < shape.VertexCount; ++i) {
+            const CollisionMask leaf = ResolveFilter(Shapes[Child(index, i)], inherited);
+            if (i == 0) first = leaf;
+            filter.Mixed |= !SameMask(first, leaf);
+            filter.Aggregate.Layer |= leaf.Layer;
+            filter.Aggregate.Collides |= leaf.Collides;
+        }
+    }
+}
+
+void World::EnsureSensorBuffers() {
+    if (SensorContacts.Handle) return;
+    MakeBuffer(SensorContacts, Poses.Capacity * ContactsPerBody);
+    MakeBuffer(SensorRefusals, Poses.Capacity);
+    Residency->commit();
+}
+
+void World::EndSensorOverlaps(Index body) {
+    if (!SensorContacts.Handle) return;
+    std::erase_if(SensorOverlaps, [&](const SensorOverlap &pair) {
+        if (pair.A.Slot != body && pair.B.Slot != body) return false;
+        if (TrackSensors) SensorChanges.push_back({pair, false});
+        return true;
+    });
+    for (Index owner = 0; owner < NumBodies; ++owner) {
+        const auto run = SensorContacts.All().subspan(owner * ContactsPerBody, ContactsPerBody);
+        const auto removed = std::ranges::remove_if(run, [body](const Contact &contact) {
+            return !contact.Active || contact.BodyA == body || contact.BodyB == body;
+        });
+        for (Contact &contact : removed) contact.Active = 0;
+    }
+}
+
+void World::UpdateSensorOverlaps() {
+    if (!SensorContacts.Handle) return;
+    std::vector<SensorOverlap> current;
+    // The narrowphase emits one point per overlapping leaf pair, in body/slot order.
+    for (const Contact &contact : SensorContacts.All().first(NumBodies * ContactsPerBody))
+        if (contact.Active) current.push_back({IdOf(contact.BodyA), IdOf(contact.BodyB), contact.Children});
+    if (TrackSensors) {
+        for (const auto &pair : SensorOverlaps)
+            if (std::ranges::find(current, pair) == current.end()) SensorChanges.push_back({pair, false});
+        for (const auto &pair : current)
+            if (std::ranges::find(SensorOverlaps, pair) == SensorOverlaps.end()) SensorChanges.push_back({pair, true});
+    }
+    SensorOverlaps = std::move(current);
 }
 
 // A live contact's event takes its excitation record by position rather than by search.
@@ -511,9 +571,21 @@ Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> i
     return shape;
 }
 
-Index World::CopyShape(Index source, Pose local) {
-    Shape copy = Shapes[source];
-    copy.Local = local;
+Index World::CopyShape(Shape copy) {
+    if (copy.Kind == ShapeMesh) {
+        std::vector<uint32_t> indices;
+        for (const Triangle &triangle : Triangles.All().subspan(copy.FirstTriangle, copy.TriangleCount)) {
+            indices.insert(indices.end(), {triangle.A - copy.FirstVertex, triangle.B - copy.FirstVertex, triangle.C - copy.FirstVertex});
+        }
+        const Index result = AddMesh(ShapeVertices.All().subspan(copy.FirstVertex, copy.VertexCount), indices, copy.Local);
+        if (result != NoIndex) {
+            Shapes[result].Surface = copy.Surface;
+            Shapes[result].HasMaterial = copy.HasMaterial;
+            Shapes[result].Mask = copy.Mask;
+            Shapes[result].HasFilter = copy.HasFilter;
+        }
+        return result;
+    }
     // A hull's geometry is in the pools, and a copy sharing those runs could not be released on its own.
     // A face names its corners by their place in the shape's own run, so both runs copy unchanged.
     if (copy.Kind == ShapeHull) {
@@ -553,84 +625,94 @@ void World::ReleaseShape(Index shape) {
     }
     // A compound owns its children, so they are released with it. One level deep, a child never being a compound.
     if (held.Kind == ShapeCompound) {
-        for (uint32_t i = 0; i < ChildrenPerCompound; ++i) {
-            const Index child = ChildOf(held, i);
-            if (child == NoIndex) break;
-            ReleaseShape(child);
-        }
+        for (Index child : CompoundChildren.All().subspan(held.FirstVertex, held.VertexCount)) ReleaseShape(child);
+        ChildPool.Give(held.FirstVertex, held.VertexCount);
     }
     LiveShapes[shape] = 0;
     FreeShapes.push_back(shape);
 }
 
 Index World::AddCompound(std::span<const Index> children, Pose *frame) {
-    if (children.empty() || children.size() > ChildrenPerCompound) {
-        ++RefusedCompounds;
-        return NoIndex;
-    }
-    for (const Index child : children) {
+    std::vector<Shape> leaves;
+    for (Index child : children) {
         if (child >= NumShapes || !LiveShapes[child]) {
             ++RefusedCompounds;
             return NoIndex;
         }
-        const uint32_t kind = Shapes[child].Kind;
-        // Flat, and convex leaves only: a plane and a mesh have no volume and no manifold of their own.
-        if (kind == ShapeCompound || kind == ShapeMesh || kind == ShapePlane) {
-            ++RefusedCompounds;
-            return NoIndex;
-        }
+        const Shape &shape = Shapes[child];
+        if (shape.Kind == ShapeCompound) {
+            for (uint32_t i = 0; i < shape.VertexCount; ++i) {
+                Shape leaf = Shapes[Child(child, i)];
+                leaf.Local = ComposePose(shape.Local, leaf.Local);
+                if (!leaf.HasMaterial && shape.HasMaterial) leaf.Surface = shape.Surface;
+                if (!leaf.HasFilter && shape.HasFilter) leaf.Mask = shape.Mask;
+                leaf.HasMaterial |= shape.HasMaterial;
+                leaf.HasFilter |= shape.HasFilter;
+                leaves.push_back(leaf);
+            }
+        } else leaves.push_back(shape);
     }
-
-    // The pieces' mass properties in the frame they were handed in, which places the body frame.
-    Shape given{.Kind = ShapeCompound};
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i) SetChild(given, i, i < children.size() ? children[i] : NoIndex);
-    const Aggregate whole = WeighChildren(given, ShapeVertices.All(), Shapes.All());
-    if (whole.Volume <= 0) { // pieces enclosing nothing, which is a shape that cannot exist
+    if (leaves.empty()) {
         ++RefusedCompounds;
         return NoIndex;
     }
-    const Diagonalized principal = DiagonalizeSymmetric(whole.Tensor);
-    const Pose body{.Position = float3{float(whole.Center.x), float(whole.Center.y), float(whole.Center.z)},
-                    .Orientation = principal.Orientation};
-    if (frame != nullptr) *frame = body;
-
-    // And every child at its pose within that frame.
-    // The caller's shapes are untouched, the compound holding its own copies.
-    const Pose inverse{.Position = Rotate(QuatConjugate(body.Orientation), -body.Position),
-                       .Orientation = QuatConjugate(body.Orientation)};
-    Shape compound{.Kind = ShapeCompound};
-    for (uint32_t i = 0; i < ChildrenPerCompound; ++i) SetChild(compound, i, NoIndex);
-    uint32_t made = 0;
-    for (; made < children.size(); ++made) {
-        const Index copy = CopyShape(children[made], ComposePose(inverse, Shapes[children[made]].Local));
-        if (copy == NoIndex) break; // a pool or the slot table refused, and has counted it already
-        SetChild(compound, made, copy);
-    }
-    const Index shape = made == children.size() ? AddShape(compound) : NoIndex;
-    if (shape == NoIndex) { // on any refusal, release every slot and run this took
-        for (uint32_t i = 0; i < made; ++i) ReleaseShape(ChildOf(compound, i));
-        TrimTail(NumShapes, FreeShapes, [this](Index at) { return LiveShapes[at] != 0; });
+    if (leaves.size() > CompoundChildren.Capacity) {
+        ++Overflow.CompoundChildren;
         return NoIndex;
     }
-
-    // And which of each child's faces are buried against a sibling, in the frame the children now share.
-    // See InternalFaces, and World::WeldStatic, which computes the same for two static bodies.
+    const uint32_t count = uint32_t(leaves.size());
+    const Index first = ChildPool.Take(count);
+    if (first == NoIndex) {
+        ++Overflow.CompoundChildren;
+        return NoIndex;
+    }
+    Shape compound{.FirstVertex = first, .VertexCount = count, .Kind = ShapeCompound};
+    uint32_t made = 0;
+    for (; made < count; ++made) {
+        const Index copy = CopyShape(leaves[made]);
+        if (copy == NoIndex) break;
+        CompoundChildren[first + made] = copy;
+    }
+    const auto discard = [&] {
+        for (uint32_t i = 0; i < made; ++i) ReleaseShape(CompoundChildren[first + i]);
+        ChildPool.Give(first, count);
+        TrimTail(NumShapes, FreeShapes, [this](Index at) { return LiveShapes[at] != 0; });
+    };
+    if (made != count) {
+        discard();
+        return NoIndex;
+    }
+    const Aggregate whole = WeighChildren(compound, ShapeVertices.All(), Shapes.All(), CompoundChildren.All());
+    const Pose body = whole.Volume > 0 ? Pose{.Position = float3{float(whole.Center.x), float(whole.Center.y), float(whole.Center.z)}, .Orientation = DiagonalizeSymmetric(whole.Tensor).Orientation} : IdentityPose;
+    const Pose inverse{.Position = Rotate(QuatConjugate(body.Orientation), -body.Position), .Orientation = QuatConjugate(body.Orientation)};
     std::vector<std::vector<ShapeFace>> faces;
-    for (uint32_t i = 0; i < made; ++i) {
-        const Shape &child = Shapes[ChildOf(compound, i)];
+    for (uint32_t i = 0; i < count; ++i) {
+        Shape &child = Shapes[CompoundChildren[first + i]];
+        child.Local = ComposePose(inverse, child.Local);
+        if (child.Kind == ShapeBox || child.Kind == ShapeHull) SetInternalFaces(child, 0);
         faces.push_back(ShapeFaces(child, child.Local, ShapeVertices.All(), HullFaces.All()));
     }
-    const std::vector<uint32_t> masks = BuriedFaces(faces);
-    for (uint32_t i = 0; i < made; ++i) SetInternalFaces(Shapes[ChildOf(compound, i)], masks[i]);
-    return shape;
+    const auto masks = BuriedFaces(faces);
+    for (uint32_t i = 0; i < count; ++i) {
+        Shape &child = Shapes[CompoundChildren[first + i]];
+        if (child.Kind == ShapeBox || child.Kind == ShapeHull) SetInternalFaces(child, masks[i]);
+    }
+    const Index result = AddShape(compound);
+    if (result == NoIndex) {
+        discard();
+        return NoIndex;
+    }
+    if (frame) *frame = body;
+    return result;
 }
 
 uint32_t World::WeldStatic() {
     // The bodies the weld covers. See the header for each exclusion.
     std::vector<Index> resting;
     std::vector<std::vector<ShapeFace>> faces;
+    std::vector<CollisionMask> filters;
     for (Index body = 0; body < NumBodies; ++body) {
-        if (!LiveBodies[body] || Moves(Masses[body])) continue;
+        if (!LiveBodies[body] || Moves(Masses[body]) || Filters[body].Sensor) continue;
         const Velocity motion = Velocities[body];
         // Kinematic is a velocity and nothing more anywhere in this engine.
         // A driven slab may leave, and the face it was covering has to be a face again the moment it does.
@@ -640,11 +722,12 @@ uint32_t World::WeldStatic() {
         const Shape &held = Shapes[shape];
         if (held.Kind != ShapeBox && held.Kind != ShapeHull) continue;
         resting.push_back(body);
+        filters.push_back(ResolveFilter(held, {Filters[body].Layer, Filters[body].Collides}));
         // In world space, the one frame two separate bodies share.
         faces.push_back(ShapeFaces(held, ComposePose(Poses[body], held.Local), ShapeVertices.All(), HullFaces.All()));
     }
     std::vector<uint32_t> wanted(NumBodies, 0);
-    const std::vector<uint32_t> masks = BuriedFaces(faces);
+    const std::vector<uint32_t> masks = BuriedFaces(faces, filters);
     for (uint32_t i = 0; i < resting.size(); ++i) wanted[resting[i]] = masks[i];
 
     // Every live body rather than only the ones above.
@@ -657,7 +740,7 @@ uint32_t World::WeldStatic() {
         if (copy == NoIndex) {
             if (mask == 0) continue; // nothing buried, and no earlier call's mark to clear
             // A shape is shared, so the mark goes on a copy this body owns. Refused, it stays unwelded.
-            copy = CopyShape(BodyShapes[body], Shapes[BodyShapes[body]].Local);
+            copy = CopyShape(Shapes[BodyShapes[body]]);
             if (copy == NoIndex) continue;
             WeldedShapes[body] = copy;
             BodyShapes[body] = copy;
@@ -705,9 +788,8 @@ Index World::AddBody(const BodyDesc &desc) {
     BodyShapes[index] = desc.Shape;
     Quiet[index] = 0;
     RestPoses[index] = desc.Pose;
-    Frictions[index] = desc.Friction;
-    Restitutions[index] = desc.Restitution;
-    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith};
+    Materials[index] = desc.Surface.value_or(Material{desc.Friction, desc.Friction, desc.Restitution, CombineGeometricMean, CombineMaximum});
+    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor};
     std::ranges::fill(JointedRun(index), NoIndex);
     // Mass properties come from the shape and motion properties from the body, sharing one lane because Integrate reads that lane.
     mass.GravityScale = desc.GravityScale;
@@ -726,6 +808,15 @@ uint32_t Modes(const JointAxisMode (&axes)[3]) {
 
 Index World::AddJoint(const JointDesc &desc) {
     if (!Alive(desc.BodyA) || !Alive(desc.BodyB)) return NoIndex;
+    for (uint32_t row = 0; row < 6; ++row) {
+        const uint32_t axis = row % 3;
+        const auto *modes = row < 3 ? desc.Linear : desc.Angular;
+        const uint32_t mask = row < 3 ? desc.LinearLimitAxes[axis] : desc.AngularLimitAxes[axis];
+        if (!mask) continue;
+        if (mask > 7 || std::countr_zero(mask) != axis || modes[axis] != AxisLimited) return NoIndex;
+        for (uint32_t other = axis + 1; other < 3; ++other)
+            if ((mask & (1u << other)) && modes[other] != AxisFree) return NoIndex;
+    }
     const Index index = TakeSlot(FreeJoints, NumJoints, Joints.Capacity, Overflow.Joints);
     if (index == NoIndex) return NoIndex;
     const Pose a = Poses[desc.BodyA], b = Poses[desc.BodyB];
@@ -744,8 +835,8 @@ Index World::AddJoint(const JointDesc &desc) {
     Joints[index] = {
         .AnchorA = LocalPoint(a, at_a),
         .AnchorB = LocalPoint(b, at_b),
-        .FrameA = QuatMul(QuatConjugate(a.Orientation), frame),
-        .FrameB = QuatMul(QuatConjugate(b.Orientation), frame),
+        .FrameA = QuatMul(QuatConjugate(a.Orientation), desc.FrameA.value_or(frame)),
+        .FrameB = QuatMul(QuatConjugate(b.Orientation), desc.FrameB.value_or(frame)),
         .LambdaLinear = {0, 0, 0},
         .LambdaAngular = {0, 0, 0},
         .PenaltyLinear = {1, 1, 1},
@@ -771,6 +862,15 @@ Index World::AddJoint(const JointDesc &desc) {
         .Active = 1,
         .Suppresses = desc.Collide ? 0u : 1u,
     };
+    for (uint32_t i = 0; i < 6; ++i) {
+        Joints[index].Drives[i] = desc.Drives[i];
+        Joints[index].Drives[i].Lambda = 0;
+        Joints[index].Drives[i].Penalty = 1;
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+        Joints[index].LinearLimitAxes[i] = desc.LinearLimitAxes[i];
+        Joints[index].AngularLimitAxes[i] = desc.AngularLimitAxes[i];
+    }
     return index;
 }
 
@@ -823,8 +923,8 @@ bool World::RemoveShape(Index shape) {
     for (Index other = 0; other < NumShapes; ++other) {
         if (!LiveShapes[other] || Shapes[other].Kind != ShapeCompound) continue;
         const Shape parent = Shapes[other];
-        for (uint32_t i = 0; i < ChildrenPerCompound; ++i) {
-            const Index child = ChildOf(parent, i);
+        for (uint32_t i = 0; i < parent.VertexCount; ++i) {
+            const Index child = ChildOf(parent, i, CompoundChildren.All().data());
             if (child == NoIndex) break;
             if (child == shape) return false;
         }
@@ -861,6 +961,7 @@ bool World::SetBodyShape(Index body, Index shape, float density, std::optional<A
 }
 
 void World::OnStepped() {
+    UpdateSensorOverlaps();
     // The step's events first, so the queue holds every event of the step before RemoveBody or SetBodyShape can append a synthesized removal.
     DrainContactEvents();
     // A body removed between steps is not recycled until a step has run.

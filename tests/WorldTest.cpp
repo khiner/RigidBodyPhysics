@@ -320,19 +320,19 @@ TEST_CASE_FIXTURE(OneWorld, "a solid described in two halves weighs what the sol
     for (uint32_t axis = 0; axis < 3; ++axis)
         CHECK(1 / built.InvInertiaLocal[axis] == doctest::Approx(1 / solid.InvInertiaLocal[axis]).epsilon(1e-5));
 
-    // A compound is one material, so its mass scales with density as a single piece does.
+    // A compound has uniform density, so its mass scales as a single piece does.
     const auto lighter = MassOf(world, compound, 500);
     CHECK(lighter.InvMass / built.InvMass == doctest::Approx(2));
 
     // The children are copies re-expressed in that frame, and the shapes passed in are left unchanged.
     CHECK(world.ShapeCount() == 5); // two given, two copied, and the compound itself
     for (uint32_t i = 0; i < 2; ++i) {
-        const Index child = ChildOf(world.Shapes[compound], i);
+        const Index child = world.Child(compound, i);
         REQUIRE(child != NoIndex);
         CHECK(child != halves[i]);
         CHECK(simd::distance(world.Shapes[child].Local.Position, world.Shapes[halves[i]].Local.Position) < 1e-6f);
     }
-    CHECK(ChildOf(world.Shapes[compound], 2) == NoIndex); // the run ends at the terminator
+    CHECK(world.Child(compound, 2) == NoIndex); // the run ends at the terminator
     // The compound sits on the body's origin, so the body frame is the compound's own frame.
     CHECK(simd::length(world.Shapes[compound].Local.Position) == 0);
 }
@@ -381,7 +381,7 @@ TEST_CASE_FIXTURE(OneWorld, "a compound off the origin says where it put the bod
     CHECK(frame.Position.y < TopY); // below the top, most of the mass being in the slab
 
     // The top's centre is furthest from the origin, so it is the piece checked.
-    const Index top = ChildOf(world.Shapes[table], 0);
+    const Index top = world.Child(table, 0);
     REQUIRE(top != NoIndex);
     const Pose local = world.Shapes[top].Local;
     const float3 placed = WorldPoint(frame, local.Position);
@@ -397,17 +397,11 @@ TEST_CASE_FIXTURE(OneWorld, "a compound the engine will not make is refused and 
     REQUIRE(pair != NoIndex);
 
     uint32_t refused = 0;
-    // One more child than the run has room for.
-    CHECK(world.AddCompound(std::vector<Index>(ChildrenPerCompound + 1, box)) == NoIndex);
-    CHECK(world.RefusedCompounds == ++refused);
-    // A child that is itself a compound, making the tree two deep.
-    CHECK(world.AddCompound(std::vector<Index>{box, pair}) == NoIndex);
-    CHECK(world.RefusedCompounds == ++refused);
-    // A surface has no interior and a plane is unbounded, so neither has a volume.
-    CHECK(world.AddCompound(std::vector<Index>{box, mesh}) == NoIndex);
-    CHECK(world.RefusedCompounds == ++refused);
-    CHECK(world.AddCompound(std::vector<Index>{box, plane}) == NoIndex);
-    CHECK(world.RefusedCompounds == ++refused);
+    CHECK(world.AddCompound(std::vector<Index>(9, box)) != NoIndex);
+    CHECK(world.AddCompound(std::vector<Index>{box, pair}) != NoIndex);
+    // Surfaces are valid children and contribute no volume.
+    CHECK(world.AddCompound(std::vector<Index>{box, mesh}) != NoIndex);
+    CHECK(world.AddCompound(std::vector<Index>{box, plane}) != NoIndex);
     // An empty list, or a child that is not a live shape.
     CHECK(world.AddCompound({}) == NoIndex);
     CHECK(world.RefusedCompounds == ++refused);
@@ -416,8 +410,8 @@ TEST_CASE_FIXTURE(OneWorld, "a compound the engine will not make is refused and 
     // The world had room for every one, so none of them is an overflow.
     CHECK(world.Overflow.Shapes == 0);
 
-    // Eight fits, so the refusal above is the run's size rather than an off-by-one.
-    CHECK(world.AddCompound(std::vector<Index>(ChildrenPerCompound, box)) != NoIndex);
+    // Valid children still fit after refusals.
+    CHECK(world.AddCompound(std::vector<Index>(8, box)) != NoIndex);
     CHECK(world.RefusedCompounds == refused);
 }
 
@@ -432,7 +426,7 @@ TEST_CASE_FIXTURE(OneWorld, "a compound gives its children's slots back with it,
     const auto compound = world.AddCompound(std::vector<Index>{box, hull});
     REQUIRE(compound != NoIndex);
     CHECK(world.ShapeCount() == before + 3); // two copies and the compound
-    const Index child = ChildOf(world.Shapes[compound], 1);
+    const Index child = world.Child(compound, 1);
     REQUIRE(child != NoIndex);
     // A hull child takes its own run rather than sharing the original's, so either can be freed.
     CHECK(world.Shapes[child].FirstVertex != world.Shapes[hull].FirstVertex);
@@ -553,4 +547,78 @@ TEST_CASE_FIXTURE(OneWorld, "a partly covered face is not buried") {
     CHECK(world.WeldStatic() == 0);
     CHECK(InternalFaces(world.Shapes[world.BodyShapes[leg]]) == 0);
     CHECK(world.ShapeCount() == before + 1);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: nested compounds flatten beyond eight leaves and release their pool") {
+    const auto box = world.AddShape(UnitBox);
+    const auto inner = world.AddCompound(std::vector<Index>(12, box));
+    REQUIRE(inner != NoIndex);
+    world.Shapes[inner].Local = At(float3{3, 0, 0});
+    Pose frame;
+    const auto outer = world.AddCompound(std::vector<Index>{inner, inner}, &frame);
+    REQUIRE(outer != NoIndex);
+    CHECK(world.Shapes[outer].VertexCount == 24);
+    CHECK(frame.Position.x == doctest::Approx(3));
+    CHECK(world.Child(outer, 24) == NoIndex);
+    const auto first = world.Shapes[outer].FirstVertex;
+    REQUIRE(world.RemoveShape(outer));
+    const auto again = world.AddCompound(std::vector<Index>{inner, inner});
+    REQUIRE(again != NoIndex);
+    CHECK(world.Shapes[again].FirstVertex == first);
+    CHECK(OwnChild(ChildPair(100000, 200000)) == 100000);
+    CHECK(OtherChild(ChildPair(100000, 200000)) == 200000);
+}
+
+TEST_CASE("integration: material combination precedence is symmetric") {
+    constexpr float a = 0.2f, b = 0.8f;
+    const float expected[]{0.5f, 0.2f, 0.8f, 0.16f};
+    for (uint32_t i = 0; i < 4; ++i)
+        for (uint32_t j = 0; j < 4; ++j) {
+            CHECK(Combine(a, b, i, j) == doctest::Approx(expected[std::min(i, j)]));
+            CHECK(Combine(b, a, j, i) == doctest::Approx(expected[std::min(i, j)]));
+        }
+}
+
+TEST_CASE_FIXTURE(Device, "integration: compound child pool exhaustion rolls back and can be reused") {
+    World world{context, {.Bodies = 4, .Shapes = 32, .CompoundChildren = 12}};
+    const auto box = world.AddShape(UnitBox);
+    const auto first = world.AddCompound(std::vector<Index>(12, box));
+    REQUIRE(first != NoIndex);
+    const auto count = world.ShapeCount();
+    CHECK(world.AddCompound(std::vector<Index>{box}) == NoIndex);
+    CHECK(world.Overflow.CompoundChildren == 1);
+    CHECK(world.ShapeCount() == count);
+    REQUIRE(world.RemoveShape(first));
+    CHECK(world.AddCompound(std::vector<Index>(12, box)) != NoIndex);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: flattening preserves explicit and inherited masks") {
+    Shape explicit_shape = UnitBox;
+    explicit_shape.HasFilter = 1;
+    explicit_shape.Mask = {1, 2};
+    const auto explicit_leaf = world.AddShape(explicit_shape);
+    const auto inherited_leaf = world.AddShape(UnitBox);
+    const auto inner = world.AddCompound(std::vector<Index>{explicit_leaf, inherited_leaf});
+    REQUIRE(inner != NoIndex);
+    world.Shapes[inner].HasFilter = 1;
+    world.Shapes[inner].Mask = {4, 8};
+    const auto outer = world.AddCompound(std::vector<Index>{inner});
+    REQUIRE(outer != NoIndex);
+    CHECK(SameMask(world.Shapes[world.Child(outer, 0)].Mask, {1, 2}));
+    CHECK(SameMask(world.Shapes[world.Child(outer, 1)].Mask, {4, 8}));
+    CHECK(world.Shapes[world.Child(outer, 1)].HasFilter == 1);
+    CHECK(world.Shapes[inherited_leaf].HasFilter == 0);
+    CHECK(world.Shapes[world.Child(inner, 1)].HasFilter == 0);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "collider filters: static welds require matching collider masks") {
+    const auto shape = world.AddShape(UnitBox);
+    const auto a = world.AddBody({.Pose = At(float3{-Half, 0, 0}), .Shape = shape, .Density = 0, .Layer = 1, .CollidesWith = 2});
+    const auto b = world.AddBody({.Pose = At(float3{Half, 0, 0}), .Shape = shape, .Density = 0, .Layer = 4, .CollidesWith = 8});
+    CHECK(world.WeldStatic() == 0);
+    world.Filters[b].Layer = 1;
+    world.Filters[b].Collides = 2;
+    CHECK(world.WeldStatic() == 2);
+    world.Filters[a].Collides = 0;
+    CHECK(world.WeldStatic() == 0);
 }

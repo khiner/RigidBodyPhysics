@@ -26,6 +26,7 @@ struct WorldLimits {
     uint32_t HullFaces = 16384;
     uint32_t Triangles = 65536;
     uint32_t BvhNodes = 65536;
+    uint32_t CompoundChildren = 65536;
 };
 
 // A pose at a position, with an optional rotation.
@@ -62,12 +63,16 @@ struct BodyDesc {
     // The fraction of an impact's closing speed returned as separating speed.
     // Combined with the other body's by taking the larger (LiteratureReview.md section 1.1), so a bouncy ball stays bouncy against anything.
     float Restitution = 0;
+    // Overrides the legacy coefficients above. Shape materials override this per collider.
+    std::optional<Material> Surface;
     // The fraction of the world's gravity applied to this body, and the fraction of its linear and angular velocity removed per second.
     // Motion properties rather than mass properties. See BodyMass.
     float GravityScale = 1;
     float LinearDamping = 0, AngularDamping = 0;
     // The bits this body belongs to, and the bits it collides with. Everything collides with everything by default.
+    // Collider and compound Shape::Mask overrides replace these defaults.
     uint32_t Layer = ~0u, CollidesWith = ~0u;
+    bool Sensor = false;
 };
 
 // Two bodies pinned together at a point in the world, stored in each body's own frame.
@@ -82,6 +87,8 @@ struct JointDesc {
     // For a KHR joint that is the joint node's transform, generally not an axis of either body.
     // Unset takes body B's own axes.
     std::optional<float4> Frame;
+    // Independently authored world orientations; override Frame at the corresponding endpoint.
+    std::optional<float4> FrameA, FrameB;
     // The mode of each of the frame's three angular axes.
     // All free is a ball joint, all locked a fixed one, and two locked with the third free or driven is a hinge about that axis.
     JointAxisMode Angular[3]{AxisFree, AxisFree, AxisFree};
@@ -114,6 +121,10 @@ struct JointDesc {
     float3 LinearDamping{0, 0, 0}, AngularDamping{0, 0, 0};
     // Two bodies a joint holds together overlap by design, so by default they are not also collided.
     bool Collide = false;
+    JointDrive Drives[6]{}; // independent linear XYZ and angular XYZ drives
+    // Grouped limit masks (bits XYZ), placed on the lowest selected axis. Other selected axes must be free.
+    // Linear groups constrain radial distance; angular groups constrain cone/rotation angle.
+    uint32_t LinearLimitAxes[3]{}, AngularLimitAxes[3]{};
 };
 
 // A body's identity across time: its slot, and which tenancy of that slot.
@@ -132,7 +143,7 @@ struct ContactChange {
     BodyId A, B;
     uint32_t Feature = 0; // identifies the geometry the point came from, stable while the contact persists
     Index SubShape = NoIndex; // which triangle of a mesh, NoIndex for a shape that is one piece
-    uint32_t Children = 0; // and which leaf of each compound, packed as Contact::Children is
+    uint64_t Children = 0; // and which leaf of each compound, packed as Contact::Children is
     ContactEventKind Kind = ContactAdded;
     // The force each row is applying, in the contact's own basis: the normal row first, then the two friction rows.
     // A normal row only pushes, so Lambda[0] < 0 marks an engaged contact.
@@ -141,6 +152,17 @@ struct ContactChange {
     float Approach = 0; // how fast the pair was closing when the step began
     float BounceImpulse = 0; // the normal impulse the restitution pass applied this step
     // All three are zero on a removal, which has no contact left to read them from.
+};
+
+// One overlapping collider pair. Identities remain valid across body-slot reuse.
+struct SensorOverlap {
+    BodyId A, B;
+    uint64_t Children{};
+    bool operator==(const SensorOverlap &) const = default;
+};
+struct SensorChange {
+    SensorOverlap Pair;
+    bool Entered;
 };
 
 // Engine-owned struct-of-arrays in shared buffers.
@@ -176,18 +198,10 @@ struct World {
     // `local` is where those points sit in the body frame.
     // A surface stays in the frame it arrived in, so unlike a hull there is no cook frame under it to compose with.
     Index AddMesh(std::span<const float3> points, std::span<const uint32_t> indices, Pose local = IdentityPose);
-    // A body made of several pieces: the shapes named here, each kept at the Local it already carries, as KHR authors a node with several collider descendants.
-    // Returns NoIndex, counted in RefusedCompounds, for more than ChildrenPerCompound children.
-    // Also NoIndex for a child that is not live, or a child that is itself a compound, a mesh or a plane.
-    // A leaf must be a convex solid the narrowphase already collides, and the tree stays one deep.
-    //
-    // The body frame produced is the frame every other shape is held in: the centre of mass with the inertia diagonal.
-    // A compound therefore moves the geometry under the caller as a hull cook does, and `frame` returns where it sits in the frame the children were given in.
-    //
-    // The children are copied into shape slots of their own at poses re-expressed in that frame, so the shapes handed in are untouched.
-    // A child then belongs to its compound.
-    // RemoveShape refuses a child while the compound holds it, and releases every child with the compound.
-    // No density is taken here, a compound being one material whose frame does not depend on it, and the body's density is read in AddBody and SetBodyShape.
+    // Copies collider leaves into a compound, flattening nested compounds and composing their poses.
+    // `frame` returns the cooked centre-of-mass and principal-axis frame in the supplied frame.
+    // A compound owns its copied leaves. Input shapes remain independently usable.
+    // Empty lists and dead children are refused and counted. Surface-only compounds need authored mass to move.
     Index AddCompound(std::span<const Index> children, Pose *frame = nullptr);
 
     // Mutation happens between steps: Solver::Step commits and waits for its own completion before returning, so outside a step the host owns every buffer.
@@ -206,7 +220,7 @@ struct World {
     bool SetBodyShape(Index body, Index shape, float density = 1000, std::optional<AuthoredMass> mass = {});
     bool Alive(Index body) const { return body < NumBodies && LiveBodies[body]; }
 
-    // Welds static geometry shut, and returns the number of faces marked internal.
+    // Welds static geometry with identical effective collision masks, returning the number of internal faces.
     // A face of one static body wholly covered by a coplanar touching face of another is inside the solid the two make together.
     // Such a face is marked through the same InternalFaces bits AddCompound sets for a compound's siblings.
     // Unmarked, that join acts as a wall.
@@ -252,7 +266,7 @@ struct World {
 
     // Adds refused because a pool was full, a scene sizing problem rather than a runtime one.
     struct Overflows {
-        uint32_t Bodies{}, Shapes{}, Joints{}, Jointed{}, ShapeVertices{}, HullFaces{}, Triangles{}, BvhNodes{};
+        uint32_t Bodies{}, Shapes{}, Joints{}, Jointed{}, ShapeVertices{}, HullFaces{}, Triangles{}, BvhNodes{}, CompoundChildren{};
     };
     Overflows Overflow{};
 
@@ -260,7 +274,7 @@ struct World {
     // Not an overflow, the pools having had room. See BodyDesc::Mass.
     uint32_t OffsetsWithoutMass{};
 
-    // Compounds refused as a shape the engine does not build: too many children, a child that is not live, or a child that is a compound, a mesh or a plane.
+    // Compounds refused as a shape the engine does not build: an empty list or a dead child.
     // Not an overflow either, this limit being one the host cannot raise. See AddCompound.
     uint32_t RefusedCompounds{};
 
@@ -275,7 +289,9 @@ struct World {
     mtl::Buffer<Triangle> Triangles; // and every mesh's triangles, indexing absolutely into that pool
     mtl::Buffer<BvhNode> BvhNodes; // and the tree over them, each shape's nodes indexed from its root
 
-    mtl::Buffer<float> Frictions, Restitutions;
+    mtl::Buffer<Index> CompoundChildren;
+    Index Child(Index compound, uint32_t i) const { return ChildOf(Shapes[compound], i, CompoundChildren.All().data()); }
+    mtl::Buffer<Material> Materials;
     mtl::Buffer<Filter> Filters;
     mtl::Buffer<Index> Jointed; // JointsPerBody slots per body, NoIndex past the end of the run
 
@@ -289,6 +305,13 @@ struct World {
     mtl::Buffer<uint32_t> Quiet, NextQuiet; // consecutive steps a body has been slower than SleepSpeed
     mtl::Buffer<uint32_t> Colors, NextColors; // kept across steps, since the coloring is incremental
     mtl::Buffer<Contact> Contacts;
+    // Allocated on first sensor step. One point per overlapping leaf pair, separate from solid contacts.
+    mtl::Buffer<Contact> SensorContacts;
+    mtl::Buffer<uint32_t> SensorRefusals;
+    std::span<const SensorOverlap> Overlaps() const { return SensorOverlaps; }
+    std::vector<SensorChange> TakeSensorChanges() { return std::exchange(SensorChanges, {}); }
+    bool TrackSensors = false; // overlap state is always refreshed; queued changes are opt-in
+
     mtl::Buffer<Adjacency> Incoming; // per body, where its contacts-as-B are in the list below
     mtl::Buffer<uint32_t> IncomingSlots;
 
@@ -308,6 +331,10 @@ struct World {
     NS::SharedPtr<MTL4::CommandQueue> Queue; // held rather than borrowed, so the destructor does not depend on the context
 
 private:
+    friend struct Solver;
+    template<typename T> void MakeBuffer(mtl::Buffer<T> &, uint32_t capacity);
+    void EnsureSensorBuffers();
+    void RefreshFilters();
     // A pool of variable-length runs: a hull's vertices, a mesh's triangles, the tree over them.
     // A bump pointer plus the freed runs, kept sorted and merged with their neighbours.
     // A mesh replaced by a similar one therefore fits where the first was rather than fragmenting the pool.
@@ -330,7 +357,7 @@ private:
     bool OffsetNeedsAuthoredMass(Index shape, const BodyMass &, bool authored) const;
     // One shape duplicated into a slot of its own at a new pose within the body frame, runs included.
     // Returns NoIndex when a pool or the slot table refused, releasing whatever was taken.
-    Index CopyShape(Index source, Pose local);
+    Index CopyShape(Shape);
     // Releases the private copy of its shape the weld gave this body. See WeldStatic.
     void DropWeld(Index body);
     // Reports every live contact of this body as removed and clears them, so the stream carries the end with the mutation that caused it, not a step later.
@@ -338,6 +365,8 @@ private:
     void EndContacts(Index body);
     // The step's event runs, translated and appended to the queue. See TrackContacts.
     void DrainContactEvents();
+    void UpdateSensorOverlaps();
+    void EndSensorOverlaps(Index);
     // Releases the pool runs and the slot itself, without RemoveShape's checks on remaining users.
     // A compound removing its own children requires skipping those checks.
     void ReleaseShape(Index);
@@ -347,7 +376,7 @@ private:
     std::span<Index> JointedRun(Index body) const { return Jointed.All().subspan(body * JointsPerBody, JointsPerBody); }
 
     uint32_t NumBodies{}, NumShapes{}, NumJoints{};
-    RunPool VertexPool, FacePool, TrianglePool, NodePool;
+    RunPool VertexPool, FacePool, TrianglePool, NodePool, ChildPool;
     // Which slots are handed out and not yet released.
     // A body with no shape is a legal live body, so liveness is not derivable from the buffers and is kept here.
     // A joint's liveness is its own Active flag.
@@ -362,6 +391,8 @@ private:
     // Host-side state, read by no kernel.
     std::vector<uint32_t> Spawns;
     std::vector<ContactChange> Changes;
+    std::vector<SensorOverlap> SensorOverlaps;
+    std::vector<SensorChange> SensorChanges;
 };
 
 // The mass of a static body: a plane, a mesh, no shape at all, or a density of zero.
@@ -371,6 +402,6 @@ inline constexpr BodyMass StaticMass{.InvInertiaLocal = {0, 0, 0}, .InvMass = 0}
 
 // The mass and diagonal inertia a shape of this density has about its center of mass.
 // A hull's geometry is in the vertex pool and a compound's in its children, so both pools are passed in and read here rather than cached.
-BodyMass MassProperties(const Shape &, float density, std::span<const float3> shape_vertices = {}, std::span<const Shape> shapes = {});
+BodyMass MassProperties(const Shape &, float density, std::span<const float3> shape_vertices = {}, std::span<const Shape> shapes = {}, std::span<const Index> children = {});
 
 } // namespace rbp

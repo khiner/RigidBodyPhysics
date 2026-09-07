@@ -86,10 +86,11 @@ private:
         CountQuietPass,
         SpreadWakingPass,
         PublishWakingPass,
+        SensorPass,
         PassCount,
     };
 
-    void Encode(const Recording &);
+    void Encode(const Recording &, World &);
     void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads) const;
 
     const mtl::Context &Context;
