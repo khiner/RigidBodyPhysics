@@ -72,8 +72,7 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         low = simd::min(low, point);
         high = simd::max(high, point);
     }
-    // Points within a millionth of the mesh's own size are the same corner.
-    // Two points either side of a grid line at that scale stay apart, which costs one seam its recognition and nothing else.
+    // Quantize vertices to a grid with spacing of one millionth of the mesh extent.
     const float grain = 1e-6f * std::max({high.x - low.x, high.y - low.y, high.z - low.z, 1e-6f});
 
     CookedMesh cooked;
@@ -89,13 +88,29 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
     for (uint32_t i = 0; i + 2 < indices.size(); i += 3) {
         if (indices[i] >= points.size() || indices[i + 1] >= points.size() || indices[i + 2] >= points.size()) return {};
         const Triangle triangle{where[indices[i]], where[indices[i + 1]], where[indices[i + 2]], 0};
-        if (triangle.A == triangle.B || triangle.B == triangle.C || triangle.A == triangle.C) continue; // welded flat
+        if (triangle.A == triangle.B || triangle.B == triangle.C || triangle.A == triangle.C) continue;
         if (length(cross(cooked.Vertices[triangle.B] - cooked.Vertices[triangle.A], cooked.Vertices[triangle.C] - cooked.Vertices[triangle.A])) <= 0) continue;
         cooked.Triangles.push_back(triangle);
     }
     if (cooked.Triangles.empty()) return {};
 
-    // Which triangles meet along each edge, so each triangle can test whether the surface folds there.
+    // Remove unused vertices before mesh-plane queries can produce contacts from them.
+    where.assign(cooked.Vertices.size(), NoIndex);
+    for (const Triangle &triangle : cooked.Triangles)
+        for (const Index corner : {triangle.A, triangle.B, triangle.C}) where[corner] = 0;
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < cooked.Vertices.size(); ++i) {
+        if (where[i] == NoIndex) continue;
+        where[i] = used;
+        cooked.Vertices[used++] = cooked.Vertices[i];
+    }
+    cooked.Vertices.resize(used);
+    for (Triangle &triangle : cooked.Triangles) {
+        triangle.A = where[triangle.A];
+        triangle.B = where[triangle.B];
+        triangle.C = where[triangle.C];
+    }
+
     std::map<std::pair<Index, Index>, std::vector<uint32_t>> along;
     for (uint32_t t = 0; t < cooked.Triangles.size(); ++t) {
         const Triangle &triangle = cooked.Triangles[t];
@@ -112,24 +127,24 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         for (uint32_t e = 0; e < 3; ++e) {
             const Index from = corner[e], to = corner[(e + 1) % 3];
             const auto &shared = along[{std::min(from, to), std::max(from, to)}];
-            // An edge belonging to one triangle is the boundary of an open surface, and an edge three or more triangles meet along is not a surface.
-            // Both are active by default, being reachable and covered by no other rule.
+            // Boundary and nonmanifold edges remain active.
             bool active = shared.size() != 2;
+            bool back_active = active;
             for (const uint32_t other : shared) {
                 if (other == t) continue;
                 const Triangle &neighbour = cooked.Triangles[other];
-                // The neighbour's corner off the shared edge gives the fold direction.
-                // Behind this triangle's plane is a ridge a body can hit, and level with it or in front is a seam or a valley out of reach.
+                // The adjacent triangle lies behind this plane at a convex crease.
                 for (const Index far : {neighbour.A, neighbour.B, neighbour.C}) {
                     if (far == from || far == to) continue;
                     const float3 offset = cooked.Vertices[far] - cooked.Vertices[from];
                     const float span = length(offset);
                     if (span > 0 && dot(normal, offset) / span < -ActiveEdgeSine) active = true;
+                    if (span > 0 && dot(normal, offset) / span > ActiveEdgeSine) back_active = true;
                 }
             }
             if (active) triangle.ActiveEdges |= 1u << e;
-            // And which triangle owns points lying along the edge: the lower-numbered of the two, so exactly one does.
-            // A point at a corner several triangles meet at is then still owned.
+            if (back_active) triangle.BackActiveEdges |= 1u << e;
+            // The lower triangle index owns contacts on a shared edge.
             if (shared.size() != 2 || t == std::min(shared[0], shared[1])) triangle.OwnedEdges |= 1u << e;
         }
     }

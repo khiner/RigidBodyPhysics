@@ -185,6 +185,11 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
         // AddCompound left the children in the frame this diagonalizes to, so the moments come out in the order of the body frame's own axes.
         const Aggregate whole = WeighChildren(shape, shape_vertices, shapes, children);
         if (whole.Volume <= 0) return StaticMass;
+        if (shape.VertexCount == 1) {
+            const Shape &child = shapes[ChildOf(shape, 0, children.data())];
+            if (simd::all(child.Local.Position == IdentityPose.Position) && simd::all(child.Local.Orientation == IdentityPose.Orientation))
+                return MassProperties(child, density, shape_vertices, shapes, children);
+        }
         const double3 moments = DiagonalizeSymmetric(whole.Tensor).Values;
         return {.InvInertiaLocal = 1 / (float3{float(moments.x), float(moments.y), float(moments.z)} * density), .InvMass = 1 / float(whole.Volume * density)};
     }
@@ -270,7 +275,7 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     MakeBuffer(Materials, limits.Bodies);
     MakeBuffer(CompoundChildren, limits.CompoundChildren);
     MakeBuffer(Filters, limits.Bodies);
-    MakeBuffer(Jointed, limits.Bodies * JointsPerBody);
+    MakeBuffer(Jointed, limits.Bodies + 1 + 2 * limits.Joints);
     MakeBuffer(InitialPoses, limits.Bodies);
     MakeBuffer(InertialPoses, limits.Bodies);
     MakeBuffer(PreviousVelocities, limits.Bodies);
@@ -291,8 +296,8 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     Residency->requestResidency();
     Queue->addResidencySet(Residency.get());
 
-    // The lanes whose empty value is NoIndex rather than zero, which is every lane naming something.
-    for (auto *buffer : {&BodyShapes, &Jointed, &IncomingSlots}) std::ranges::fill(buffer->All(), NoIndex);
+    std::ranges::fill(Jointed.All().first(limits.Bodies + 1), limits.Bodies + 1);
+    for (auto *buffer : {&BodyShapes, &IncomingSlots}) std::ranges::fill(buffer->All(), NoIndex);
 
     VertexPool.Capacity = limits.ShapeVertices;
     FacePool.Capacity = limits.HullFaces;
@@ -354,7 +359,6 @@ void World::RunPool::Give(Index start, uint32_t count) {
 }
 
 // Both directions: this body's own run holds the contacts where it is A, and last step's incoming list the ones where it is B.
-// Both are needed because a plane and a mesh own no manifold, so everything standing on one names it as B and only the incoming list reaches those.
 void World::Wake(Index body) {
     Quiet[body] = 0;
     for (uint32_t i = 0; i < ContactsPerBody; ++i) {
@@ -384,6 +388,7 @@ void World::EndContacts(Index body) {
                 .B = IdOf(contact.BodyB),
                 .Feature = contact.Feature,
                 .SubShape = contact.SubShape,
+                .SubShapeA = contact.SubShapeA,
                 .Children = contact.Children,
                 .Kind = ContactRemoved,
                 .Step = CompletedSteps,
@@ -493,6 +498,7 @@ void World::DrainContactEvents(float delta_time) {
                 .B = IdOf(event.BodyB),
                 .Feature = event.Feature,
                 .SubShape = event.SubShape,
+                .SubShapeA = event.SubShapeA,
                 .Children = event.Children,
                 .Kind = ContactEventKind(event.Kind),
                 .Step = CompletedSteps,
@@ -599,11 +605,11 @@ Index World::CopyShape(Shape copy) {
             Shapes[result].HasMaterial = copy.HasMaterial;
             Shapes[result].Mask = copy.Mask;
             Shapes[result].HasFilter = copy.HasFilter;
+            Shapes[result].DoubleSided = copy.DoubleSided;
         }
         return result;
     }
-    // A hull's geometry is in the pools, and a copy sharing those runs could not be released on its own.
-    // A face names its corners by their place in the shape's own run, so both runs copy unchanged.
+    // Copies own their geometry runs so either shape can be released independently.
     if (copy.Kind == ShapeHull) {
         const Index first = VertexPool.Take(copy.VertexCount);
         const Index first_face = FacePool.Take(copy.FaceCount);
@@ -699,12 +705,13 @@ Index World::AddCompound(std::span<const Index> children, Pose *frame) {
         return NoIndex;
     }
     const Aggregate whole = WeighChildren(compound, ShapeVertices.All(), Shapes.All(), CompoundChildren.All());
-    const Pose body = whole.Volume > 0 ? Pose{.Position = float3{float(whole.Center.x), float(whole.Center.y), float(whole.Center.z)}, .Orientation = DiagonalizeSymmetric(whole.Tensor).Orientation} : IdentityPose;
+    const bool single = count == 1 && whole.Volume > 0;
+    const Pose body = single ? leaves[0].Local : (whole.Volume > 0 ? Pose{.Position = float3{float(whole.Center.x), float(whole.Center.y), float(whole.Center.z)}, .Orientation = DiagonalizeSymmetric(whole.Tensor).Orientation} : IdentityPose);
     const Pose inverse{.Position = Rotate(QuatConjugate(body.Orientation), -body.Position), .Orientation = QuatConjugate(body.Orientation)};
     std::vector<std::vector<ShapeFace>> faces;
     for (uint32_t i = 0; i < count; ++i) {
         Shape &child = Shapes[CompoundChildren[first + i]];
-        child.Local = ComposePose(inverse, child.Local);
+        child.Local = single ? IdentityPose : ComposePose(inverse, child.Local);
         if (child.Kind == ShapeBox || child.Kind == ShapeHull) SetInternalFaces(child, 0);
         faces.push_back(ShapeFaces(child, child.Local, ShapeVertices.All(), HullFaces.All()));
     }
@@ -806,7 +813,7 @@ Index World::AddBody(const BodyDesc &desc) {
     RestPoses[index] = desc.Pose;
     Materials[index] = desc.Surface.value_or(Material{desc.Friction, desc.Friction, desc.Restitution, CombineGeometricMean, CombineMaximum});
     Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor};
-    std::ranges::fill(JointedRun(index), NoIndex);
+    if (index + 1 == NumBodies) Jointed[index + 1] = Jointed[index];
     // Mass properties come from the shape and motion properties from the body, sharing one lane because Integrate reads that lane.
     mass.GravityScale = desc.GravityScale;
     mass.LinearDamping = desc.LinearDamping;
@@ -836,18 +843,8 @@ Index World::AddJoint(const JointDesc &desc) {
     const Index index = TakeSlot(FreeJoints, NumJoints, Joints.Capacity, Overflow.Joints);
     if (index == NoIndex) return NoIndex;
     const Pose a = Poses[desc.BodyA], b = Poses[desc.BodyB];
-    // Each end's world point and the joint's world frame, stored in each body's own frame, so a joint holds the pose the bodies were in when it was made.
-    // Two ends that do not coincide are an initial error the joint closes rather than a refusal.
     const float3 at_a = desc.AtA.value_or(desc.At), at_b = desc.AtB.value_or(desc.At);
     const float4 frame = desc.Frame.value_or(b.Orientation);
-    if (!desc.Collide) { // record each as the other's partner, so neither generates contacts against it
-        for (const auto [owner, partner] : {std::pair{desc.BodyA, desc.BodyB}, std::pair{desc.BodyB, desc.BodyA}}) {
-            const auto run = JointedRun(owner);
-            const auto gap = std::ranges::find(run, NoIndex);
-            if (gap == run.end()) ++Overflow.Jointed;
-            else *gap = partner;
-        }
-    }
     Joints[index] = {
         .AnchorA = LocalPoint(a, at_a),
         .AnchorB = LocalPoint(b, at_b),
@@ -887,7 +884,31 @@ Index World::AddJoint(const JointDesc &desc) {
         Joints[index].LinearLimitAxes[i] = desc.LinearLimitAxes[i];
         Joints[index].AngularLimitAxes[i] = desc.AngularLimitAxes[i];
     }
+    RebuildJointed();
     return index;
+}
+
+void World::RebuildJointed() {
+    std::vector<Index> cursor(NumBodies, 0);
+    for (Index i = 0; i < NumJoints; ++i) {
+        const Joint &joint = Joints[i];
+        if (!joint.Active || !joint.Suppresses) continue;
+        ++cursor[joint.BodyA];
+        ++cursor[joint.BodyB];
+    }
+    Index end = Poses.Capacity + 1;
+    for (Index body = 0; body < NumBodies; ++body) {
+        Jointed[body] = end;
+        end += cursor[body];
+        cursor[body] = Jointed[body];
+    }
+    Jointed[NumBodies] = end;
+    for (Index i = 0; i < NumJoints; ++i) {
+        const Joint &joint = Joints[i];
+        if (!joint.Active || !joint.Suppresses) continue;
+        Jointed[cursor[joint.BodyA]++] = joint.BodyB;
+        Jointed[cursor[joint.BodyB]++] = joint.BodyA;
+    }
 }
 
 bool World::RemoveBody(Index body) {
@@ -914,12 +935,6 @@ bool World::RemoveBody(Index body) {
 bool World::RemoveJoint(Index joint) {
     if (joint >= NumJoints || !Joints[joint].Active) return false;
     const Joint &held = Joints[joint];
-    if (held.Suppresses) { // undo exactly what AddJoint wrote: one entry each way and no more
-        for (const auto [owner, partner] : {std::pair{held.BodyA, held.BodyB}, std::pair{held.BodyB, held.BodyA}}) {
-            const auto run = JointedRun(owner);
-            if (const auto at = std::ranges::find(run, partner); at != run.end()) *at = NoIndex;
-        }
-    }
     // Whatever the joint was holding up is now falling, and nothing else wakes either end.
     Quiet[held.BodyA] = 0;
     Quiet[held.BodyB] = 0;
@@ -928,6 +943,7 @@ bool World::RemoveJoint(Index joint) {
     // A joint carries nothing across steps that a kernel must read first, so its slot is free at once.
     // Every body scans the whole joint pool once per color per iteration.
     TrimTail(NumJoints, FreeJoints, [this](Index at) { return Joints[at].Active != 0; });
+    RebuildJointed();
     return true;
 }
 

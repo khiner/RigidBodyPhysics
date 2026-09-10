@@ -173,17 +173,21 @@ std::vector<Face> BuildSimplified(std::span<const float3> points, float epsilon,
     std::vector<Face> faces = SeedTetrahedron(points, epsilon);
     if (faces.empty()) return {};
     std::vector<std::pair<uint32_t, uint32_t>> rim;
+    std::vector<uint8_t> inserted(points.size());
+    for (const auto corner : Corners(faces)) inserted[corner] = true;
     // A point adds itself and can only remove corners, so the count rises by at most one per step and stopping at the budget lands exactly on it.
     while (Corners(faces).size() < limit) {
         uint32_t furthest = NoIndex;
         float outside = epsilon; // under which a point is on the hull rather than outside it
         for (uint32_t i = 0; i < points.size(); ++i)
-            if (const float by = OutsideBy(faces, points[i]); by > outside) { // ties go to the lower index, so the hull is deterministic
+            if (const float by = inserted[i] ? -INFINITY : OutsideBy(faces, points[i]); by > outside) { // ties go to the lower index, so the hull is deterministic
                 outside = by;
                 furthest = i;
             }
         if (furthest == NoIndex) break; // every point on or inside it, which is the exact hull
         AddPoint(points, faces, furthest, epsilon, rim);
+        inserted[furthest] = true;
+        std::erase_if(faces, [](const Face &face) { return !face.Live; });
     }
     tolerance = 0;
     for (const float3 point : points) tolerance = std::max(tolerance, OutsideBy(faces, point));

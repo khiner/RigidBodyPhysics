@@ -147,16 +147,11 @@ struct HullFace {
 // Sphere uses Radius.
 // Capsule uses Radius and HalfExtents.y, the half length of the segment its two caps sit on.
 // A capsule runs along the body's local y and reaches HalfExtents.y + Radius from the centre.
-// Plane uses Normal and Offset and is always static, with points at dot(Normal, p) < Offset inside it.
 // Hull uses a run of the world's one vertex pool, in the frame World::AddHull cooked it into.
 // That frame is centred on the centre of mass and turned onto the principal axes, which gives the body a diagonal inertia.
 //
 // A mesh adds a run of triangles and the root of the tree over them.
-// It is one-sided and carries no mass properties, so a moving body wearing one requires an explicit mass from the host (BodyDesc::Mass).
 // Jolt, Havok and the KHR reference loader all require the same.
-// One-sided means nothing is ever pushed out of the back of a triangle.
-// A mesh presents no manifold of its own, so mesh against mesh and mesh against plane produce no contact.
-// A moving solid concave shape is a set of hulls instead.
 //
 // Compounds are cooked to a flat run of collider leaves in the world's child-index pool.
 // FirstVertex and VertexCount name that run. Authoring depth does not affect GPU traversal.
@@ -176,7 +171,6 @@ struct Shape {
     // The pose of the shape's own frame within the body frame, which is centred on the centre of mass with the inertia diagonal.
     // The narrowphase composes body pose with this only where it reads the geometry, so anchors, features and manifold points stay in the body frame.
     // A contact on an offset shape therefore has anchors carrying the offset.
-    // A plane leaves this unread, its Normal and Offset being world quantities rather than geometry in a frame.
     //
     // Mass properties are the shape's own, about its own centre. See MassProperties.
     // A body wearing a shape at any other pose needs an explicit mass.
@@ -188,8 +182,10 @@ struct Shape {
     CollisionMask Mask{};
     uint HasFilter = 0;
     ulong UserData = 0; // opaque collider identity, preserved when shapes are copied
+    uint DoubleSided = 0; // Planes and meshes accept contacts on both sides.
 };
 
+inline bool IsBoundedPlane(Shape shape) { return shape.Kind == ShapePlane && (shape.HalfExtents.x > 0 || shape.HalfExtents.z > 0); }
 inline CollisionMask ResolveFilter(Shape shape, CollisionMask inherited) { return shape.HasFilter ? shape.Mask : inherited; }
 
 // Child indices are pooled independently of shape geometry.
@@ -234,6 +230,7 @@ struct Triangle {
     // Which of those edges this triangle owns contact points on.
     // A point exactly on an edge clips inside both triangles, and a single owner keeps it from taking two rows and two duals.
     uint OwnedEdges;
+    uint BackActiveEdges; // Reverse-winding edge flags retain inactive coplanar edges.
 };
 
 // A node of the tree over a mesh's triangles: the box around everything below it, and either a run of triangles or a pair of children.
@@ -256,10 +253,6 @@ struct Filter {
     uint Mixed = 0; // differently filtered leaves cannot unconditionally bury each other's faces
 };
 
-// A body's jointed partners, which by default it does not collide with, because two bodies a joint holds together overlap by design.
-// A fixed run per body, terminated by a NoIndex.
-GPU_CONSTANT uint JointsPerBody = 8;
-
 // A body's color word holds its color in the low byte and its contact degree above.
 // One load therefore supplies both the conflict test and the neighbour's coloring priority, which is degree first and index as the tie.
 GPU_CONSTANT uint ColorDegreeShift = 8;
@@ -279,7 +272,6 @@ inline bool Prioritized(uint other_word, uint other, uint degree, uint body, boo
 // Each body has a fixed run of contact slots, so the pool is addressable without an atomic append.
 // One thread fills its own body's run, in a fixed order over the other bodies.
 // The budget is in manifolds, because reduction leaves four points per manifold whatever shape produced it.
-// Ten manifolds cover the busiest measured scene, which puts 33 points on one body, with a whole manifold of headroom.
 //
 // Every partner is collided whether or not the run is full, and the shallowest contact held is replaced by any deeper one.
 // Going over budget therefore drops the shallowest contact rather than the highest-numbered body.
@@ -306,6 +298,7 @@ struct Contact {
     float3 Normal; // world, out of B towards A
     float3 PointA, PointB; // fresh geometric points in body frames, independent of retained friction anchors
     float NominalArea = -1, NominalExtent = 0; // unreduced projected patch; area -1 when reporting was disabled
+    float StiffnessScale = 0; // Pair inertial stiffness is divided among points sharing the normal.
     float3 C0;
     float3 Lambda; // the force each row is applying, and the dual the solve converges
     float3 Penalty;
@@ -322,6 +315,7 @@ struct Contact {
     // The part of body B's shape it came from: the triangle for a mesh, and NoIndex for a shape of one piece.
     // A contact is matched on this, Feature and Children together.
     Index SubShape;
+    Index SubShapeA = NoIndex;
     // Leaf ordinals in the low and high 32 bits, both zero for a shape of one piece.
     // Leaf 3 against leaf 5 is different geometry from leaf 2 against leaf 5, even when both name the same face and corner.
     // The warm start needs this to give each leaf its own dual.
@@ -364,6 +358,7 @@ struct ContactEvent {
     Index SubShape; // which triangle of a mesh, and NoIndex for every shape that is one piece
     ulong Children; // and which leaf of each compound, packed as Contact::Children is
     uint Kind;
+    Index SubShapeA = NoIndex;
 };
 
 // A body reports at most one event per slot it filled, plus one per slot it held last step and did not refill, so twice the slot count is an exact bound.
@@ -442,8 +437,6 @@ struct Joint {
     JointDrive Drives[6]{}; // linear XYZ, angular XYZ
     // A nonzero mask groups a limit's axes into a distance or cone, stored on its first axis.
     uint LinearLimitAxes[3]{}, AngularLimitAxes[3]{};
-    // Whether this joint wrote itself into both bodies' Jointed runs, which suppresses contacts between them.
-    // Removal must undo exactly what was written, or it lifts the suppression another joint between the same pair installed.
     uint Suppresses;
 };
 
@@ -470,7 +463,8 @@ inline bool IsHard(float stiffness) { return isinf(stiffness); }
 struct StepParams {
     float3 Gravity;
     float DeltaTime;
-    float Beta; // how fast the penalty ramps per unit of constraint violation
+    float Beta;
+    float ContactBeta;
     float Gamma; // the fraction of a penalty carried into the next step
     float PenaltyMin;
     float PenaltyMax;

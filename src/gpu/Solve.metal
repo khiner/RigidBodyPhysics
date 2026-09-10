@@ -8,6 +8,13 @@
 // Sign convention: the normal points out of B towards A, and C is the separation along it.
 // Penetration is therefore negative, and a contact's normal force is at most zero.
 
+#ifndef BOUNDED_PLANES
+#define BOUNDED_PLANES 1
+#endif
+#ifndef MESH_PAIRS
+#define MESH_PAIRS 1
+#endif
+
 constant uint Dof = 6;
 
 // A body too slow for long enough stops being solved and keeps its contacts, so loads stay up.
@@ -33,9 +40,10 @@ static bool Solved(BodyMass mass, uint quiet, constant StepParams &p) {
     return Moves(mass) && !Asleep(quiet, p);
 }
 
-// Whether a shape presents a manifold of its own, which decides which body owns a pair.
-// A plane and a mesh are reference surfaces with no support function, so the convex side always owns the pair, and two of them produce no contact.
-static bool Presents(uint kind) { return kind != ShapePlane && kind != ShapeMesh; }
+// Convex leaves own mesh and plane pairs; meshes own plane pairs.
+static bool ConvexLeaf(uint kind) { return kind != ShapePlane && kind != ShapeMesh; }
+static bool BoundedPlane(Shape shape) { return BOUNDED_PLANES && IsBoundedPlane(shape); }
+constant uint PlaneBackFeature = 1u << 31;
 
 // Box2D-lite's bias towards keeping the reference face already chosen, kept by both references.
 constant float RelativeTolerance = 0.95f;
@@ -84,66 +92,101 @@ static float3x3 WorldInverseInertia(float4 orientation, float3 inverse_local) {
     return WorldTensor(QuatToMatrix(orientation), inverse_local);
 }
 
-// Solves H x = -g by LDL^T without pivoting, for a symmetric positive definite H.
-// H is definite by construction, the inertial term putting mass on the whole diagonal before any contact adds to it.
-static void SolveBlock(thread float H[Dof][Dof], thread float g[Dof], thread float out[Dof]) {
+static float2 WideSum(float a, float b) {
+#pragma clang fp reassociate(off) contract(off)
+    const float sum = a + b;
+    const float tail = sum - a;
+    return float2(sum, (a - (sum - tail)) + (b - tail));
+}
+static float2 WideAdd(float2 a, float2 b) {
+#pragma clang fp reassociate(off) contract(off)
+    const float2 sum = WideSum(a.x, b.x);
+    return WideSum(sum.x, sum.y + a.y + b.y);
+}
+static float2 WideMul(float2 a, float2 b) {
+#pragma clang fp reassociate(off) contract(off)
+    const float product = a.x * b.x;
+    const float error = fma(a.x, b.x, -product) + a.x * b.y + a.y * b.x + a.y * b.y;
+    return WideSum(product, error);
+}
+static float2 WideDiv(float2 a, float2 b) {
+#pragma clang fp reassociate(off) contract(off)
+    const float quotient = a.x / b.x;
+    const float2 remainder = WideAdd(a, -WideMul(b, float2(quotient, 0)));
+    return WideSum(quotient, (remainder.x + remainder.y) / b.x);
+}
+
+static void SolveBlock(thread float2 H[Dof][Dof], thread float2 g[Dof], thread float out[Dof]) {
     for (uint j = 0; j < Dof; ++j) {
-        for (uint k = 0; k < j; ++k) H[j][j] -= H[j][k] * H[j][k] * H[k][k];
+        for (uint k = 0; k < j; ++k) H[j][j] = WideAdd(H[j][j], -WideMul(WideMul(H[j][k], H[j][k]), H[k][k]));
         for (uint i = j + 1; i < Dof; ++i) {
-            for (uint k = 0; k < j; ++k) H[i][j] -= H[i][k] * H[j][k] * H[k][k];
-            H[i][j] /= H[j][j];
+            for (uint k = 0; k < j; ++k) H[i][j] = WideAdd(H[i][j], -WideMul(WideMul(H[i][k], H[j][k]), H[k][k]));
+            H[i][j] = WideDiv(H[i][j], H[j][j]);
         }
     }
-    float y[Dof];
+    float2 y[Dof];
     for (uint i = 0; i < Dof; ++i) {
         y[i] = -g[i];
-        for (uint k = 0; k < i; ++k) y[i] -= H[i][k] * y[k];
+        for (uint k = 0; k < i; ++k) y[i] = WideAdd(y[i], -WideMul(H[i][k], y[k]));
     }
-    for (uint i = 0; i < Dof; ++i) y[i] /= H[i][i];
+    for (uint i = 0; i < Dof; ++i) y[i] = WideDiv(y[i], H[i][i]);
     for (uint i = Dof; i-- > 0;) {
-        out[i] = y[i];
-        for (uint k = i + 1; k < Dof; ++k) out[i] -= H[k][i] * out[k];
+        for (uint k = i + 1; k < Dof; ++k) y[i] = WideAdd(y[i], -WideMul(H[k][i], y[k]));
+        out[i] = y[i].x + y[i].y;
     }
 }
 
+// Gradient of dot(Log(Exp(delta) Exp(turn)), axis) at delta = 0.
+
+static float3 LogGradient(float3 turn, float3 axis) {
+    // Inverse left Jacobian transpose: https://borglab.github.io/gtsam/so3/
+    const float squared = dot(turn, turn);
+    float coefficient;
+    if (squared < 0.01f) coefficient = 1.f / 12 + squared / 720 + squared * squared / 30240;
+    else {
+        const float angle = sqrt(squared);
+        coefficient = (1 - 0.5f * angle * cos(0.5f * angle) / sin(0.5f * angle)) / squared;
+    }
+    return axis + 0.5f * cross(turn, axis) + coefficient * cross(turn, cross(turn, axis));
+}
+
 // Adds one constraint row to a body's 6x6 block: its force onto the gradient, and its outer product scaled by the row's stiffness onto the Hessian.
-// The Jacobian is `axis` together with the moment `arm` makes with it.
 // `side` is +1 where the row measures this body as A and -1 as B.
 static void AddRow(
-    thread float H[Dof][Dof], thread float g[Dof], float3 axis, float3 arm, float side, float force, float stiffness
+    thread float2 H[Dof][Dof], thread float2 g[Dof], float3 axis, float3 angular, float side, float force, float stiffness
 ) {
-    const float3 angular = cross(arm, axis);
     float row[Dof];
     for (uint k = 0; k < 3; ++k) {
         row[k] = side * axis[k];
         row[3 + k] = side * angular[k];
     }
     for (uint i = 0; i < Dof; ++i) {
-        g[i] += row[i] * force;
-        for (uint j = 0; j < Dof; ++j) H[i][j] += stiffness * row[i] * row[j];
+        g[i] = WideAdd(g[i], WideMul(float2(row[i], 0), float2(force, 0)));
+        for (uint j = 0; j < Dof; ++j) H[i][j] = WideAdd(H[i][j], WideMul(WideMul(float2(stiffness, 0), float2(row[i], 0)), float2(row[j], 0)));
     }
 }
 
 // Removes one direction from a body's block, for a degree of freedom it does not have.
 // Call after every row is in, with `first` 0 for a direction in space and 3 for one to turn about.
-static void LockDirection(thread float H[Dof][Dof], thread float g[Dof], uint first, float3 axis) {
-    // Projected out rather than given a large number, which would cost the LDL its conditioning and still let the body creep.
-    // The diagonal keeps the block's own scale, deliberately not a unit.
-    // Projection leaves an epsilon of the block's largest term coupled in, and a unit divisor turns that into a visible step or a zero pivot.
-    float a[Dof], product[Dof], along = 0, gradient = 0, held = 1;
+static void LockDirection(thread float2 H[Dof][Dof], thread float2 g[Dof], uint first, float3 axis) {
+    float a[Dof], held = 1;
+    float2 product[Dof], along = 0, gradient = 0;
     for (uint i = 0; i < Dof; ++i) a[i] = i >= first && i < first + 3 ? axis[i - first] : 0;
     for (uint i = 0; i < Dof; ++i) {
         product[i] = 0;
-        for (uint j = 0; j < Dof; ++j) product[i] += H[i][j] * a[j];
+        for (uint j = 0; j < Dof; ++j) product[i] = WideAdd(product[i], WideMul(H[i][j], float2(a[j], 0)));
     }
     for (uint i = 0; i < Dof; ++i) {
-        along += a[i] * product[i];
-        gradient += a[i] * g[i];
-        held = max(held, H[i][i]); // the block is positive definite, so its scale is on its diagonal
+        along = WideAdd(along, WideMul(float2(a[i], 0), product[i]));
+        gradient = WideAdd(gradient, WideMul(float2(a[i], 0), g[i]));
+        held = max(held, H[i][i].x);
     }
     for (uint i = 0; i < Dof; ++i) {
-        g[i] -= a[i] * gradient;
-        for (uint j = 0; j < Dof; ++j) H[i][j] += a[i] * (along * a[j] - product[j] + held * a[j]) - product[i] * a[j];
+        g[i] = WideAdd(g[i], -WideMul(float2(a[i], 0), gradient));
+        for (uint j = 0; j < Dof; ++j) {
+            const float2 term = WideAdd(WideMul(WideAdd(along, float2(held, 0)), float2(a[j], 0)), -product[j]);
+            H[i][j] = WideAdd(H[i][j], WideAdd(WideMul(float2(a[i], 0), term), -WideMul(product[i], float2(a[j], 0))));
+        }
     }
 }
 
@@ -302,17 +345,24 @@ static Poly MakeTriangle(Pose pose, Triangle triangle) {
     return {pose.Position, pose.Orientation, float3(0), 0, 0, 0, 0, 0, uint3(triangle.A, triangle.B, triangle.C), ShapeMesh};
 }
 
+static Poly MeshBounds(Shape shape, Pose pose, device const BvhNode *nodes) {
+    const BvhNode root = nodes[shape.RootNode];
+    return {WorldPoint(pose, (root.Low + root.High) * 0.5f), pose.Orientation, (root.High - root.Low) * 0.5f, 0, 0, 0, 0, 0, uint3(0), ShapeBox};
+}
+
 static uint PolyCount(Poly poly) {
     if (poly.Kind == ShapeBox) return 8;
+    if (BOUNDED_PLANES && poly.Kind == ShapePlane) return 4;
     if (poly.Kind == ShapeHull) return poly.Count;
     if (poly.Kind == ShapeMesh) return 3;
-    return poly.Kind == ShapeCapsule ? 2 : 1; // a sphere's core is a single point
+    return poly.Kind == ShapeCapsule ? 2 : 1;
 }
 
 // Vertex `i` in world. A box's eight are its half-extent sign patterns, in the order `i`'s bits give.
 static float3 LocalVertex(Poly poly, device const float3 *pool, uint i) {
     float3 local = float3(0);
     if (poly.Kind == ShapeBox) local = poly.Half * float3((i & 1) ? 1.f : -1.f, (i & 2) ? 1.f : -1.f, (i & 4) ? 1.f : -1.f);
+    else if (BOUNDED_PLANES && poly.Kind == ShapePlane) local = poly.Half * float3(i < 2 ? -1.f : 1.f, 0, i == 1 || i == 2 ? 1.f : -1.f);
     else if (poly.Kind == ShapeHull) local = pool[poly.First + i];
     else if (poly.Kind == ShapeMesh) local = pool[poly.Corner[i]];
     else if (poly.Kind == ShapeCapsule) local = float3(0, i == 0 ? -poly.Half.y : poly.Half.y, 0);
@@ -344,9 +394,57 @@ static float3 PolySupportPoint(Poly poly, device const float3 *pool, float3 dire
     return PolyVertex(poly, pool, PolySupport(poly, pool, direction));
 }
 
+// Extend unbounded plane edges beyond the partner projection so only authored boundaries clip contacts.
+static bool PlanePatch(Poly own, Pose pose, Shape plane, device const float3 *pool, float margin, thread Poly &patch) {
+    pose.Position += (plane.Offset - dot(plane.Normal, pose.Position)) * plane.Normal;
+    float3 low = INFINITY, high = -INFINITY;
+    for (uint i = 0; i < PolyCount(own); ++i) {
+        const float3 at = LocalPoint(pose, PolyVertex(own, pool, i));
+        low = min(low, at);
+        high = max(high, at);
+    }
+    const float padding = own.Radius + margin + 1e-5f * max(1.f, max(length(low), length(high)));
+    low -= padding;
+    high += padding;
+    for (uint side = 0; side < 2; ++side) {
+        const uint axis = 2 * side;
+        if (plane.HalfExtents[axis] <= 0) continue;
+        low[axis] = max(low[axis], -plane.HalfExtents[axis]);
+        high[axis] = min(high[axis], plane.HalfExtents[axis]);
+        if (low[axis] >= high[axis]) return false;
+    }
+    low.y = high.y = 0;
+    pose.Position = WorldPoint(pose, (low + high) * 0.5f);
+    patch = MakePoly(pose, plane);
+    patch.Half = (high - low) * 0.5f;
+    if (dot(Rotate(pose.Orientation, float3(0, 1, 0)), plane.Normal) < 0)
+        patch.Orientation = QuatMul(pose.Orientation, float4(1, 0, 0, 0));
+    return true;
+}
+
+// Face-plane rejection excludes triangles whose bounds overlap the convex body.
+static bool OutsideFaces(Poly convex, Poly triangle, device const float3 *pool, device const HullFace *faces, float margin) {
+    if (convex.Kind != ShapeHull && convex.Kind != ShapeBox) return false;
+    margin += convex.Radius;
+    float3 points[3];
+    for (uint i = 0; i < 3; ++i)
+        points[i] = Rotate(QuatConjugate(convex.Orientation), PolyVertex(triangle, pool, i) - convex.Center);
+    if (convex.Kind == ShapeBox) {
+        const float3 low = min(points[0], min(points[1], points[2]));
+        const float3 high = max(points[0], max(points[1], points[2]));
+        return any(low > convex.Half + margin) || any(high < -convex.Half - margin);
+    }
+    for (uint i = 0; i < convex.FaceCount; ++i) {
+        const HullFace face = faces[convex.FirstFace + i];
+        const float nearest = min(dot(face.Normal, points[0]), min(dot(face.Normal, points[1]), dot(face.Normal, points[2])));
+        if (nearest > face.Offset + margin) return true;
+    }
+    return false;
+}
+
 // How far the furthest vertex sits from the centre, the scale a face tolerance is measured against.
 static float PolyReach(Poly poly, device const float3 *pool) {
-    if (poly.Kind == ShapeBox) return length(poly.Half);
+    if (poly.Kind == ShapeBox || (BOUNDED_PLANES && poly.Kind == ShapePlane)) return length(poly.Half);
     if (poly.Kind == ShapeCapsule) return poly.Half.y;
     // A triangle's own size, not its distance from the mesh origin, a hull being centred on its centre of mass.
     if (poly.Kind == ShapeMesh)
@@ -880,6 +978,10 @@ static uint SupportFace(
             const uint2 corner = order[positive ? i : 3 - i];
             corners[found++] = (positive ? (1u << axis) : 0u) | (corner.x << across) | (corner.y << along);
         }
+    } else if (BOUNDED_PLANES && poly.Kind == ShapePlane) {
+        const bool forwards = local.y >= 0;
+        local_plane = float3(0, forwards ? 1.f : -1.f, 0);
+        for (uint i = 0; i < 4; ++i) corners[found++] = forwards ? i : 3 - i;
     } else if (poly.Kind == ShapeMesh) {
         // A triangle is one face and has two sides. Wound so its normal is the one being asked for.
         const float3 a = pool[poly.Corner[0]], b = pool[poly.Corner[1]], c = pool[poly.Corner[2]];
@@ -901,7 +1003,7 @@ static uint SupportFace(
     //
     // A triangle keeps all three corners whatever the direction, a half-metre triangle losing its third corner to a twentieth of a degree of error.
     // A capsule's core is not a face at all.
-    if (poly.Kind == ShapeHull || poly.Kind == ShapeBox) {
+    if (poly.Kind == ShapeHull || poly.Kind == ShapeBox || (BOUNDED_PLANES && poly.Kind == ShapePlane)) {
         float furthest = -INFINITY;
         for (uint i = 0; i < found; ++i) furthest = max(furthest, dot(LocalVertex(poly, pool, corners[i]), local));
         const float tolerance = FaceTolerance(poly, pool);
@@ -1119,6 +1221,113 @@ static uint ConvexManifold(
     return found;
 }
 
+// Clip both triangle footprints and choose the face requiring the smaller correction.
+static uint MeshManifold(
+    Poly a, Poly b, bool double_a, bool double_b, float3 center_a, float3 center_b, uint previous,
+    device const float3 *pool, device const HullFace *faces, float margin,
+    thread float3 *here, thread float3 *there, thread uint *names, thread float3 &normal
+) {
+    const float3 origin = a.Center;
+    a.Center -= origin;
+    b.Center -= origin;
+    center_a -= origin;
+    center_b -= origin;
+    float3 av[3], bv[3], ae[3], be[3];
+    for (uint i = 0; i < 3; ++i) {
+        av[i] = PolyVertex(a, pool, i);
+        bv[i] = PolyVertex(b, pool, i);
+    }
+    for (uint i = 0; i < 3; ++i) {
+        ae[i] = av[(i + 1) % 3] - av[i];
+        be[i] = bv[(i + 1) % 3] - bv[i];
+    }
+    // Reject separated triangles before clipping potentially overlapping half-spaces.
+    for (uint axis_index = 0; axis_index < 11; ++axis_index) {
+        const float3 axis = axis_index == 0 ? cross(ae[0], ae[1]) :
+                                              (axis_index == 1 ? cross(be[0], be[1]) : cross(ae[(axis_index - 2) / 3], be[(axis_index - 2) % 3]));
+        const float span = length(axis);
+        if (span < 1e-18f) continue;
+        float al = INFINITY, ah = -INFINITY, bl = INFINITY, bh = -INFINITY;
+        for (uint i = 0; i < 3; ++i) {
+            const float pa = dot(axis, av[i]), pb = dot(axis, bv[i]);
+            al = min(al, pa);
+            ah = max(ah, pa);
+            bl = min(bl, pb);
+            bh = max(bh, pb);
+        }
+        if (max(bl - ah, al - bh) > margin * span + 1e-6f * max(max(abs(al), abs(ah)), max(abs(bl), abs(bh)))) return 0;
+    }
+    uint kept = 0, side_bits = 0;
+    float best = -INFINITY;
+    for (uint side = 0; side < 2; ++side) {
+        const Poly reference = side == 0 ? b : a, incident = side == 0 ? a : b;
+        const float3 first = PolyVertex(reference, pool, 0);
+        const float3 turn = cross(PolyVertex(reference, pool, 1) - first, PolyVertex(reference, pool, 2) - first);
+        if (length(turn) < 1e-18f) return 0;
+        float3 outward = normalize(turn);
+        const float signed_center = dot(outward, (side == 0 ? center_a : center_b) - first);
+        const uint back_bit = side == 0 ? (1u << 31) : (1u << 29);
+        bool back = (side == 0 ? double_b : double_a) && signed_center < 0;
+        if ((side == 0 ? double_b : double_a) && previous != NoIndex && abs(signed_center) <= margin)
+            back = (previous & back_bit) != 0;
+        if (back) {
+            outward = -outward;
+            side_bits |= back_bit;
+        }
+        float3 on_reference[MaxClipPoints], on_incident[MaxClipPoints], axis;
+        uint features[MaxClipPoints];
+        const uint found = ConvexManifold(reference, incident, pool, faces, margin, -outward, on_reference, on_incident, features, axis);
+        if (found == 0) return 0;
+        float deepest = INFINITY;
+        for (uint i = 0; i < found; ++i) deepest = min(deepest, dot(outward, on_incident[i] - on_reference[i]));
+        const bool prefer_previous = previous != NoIndex && (previous & (1u << 30)) != 0 && abs(deepest - best) <= 1e-6f;
+        if (side != 0 && deepest <= best + 1e-6f && !prefer_previous) continue;
+        kept = found;
+        best = deepest;
+        normal = side == 0 ? outward : -outward;
+        for (uint i = 0; i < found; ++i) {
+            here[i] = (side == 0 ? on_incident[i] : on_reference[i]) + origin;
+            there[i] = (side == 0 ? on_reference[i] : on_incident[i]) + origin;
+            names[i] = features[i] | (side << 30);
+        }
+    }
+    const float3 face_a = normalize(cross(ae[0], ae[1])), face_b = normalize(cross(be[0], be[1]));
+    const float tolerance = 1e-5f * max(PolyReach(a, pool), PolyReach(b, pool)) + 1e-9f;
+    // An edge axis can require less separation than either face normal.
+    for (uint ea = 0; ea < 3; ++ea) {
+        for (uint eb = 0; eb < 3; ++eb) {
+            float3 axis = cross(ae[ea], be[eb]);
+            const float span = length(axis);
+            if (span < 1e-18f) continue;
+            axis /= span;
+            if (abs(dot(axis, face_a)) > 0.99999f || abs(dot(axis, face_b)) > 0.99999f) continue;
+            if (dot(axis, center_a - center_b) < 0) axis = -axis;
+            float low = INFINITY, high = -INFINITY;
+            for (uint i = 0; i < 3; ++i) {
+                low = min(low, dot(axis, av[i]));
+                high = max(high, dot(axis, bv[i]));
+            }
+            const float separation = low - high;
+            if (separation <= best + tolerance) continue;
+            uint ca[3], cb[3], na = 0, nb = 0;
+            for (uint i = 0; i < 3; ++i) {
+                if (dot(axis, av[i]) <= low + tolerance) ca[na++] = i;
+                if (dot(axis, bv[i]) >= high - tolerance) cb[nb++] = i;
+            }
+            float3 on_a, on_b;
+            ClosestOnSegments(av[ca[0]], av[ca[na - 1]], bv[cb[0]], bv[cb[nb - 1]], on_a, on_b);
+            kept = 1;
+            best = separation;
+            normal = axis;
+            here[0] = on_a + origin;
+            there[0] = on_b + origin;
+            names[0] = (1u << 28) | ca[0] | (ca[na - 1] << 2) | (cb[0] << 4) | (cb[nb - 1] << 6);
+        }
+    }
+    for (uint i = 0; i < kept; ++i) names[i] |= side_bits;
+    return kept;
+}
+
 // One piece of geometry, one row.
 // A clip emits the same point twice wherever the geometry is degenerate against it.
 // Each copy carries its own dual and penalty, which doubles the force at one spot.
@@ -1262,9 +1471,30 @@ static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uin
 }
 
 // How many triangles of one mesh a body may be collided against in a batch, and how deep the walk may go.
-// Fixed, a kernel being unable to grow anything, and anything a body reaches past these counts as a refusal.
 constant uint MaxMeshTriangles = 32;
 constant uint MeshStackDepth = 32;
+
+static bool OutsideNode(Poly convex, BvhNode node, float3 offset, float3x3 rotation, device const HullFace *faces, float margin) {
+    if (convex.Kind != ShapeHull && convex.Kind != ShapeBox && (!BOUNDED_PLANES || convex.Kind != ShapePlane)) return false;
+    const float3 radii = (node.High - node.Low) * 0.5f;
+    const float3 node_center = (node.High + node.Low) * 0.5f;
+    const float3 center = offset + rotation * node_center;
+    // Roundoff can grow when large mesh and body offsets cancel.
+    margin += convex.Radius + 1e-5f * max(1.f, length(offset) + length(node_center) + length(radii));
+    if (convex.Kind == ShapeBox || (BOUNDED_PLANES && convex.Kind == ShapePlane)) {
+        const float3 extent = abs(rotation[0]) * radii.x + abs(rotation[1]) * radii.y + abs(rotation[2]) * radii.z;
+        if (convex.Kind == ShapePlane)
+            return abs(center.x) > convex.Half.x + extent.x + margin || abs(center.z) > convex.Half.z + extent.z + margin || center.y > extent.y + margin;
+        return any(abs(center) > convex.Half + extent + margin);
+    }
+    for (uint i = 0; i < convex.FaceCount; ++i) {
+        const HullFace face = faces[convex.FirstFace + i];
+        const float3 projected = float3(dot(face.Normal, rotation[0]), dot(face.Normal, rotation[1]), dot(face.Normal, rotation[2]));
+        const float nearest = dot(face.Normal, center) - dot(abs(projected), radii);
+        if (nearest > face.Offset + margin) return true;
+    }
+    return false;
+}
 
 // The next batch of triangles of a mesh whose bounds the body's own box reaches into.
 // `low` and `high` are the body's box in the mesh's frame, the frame the tree was built in.
@@ -1275,13 +1505,15 @@ constant uint MeshStackDepth = 32;
 //
 // A leaf's `First` counts from the mesh's first triangle and an interior node's from its own root.
 static uint GatherTriangles(
-    Shape mesh, float3 low, float3 high, device const BvhNode *nodes, thread uint *stack, thread uint &depth, thread uint *out
+    Shape mesh, float3 low, float3 high, Poly convex, float3 offset, float3x3 rotation, device const HullFace *faces, float margin,
+    device const BvhNode *nodes, thread uint *stack, thread uint &depth, thread uint *out
 ) {
     uint found = 0;
     while (depth > 0) {
         const uint at = stack[--depth];
         const BvhNode node = nodes[mesh.RootNode + at];
         if (any(node.High < low) || any(node.Low > high)) continue;
+        if (node.Count == 0 && OutsideNode(convex, node, offset, rotation, faces, margin)) continue;
         if (node.Count > 0) {
             // A leaf holds four, so a short batch puts the node back rather than splitting it.
             if (found + node.Count > MaxMeshTriangles) {
@@ -1300,6 +1532,45 @@ static uint GatherTriangles(
     return found;
 }
 
+static uint GatherMeshPairs(
+    Shape a, Shape b, float3 offset, float3x3 rotation, float margin,
+    device const BvhNode *nodes, thread uint2 *stack, thread uint &depth, thread uint2 *out
+) {
+    uint found = 0;
+    while (depth > 0) {
+        const uint2 at = stack[--depth];
+        const BvhNode na = nodes[a.RootNode + at.x], nb = nodes[b.RootNode + at.y];
+        const float3 ca = (na.Low + na.High) * 0.5f, cb = (nb.Low + nb.High) * 0.5f;
+        const float3 ra = (na.High - na.Low) * 0.5f, rb = (nb.High - nb.Low) * 0.5f;
+        const float3 distance = offset + rotation * ca - cb;
+        const float allowance = margin + 1e-5f * max(1.f, length(offset) + length(ca) + length(cb) + length(ra) + length(rb));
+        const float3 extent = abs(rotation[0]) * ra.x + abs(rotation[1]) * ra.y + abs(rotation[2]) * ra.z;
+        if (any(abs(distance) > extent + rb + allowance)) continue;
+        const float3x3 inverse = transpose(rotation);
+        const float3 other_extent = abs(inverse[0]) * rb.x + abs(inverse[1]) * rb.y + abs(inverse[2]) * rb.z;
+        if (any(abs(inverse * distance) > other_extent + ra + allowance)) continue;
+        if (na.Count > 0 && nb.Count > 0) {
+            if (found + na.Count * nb.Count > MaxMeshTriangles) {
+                stack[depth++] = at;
+                return found;
+            }
+            for (uint i = 0; i < na.Count; ++i)
+                for (uint j = 0; j < nb.Count; ++j)
+                    out[found++] = uint2(na.First + i, nb.First + j);
+            continue;
+        }
+        if (depth + 2 > 2 * MeshStackDepth) continue;
+        if (na.Count == 0 && (nb.Count > 0 || dot(ra, ra) >= dot(rb, rb))) {
+            stack[depth++] = uint2(at.x + 1, at.y);
+            stack[depth++] = uint2(na.First, at.y);
+        } else {
+            stack[depth++] = uint2(at.x, at.y + 1);
+            stack[depth++] = uint2(at.x, nb.First);
+        }
+    }
+    return found;
+}
+
 // Whether a point lies along edge `e`'s line, to the tolerance the clip that made it measured with.
 static bool OnEdgeLine(Poly face, device const float3 *pool, float3 outward, uint e, float3 at_point, float seam) {
     const float3 at = PolyVertex(face, pool, e);
@@ -1312,14 +1583,14 @@ static bool OnEdgeLine(Poly face, device const float3 *pool, float3 outward, uin
 // Every exit from CollectContacts goes through this, a body that stopped colliding having still ended every contact it held.
 static void EndUnclaimed(
     device ContactEvent *events, device uint *counts, uint body, ulong claimed, uint reported,
-    thread const uint *was_feature, thread const Index *was_other, thread const Index *was_sub,
+    thread const uint *was_feature, thread const Index *was_other, thread const Index *was_sub, thread const Index *was_sub_a,
     thread const ulong *was_children
 ) {
 #if !SENSOR_PASS
     for (uint j = 0; j < ContactsPerBody; ++j) {
         if (was_feature[j] == NoIndex) break; // the run is dense, so this sentinel ends it
         if ((claimed & (1ul << j)) != 0) continue;
-        events[reported++] = ContactEvent{body, was_other[j], was_feature[j], was_sub[j], was_children[j], uint(ContactRemoved)};
+        events[reported++] = ContactEvent{body, was_other[j], was_feature[j], was_sub[j], was_children[j], uint(ContactRemoved), was_sub_a[j]};
     }
     counts[body] = reported;
 #endif
@@ -1362,6 +1633,7 @@ kernel void CollectContacts(
     // The previous step's state, kept only so a matching feature can inherit it.
     uint was_feature[ContactsPerBody], was_stick[ContactsPerBody];
     Index was_other[ContactsPerBody]; // the partner body, which only a removal still needs
+    Index was_sub_a[ContactsPerBody];
     Index was_sub[ContactsPerBody]; // and which part of it, which for a mesh is the triangle
     ulong was_children[ContactsPerBody]; // and which leaf of each shape, which for a compound is the child
     float3 was_lambda[ContactsPerBody], was_penalty[ContactsPerBody];
@@ -1375,6 +1647,7 @@ kernel void CollectContacts(
         was_feature[i] = slots[i].Feature;
         was_other[i] = slots[i].BodyB;
         was_sub[i] = slots[i].SubShape;
+        was_sub_a[i] = slots[i].SubShapeA;
         was_children[i] = slots[i].Children;
         was_lambda[i] = slots[i].Lambda;
         was_penalty[i] = slots[i].Penalty;
@@ -1385,16 +1658,15 @@ kernel void CollectContacts(
     }
 
     const Index shape_index = body_shapes[body];
-    // A body with no shape is a removed body's slot, and a reference surface presents no manifold and never owns a pair.
     // Deliberately no test for a static body, a dynamic mesh's partner being able to be static.
     // Exiting on mass alone would leave no owner for the pair, and the mesh falls through.
     if (shape_index == NoIndex) {
-        EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_children);
+        EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
         return;
     }
     const Shape body_shape = shapes[shape_index];
-    if (!Presents(body_shape.Kind)) {
-        EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_children);
+    if (body_shape.Kind == ShapePlane) {
+        EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
         return;
     }
     const Pose pose = poses[body];
@@ -1444,7 +1716,8 @@ kernel void CollectContacts(
     // Which contacts a body keeps must not depend on the order the partners were visited in, and the refusal count below is then exact.
     for (uint own_leaf = 0; own_leaf < own_leaf_count; ++own_leaf) {
         Shape shape = shapes[body_shape.Kind == ShapeCompound ? ChildOf(body_shape, own_leaf, compound_children) : shape_index];
-        if (!Presents(shape.Kind)) continue;
+        if (body_shape.Kind == ShapeCompound) shape.Local = ComposePose(body_shape.Local, shape.Local);
+        if (shape.Kind == ShapePlane) continue;
         const CollisionMask leaf_filter = ResolveFilter(shape, ResolveFilter(body_shape, {own_filter.Layer, own_filter.Collides}));
         if (own_filter.Mixed && (shape.Kind == ShapeBox || shape.Kind == ShapeHull)) shape.FirstTriangle = 0;
         // Where this leaf's geometry is.
@@ -1452,9 +1725,11 @@ kernel void CollectContacts(
         // A contact belongs to the body frame whatever pose the shape sits at.
         const Pose shape_pose = ComposePose(pose, shape.Local);
         const BoxPose box = MakeBox(shape_pose, shape);
-        const Poly own_poly = MakePoly(shape_pose, shape);
+        Poly leaf_poly = MakePoly(shape_pose, shape);
+        // A mesh against a half-space queries its vertex run, with no hull cook or face list.
+        if (shape.Kind == ShapeMesh) leaf_poly.Kind = ShapeHull;
         // Hoisted out of the partner loop, being a scan over every vertex of a hull.
-        const float own_reach = PolyReach(own_poly, hull_vertices) + shape.Radius;
+        float own_reach = shape.Kind == ShapeMesh ? -1 : PolyReach(leaf_poly, hull_vertices) + shape.Radius;
         for (uint other = 0; other < p.BodyCount; ++other) {
             const Index other_shape = body_shapes[other];
             if (other == body || other_shape == NoIndex) continue;
@@ -1465,7 +1740,6 @@ kernel void CollectContacts(
             // Generating it from both sides gives two independent constraint sets with two sets of duals for one physical contact.
             // Jacobi's symmetry hides that and Gauss-Seidel does not.
             // A body may defer only to a partner that will actually present the manifold.
-            // A pair with a plane or a mesh therefore belongs to the convex side, whatever the index order.
             // Of two convex bodies the one the solve moves comes first.
             // A body of infinite mass that turns counts as moving, or nothing spins a pinned wheel.
             // Deliberately not split by parity to even the load.
@@ -1484,18 +1758,13 @@ kernel void CollectContacts(
             const Filter theirs = filters[other];
             if (!Allows(leaf_filter, theirs.Aggregate)) continue;
             bool jointed = false;
-            for (uint i = 0; i < JointsPerBody && !jointed; ++i) jointed = jointed_to[body * JointsPerBody + i] == other;
+            for (uint i = jointed_to[body]; i < jointed_to[body + 1] && !jointed; ++i) jointed = jointed_to[i] == other;
             if (jointed) continue;
 
             const Shape other_body_shape = shapes[other_shape];
+            if (shape.Kind == ShapeMesh && other_body_shape.Kind != ShapePlane && (!MESH_PAIRS || other_body_shape.Kind != ShapeMesh) && other_body_shape.Kind != ShapeCompound) continue;
             const Pose target_pose = poses[other];
-            // The softest the normal row of this pair may be: the pair's reduced mass over h squared (Sec. 3.4).
-            // On a settled contact the dual has absorbed the load, so C goes to zero and nothing opposes Eq. 19's decay to PenaltyMin.
-            // The contact then all but vanishes from the block and a slow rocking mode rings on.
-            // A six-box stack is quietest at M/h^2 and unstable past ten times it, so this is a ratio rather than a constant.
-            // The normal row only: friction's penalty is algorithmic and the cone already bounds it, so a floor there locks the stick-slip transition early.
-            const float pair_stiffness = PairStiffness(own_inverse_mass + masses[other].InvMass, p.DeltaTime);
-            const float3 penalty_floor{max(p.PenaltyMin, pair_stiffness), p.PenaltyMin, p.PenaltyMin};
+            const float3 penalty_floor(p.PenaltyMin);
             // How far apart the pair may be and still be given contacts.
             // A contact built while the bodies are apart carries the gap as slack and does no work until the step's motion consumes it.
             // The step therefore ends at touch.
@@ -1516,598 +1785,723 @@ kernel void CollectContacts(
             const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
             for (uint target_leaf = 0; target_leaf < target_leaf_count; ++target_leaf) {
                 Shape target = shapes[other_body_shape.Kind == ShapeCompound ? ChildOf(other_body_shape, target_leaf, compound_children) : other_shape];
+                if (shape.Kind == ShapeMesh && target.Kind != ShapePlane && (!MESH_PAIRS || target.Kind != ShapeMesh)) continue;
+                if (other_body_shape.Kind == ShapeCompound) target.Local = ComposePose(other_body_shape.Local, target.Local);
                 if (!Allows(leaf_filter, ResolveFilter(target, ResolveFilter(other_body_shape, {theirs.Layer, theirs.Collides})))) continue;
                 if (theirs.Mixed && (target.Kind == ShapeBox || target.Kind == ShapeHull)) target.FirstTriangle = 0;
-                if (Presents(target.Kind)) {
+                const bool mesh_pair = MESH_PAIRS && shape.Kind == ShapeMesh && target.Kind == ShapeMesh;
+                if (ConvexLeaf(target.Kind) || mesh_pair) {
 #if SENSOR_PASS
                     if (other < body) continue;
 #else
                     if (!i_move || (they_move && other < body)) continue;
 #endif
                 }
-                if (target.Kind == ShapePlane && other_body_shape.Kind == ShapeCompound) {
-                    const Pose local = ComposePose(target_pose, target.Local);
-                    target.Normal = Rotate(local.Orientation, target.Normal);
-                    target.Offset += dot(target.Normal, local.Position);
-                }
-                const Pose target_shape_pose = ComposePose(target_pose, target.Local); // as above, on the other side
-                // How close two points must be to be one, the scale SupportFace resolves at.
-                const float geometry = max(own_reach, PolyReach(MakePoly(target_shape_pose, target), hull_vertices) + target.Radius);
-                const float weld = 1e-3f * geometry + 1e-6f;
-                // Whether either surface is round, which inherited friction anchors cannot assume.
-                const bool curved = IsRound(shape.Kind) || IsRound(target.Kind);
-
-                // How many manifolds this pair has: one, or one per mesh triangle the body reaches, a batch at a time.
-                // The walk's stack lives out here so it survives between batches.
-                uint candidates[MaxMeshTriangles], walk[MeshStackDepth], depth = 0;
-                float3 low = 0, high = 0;
-                if (target.Kind == ShapeMesh) {
-                    // The body's box in the mesh's frame, let out by radius and margin.
-                    const uint corners = PolyCount(own_poly);
-                    low = INFINITY;
-                    high = -INFINITY;
-                    for (uint i = 0; i < corners; ++i) {
-                        const float3 at = LocalPoint(target_shape_pose, PolyVertex(own_poly, hull_vertices, i));
-                        low = min(low, at);
-                        high = max(high, at);
-                    }
-                    const float let_out = own_poly.Radius + reach;
-                    low -= let_out;
-                    high += let_out;
-                    walk[depth++] = 0;
-                }
-
-                for (bool walking = true; walking;) {
-                    uint manifolds = 1;
-                    if (target.Kind == ShapeMesh) {
-                        manifolds = GatherTriangles(target, low, high, bvh_nodes, walk, depth, candidates);
-                        walking = depth > 0;
-                        if (manifolds == 0) break;
+                const Poly own_bounds = mesh_pair ? MeshBounds(shape, shape_pose, bvh_nodes) : leaf_poly;
+                const Poly target_bounds = mesh_pair ? MeshBounds(target, ComposePose(target_pose, target.Local), bvh_nodes) : leaf_poly;
+                uint2 own_candidates[MaxMeshTriangles], own_walk[2 * MeshStackDepth];
+                uint own_depth = mesh_pair ? 1 : 0;
+                own_walk[0] = uint2(0);
+                for (bool own_walking = true; own_walking;) {
+                    uint own_count = 1;
+                    if (mesh_pair) {
+                        const float4 inverse = QuatConjugate(target_bounds.Orientation);
+                        const float3 offset = Rotate(inverse, shape_pose.Position - ComposePose(target_pose, target.Local).Position);
+                        const float3x3 rotation = QuatToMatrix(QuatMul(inverse, shape_pose.Orientation));
+                        own_count = GatherMeshPairs(shape, target, offset, rotation, reach, bvh_nodes, own_walk, own_depth, own_candidates);
+                        own_walking = own_depth > 0;
                     } else {
-                        walking = false;
+                        own_walking = false;
                     }
-
-                    for (uint manifold = 0; manifold < manifolds; ++manifold) {
-                        // Which part of the other shape this is against, which only a mesh has.
-                        Index sub_shape = NoIndex;
-                        // And which leaf of each produced it.
-                        const ulong children = ChildPair(own_leaf, target_leaf);
-                        // A manifold point is a pair: where it sits on this body, and where on the other.
-                        // The two are distinct points, one always being a projection onto the other's surface.
-                        float3 points_here[MaxClipPoints], points_there[MaxClipPoints], normal;
-                        // A feature names the geometry that produced a point - which corner, or which
-                        // pair of faces and which vertex of the clip - never its position in the
-                        // output, or warm starting hands a dual to the wrong point when the touching
-                        // set changes.
-                        uint features[MaxClipPoints];
-                        uint found = 0;
-                        float2 patch{-1, 0};
-
-                        const bool hulled = shape.Kind == ShapeHull || target.Kind == ShapeHull;
-                        if (target.Kind == ShapeMesh) {
-                            const Index index = target.FirstTriangle + candidates[manifold];
-                            const Triangle triangle = mesh_triangles[index];
-                            sub_shape = index;
-                            const Poly face = MakeTriangle(target_shape_pose, triangle);
-                            const float3 first = PolyVertex(face, hull_vertices, 0);
-                            const float3 turn = cross(PolyVertex(face, hull_vertices, 1) - first, PolyVertex(face, hull_vertices, 2) - first);
-                            const float area = length(turn);
-                            if (area < 1e-18f) continue; // a sliver the cook let through has no usable side
-                            const float3 outward = turn / area; // out of the surface, as the winding defines it
-
-                            // A mesh has no interior, so a body wholly behind a triangle is past it.
-                            const float3 top = PolySupportPoint(own_poly, hull_vertices, outward);
-                            if (dot(top - first, outward) + own_poly.Radius <= 0) continue;
-
-                            // The triangle goes in first and with its own normal, which makes it the reference face every time.
-                            // The manifold is then the body's face clipped into the triangle, and every point is named after the geometry under it.
-                            // The result comes back the other way round, out of the mesh.
-                            found = ConvexManifold(face, own_poly, hull_vertices, hull_faces, reach, -outward, points_there, points_here, features, normal);
-
-                            // Where that finds nothing while the body is in range, the given direction is wrong for this geometry.
-                            // A body over a crease presents, to each slope's normal, the feature of itself over the other slope, which the clip drops.
-                            // Both triangles then come back empty and the body falls through the ridge.
-                            // The contact is against the crease itself and has to be searched for.
-                            // Only as a fallback, and only where this triangle has an active edge.
-                            // An inactive edge is a seam whose neighbour holds the body on its own face.
-                            const float3 bottom = PolySupportPoint(own_poly, hull_vertices, -outward);
-                            const bool within = dot(bottom - first, outward) - own_poly.Radius < reach;
-                            const bool searched = found == 0 && within && triangle.ActiveEdges != 0;
-                            if (searched)
-                                found = ConvexManifold(face, own_poly, hull_vertices, hull_faces, reach, float3(0), points_there, points_here, features, normal);
-                            normal = -normal;
-#if !SENSOR_PASS
-                            // Seam ownership removes solver points without shrinking the geometric patch.
-                            if (p.ReportContacts) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
-#endif
-
-                            // A point one seam cut is cut by the triangle across it too, so both would hold one piece of geometry with a dual each.
-                            // Dropping it from both loses nothing, only the tessellation having put it there.
-                            // An edge that is a feature, a rim or a crease, is not a seam, and the points it cut stay.
-                            // Bits 8 to 10 name which reference-face edges cut a point.
-                            // Those are the triangle's own only while it is the reference (bit 28 clear).
-                            // The tolerance is the scale the clip measured with.
-                            float scale = 1;
-                            for (uint v = 0; v < 3; ++v) scale = max(scale, length(PolyVertex(face, hull_vertices, v)));
-                            const float seam = 1e-5f * scale;
-
-                            uint kept = 0;
-                            for (uint i = 0; i < found; ++i) {
-                                // A surface has a side, and a body still in front of one is at most a step of motion behind it.
-                                // The reach covers exactly a step.
-                                // A point reading deeper is a body beside the triangle rather than through it.
-                                // The cull above covers only the whole body being past the triangle.
-                                // A body wider than the mesh piece it stands on gets its far face clipped in.
-                                // That is a row whose ends are metres apart.
-                                // It holds no force until post-stabilization takes it all back at once along contradictory normals.
-#if !SENSOR_PASS
-                                if (dot(normal, points_here[i] - points_there[i]) < -reach) continue;
-#endif
-                                const bool triangle_led = ((features[i] >> 28) & 1) == 0;
-                                // Which edges cut the point, and which were seams.
-                                const uint cut_by = triangle_led ? (features[i] >> 8) & 7 : 0u;
-                                const uint cut_by_seam = cut_by & ~triangle.ActiveEdges;
-                                // Two of its edges cutting one point put it at a corner of the triangle.
-                                // Where one of the two is a feature it is a corner of the surface as well.
-                                // A body can rest there, so it is not a point both triangles may drop.
-                                // Dropped by both, a cube on a two-triangle face keeps 2 rows on the diagonal instead of 4 on the corners.
-                                // The seam's owner keeps it, which is the lower-numbered triangle as the cook wrote the bit.
-                                // The two threads therefore read opposite results from one name.
-                                const bool corner_is_mine = (cut_by & triangle.ActiveEdges) != 0 && (cut_by_seam & ~triangle.OwnedEdges) == 0;
-                                if (cut_by_seam != 0 && !corner_is_mine) continue;
-                                // A searched point not on an active edge belongs to the triangle across, which holds it on its own face.
-                                // Without this every triangle of a flat mesh takes whatever is near its plane.
-                                // A box sliding down the middle is then caught by edges nowhere near it.
-                                if (searched) {
-                                    bool on_feature = false;
-                                    for (uint e = 0; e < 3 && !on_feature; ++e)
-                                        on_feature = (triangle.ActiveEdges & (1u << e)) != 0 &&
-                                            OnEdgeLine(face, hull_vertices, outward, e, points_there[i], seam);
-                                    if (!on_feature) continue;
-                                }
-                                // A point the seam did not cut but that landed along it anyway.
-                                // A vertex on a plane is inside it and keeps its own name, so both triangles hold it.
-                                // The cook's owner decides which one reports it.
-                                bool disowned = false;
-                                for (uint e = 0; e < 3 && !disowned; ++e)
-                                    disowned = ((triangle.ActiveEdges | triangle.OwnedEdges) & (1u << e)) == 0 &&
-                                        OnEdgeLine(face, hull_vertices, outward, e, points_there[i], seam);
-                                if (disowned) continue;
-                                points_here[kept] = points_here[i];
-                                points_there[kept] = points_there[i];
-                                features[kept] = features[i];
-                                ++kept;
+                    for (uint own_at = 0; own_at < own_count; ++own_at) {
+                        const Index own_triangle = mesh_pair ? shape.FirstTriangle + own_candidates[own_at].x : NoIndex;
+                        Poly own_poly = mesh_pair ? MakeTriangle(shape_pose, mesh_triangles[own_triangle]) : leaf_poly;
+                        bool plane_back = false;
+                        if (target.Kind == ShapePlane) {
+                            const Pose local = ComposePose(target_pose, target.Local);
+                            target.Normal = Rotate(local.Orientation, target.Normal);
+                            target.Offset += dot(target.Normal, local.Position);
+                            float3 centre = shape_pose.Position;
+                            if (shape.Kind == ShapeMesh && target.DoubleSided) {
+                                const BvhNode bounds = bvh_nodes[shape.RootNode];
+                                centre = WorldPoint(shape_pose, (bounds.Low + bounds.High) * 0.5f);
                             }
-                            found = kept;
-                        } else if (curved && !hulled) {
-                            // One of the two is round, which makes the pair a distance problem.
-                            // The contact is the nearest point of the other shape, with the radius taken off.
-                            // A capsule's core is a segment and can lie along what it touches, so it takes one sample per end.
-                            // Those two are its whole manifold, its surface between them being a straight ruling.
-                            const bool mine_is_round = IsRound(shape.Kind);
-                            const Shape round_shape = mine_is_round ? shape : target;
-                            const Shape against = mine_is_round ? target : shape;
-                            const Core core = MakeCore(mine_is_round ? shape_pose : target_shape_pose, round_shape);
-                            const Pose other_pose = mine_is_round ? target_shape_pose : shape_pose;
-                            const bool other_is_round = IsRound(against.Kind);
-                            const Core other_core = other_is_round ? MakeCore(other_pose, against) : Core{};
-
-                            // Where along each core to sample, and each sample's name.
-                            float3 samples[2], others[2];
-                            uint names[2];
-                            uint taken = 0;
-                            if (other_is_round) {
-                                const float3 mine_along = core.To - core.From, theirs_along = other_core.To - other_core.From;
-                                const float mine_length = length(mine_along), theirs_length = length(theirs_along);
-                                const bool parallel = mine_length > 1e-6f && theirs_length > 1e-6f &&
-                                    abs(dot(mine_along / mine_length, theirs_along / theirs_length)) > 0.999f;
-                                if (parallel) {
-                                    // Side by side: the stretch both cores cover.
-                                    const float3 direction = mine_along / mine_length;
-                                    const float base = dot(core.From, direction);
-                                    const float their_low = dot(other_core.From, direction) - base;
-                                    const float their_high = dot(other_core.To, direction) - base;
-                                    const float low = max(0.f, min(their_low, their_high));
-                                    const float high = min(mine_length, max(their_low, their_high));
-                                    if (high - low > 1e-5f) {
-                                        for (uint end = 0; end < 2; ++end) {
-                                            const float at = end == 0 ? low : high;
-                                            samples[taken] = core.From + direction * at;
-                                            // The core end that bounded this limit names it.
-                                            const bool theirs = end == 0 ? their_low > 0 || their_high > 0 : their_high < mine_length || their_low < mine_length;
-                                            names[taken] = (end << 1) | (theirs ? 1u : 0u);
-                                            ++taken;
-                                        }
-                                    }
-                                }
-                                if (taken == 0) {
-                                    ClosestOnSegments(core.From, core.To, other_core.From, other_core.To, samples[0], others[0]);
-                                    names[0] = 0;
-                                    taken = 1;
-                                }
-                            } else if (against.Kind == ShapePlane) {
-                                // A plane is flat everywhere, so the core's ends are all of it.
-                                samples[0] = core.From;
-                                names[0] = 0;
-                                taken = 1;
-                                if (distance(core.From, core.To) > 1e-6f) {
-                                    samples[1] = core.To;
-                                    names[1] = 1;
-                                    taken = 2;
-                                }
-                            } else {
-                                // Against a box, the core's own ends do not give where to sample.
-                                // A capsule can rest with its middle across a box and both ends over nothing.
-                                // Alternating projection finds where the core comes nearest the box, converging because both shapes are convex.
-                                // That gives the face the core lands on.
-                                // The stretch of core over that face is where the capsule rests, and its two limits are the manifold.
-                                const BoxPose target_box = MakeBox(other_pose, against);
-                                float3 on_core = ClosestOnSegment(core.From, core.To, target_box.Center), on_box;
-                                float away;
-                                uint face = 0;
-                                for (uint round = 0; round < 3; ++round) {
-                                    on_box = ClosestOnBox(target_box, on_core, away, face);
-                                    on_core = ClosestOnSegment(core.From, core.To, on_box);
-                                }
-                                on_box = ClosestOnBox(target_box, on_core, away, face);
-
-                                const float3 out_of = OutOfBox(on_core, on_box, away);
-                                uint axis = 0;
-                                float most = 0;
-                                for (uint i = 0; i < 3; ++i) {
-                                    const float aligned = abs(dot(out_of, target_box.Axis[i]));
-                                    if (aligned > most) {
-                                        most = aligned;
-                                        axis = i;
-                                    }
-                                }
-
-                                // Clip the core to the two slabs across that face. Both limits keep
-                                // the name of what set them, so the pair is the same pair next step
-                                // wherever the search started.
-                                const float3 along = core.To - core.From;
-                                float low = 0, high = 1;
-                                uint low_name = 0, high_name = 1;
-                                for (uint side = 0; side < 2; ++side) {
-                                    const uint slab = (axis + 1 + side) % 3;
-                                    const float direction = dot(along, target_box.Axis[slab]);
-                                    const float from = dot(core.From - target_box.Center, target_box.Axis[slab]);
-                                    for (uint face_side = 0; face_side < 2; ++face_side) {
-                                        const float edge = face_side == 0 ? target_box.Half[slab] : -target_box.Half[slab];
-                                        if (abs(direction) < 1e-9f) continue;
-                                        const float at = (edge - from) / direction;
-                                        const bool entering = (face_side == 0) == (direction < 0);
-                                        const uint slab_name = 2 + slab * 2 + face_side;
-                                        if (entering && at > low) {
-                                            low = at;
-                                            low_name = slab_name;
-                                        } else if (!entering && at < high) {
-                                            high = at;
-                                            high_name = slab_name;
-                                        }
-                                    }
-                                }
-
-                                // A sphere's core is a point, so both limits are one contact.
-                                if (high - low > 1e-5f && length(along) * (high - low) > 1e-5f) {
-                                    samples[0] = core.From + along * low;
-                                    samples[1] = core.From + along * high;
-                                    names[0] = low_name;
-                                    names[1] = high_name;
-                                    taken = 2;
-                                } else {
-                                    // No part of the core lies over a face, so the nearest point is the whole sample.
-                                    samples[0] = on_core;
-                                    names[0] = 8 + face;
-                                    taken = 1;
+                            plane_back = target.DoubleSided && dot(target.Normal, centre) < target.Offset;
+                            // Retain the previous side during mesh-plane penetration.
+                            // The vertex feature encodes the side to invalidate the dual when it changes.
+                            if (shape.Kind == ShapeMesh && target.DoubleSided && abs(dot(target.Normal, centre) - target.Offset) <= reach) {
+                                for (uint j = 0; j < ContactsPerBody && was_feature[j] != NoIndex; ++j) {
+                                    if (was_other[j] != other || was_children[j] != ChildPair(own_leaf, target_leaf)) continue;
+                                    plane_back = (was_feature[j] & PlaneBackFeature) != 0;
+                                    break;
                                 }
                             }
-
-                            for (uint sample = 0; sample < taken && found < MaxFacePoints; ++sample) {
-                                const float3 at = samples[sample];
-                                // `out_of` points away from the other shape and `gap` spans them.
-                                float3 nearest, out_of;
-                                float gap;
-                                if (against.Kind == ShapePlane) {
-                                    const float above = dot(against.Normal, at) - against.Offset;
-                                    out_of = against.Normal;
-                                    nearest = at - above * against.Normal;
-                                    gap = above - core.Radius;
-                                } else if (other_is_round) {
-                                    const float3 on_theirs = taken == 1 ? others[0] : ClosestOnSegment(other_core.From, other_core.To, at);
-                                    const float3 apart = at - on_theirs;
-                                    const float span = length(apart);
-                                    out_of = span > 1e-9f ? apart / span : float3(0, 1, 0); // coincident, so any direction serves
-                                    nearest = on_theirs + out_of * other_core.Radius;
-                                    gap = span - other_core.Radius - core.Radius;
-                                } else {
-                                    float away;
-                                    uint face;
-                                    nearest = ClosestOnBox(MakeBox(other_pose, against), at, away, face);
-                                    out_of = OutOfBox(at, nearest, away);
-                                    gap = away - core.Radius;
-                                }
-
-                                if (gap >= reach) continue;
-                                // The convention is out of the other body towards this one.
-                                normal = mine_is_round ? out_of : -out_of;
-                                const float3 on_round = at - out_of * core.Radius;
-                                points_here[found] = mine_is_round ? on_round : nearest;
-                                points_there[found] = mine_is_round ? nearest : on_round;
-                                features[found] = names[sample];
-                                ++found;
+                            if (plane_back) {
+                                target.Normal = -target.Normal;
+                                target.Offset = -target.Offset;
                             }
-                        } else if (target.Kind == ShapePlane) {
-                            // The vertices reaching through the plane are the manifold.
-                            normal = target.Normal;
-                            // Spread rather than the first eight, MaxFacePoints being the most one pair may report.
-                            found = SpreadSupport(own_poly, hull_vertices, -normal, -(target.Offset + reach), MaxFacePoints, points_here, features);
-                            for (uint i = 0; i < found; ++i)
-                                points_there[i] = points_here[i] - (dot(normal, points_here[i]) - target.Offset) * normal;
-                        } else if (!hulled) {
-                            const BoxPose other_box = MakeBox(target_shape_pose, target);
-
-                            // Separating axis test over all fifteen axes.
-                            // The nine cross products are the edge-on-edge axes, and the shallowest is kept.
-                            // Two boxes crossing at an angle touch along one pair of edges.
-                            // Taking a face there gives the wrong normal and too much penetration.
-                            bool apart = false;
-                            uint edge_i = 0, edge_j = 0;
-                            float3 edge_normal = float3(0);
-                            float least_edge = INFINITY;
-                            for (uint i = 0; i < 3 && !apart; ++i) {
-                                for (uint j = 0; j < 3; ++j) {
-                                    const float3 axis = cross(box.Axis[i], other_box.Axis[j]);
-                                    const float len = length(axis);
-                                    if (len < 1e-6f) continue; // parallel edges, covered by the face axes
-                                    const float3 unit = axis / len;
-                                    const float overlap = Overlap(box, other_box, unit);
-                                    // Apart by more than the reach, rather than merely apart.
-                                    // A projection gap is a lower bound on the distance.
-                                    // The early-out therefore stays sound, and everything within reach is given its slack.
-                                    if (overlap < -reach) {
-                                        apart = true;
-                                        break;
-                                    }
-                                    if (overlap < least_edge) {
-                                        least_edge = overlap;
-                                        edge_i = i;
-                                        edge_j = j;
-                                        // Out of the other body towards this one.
-                                        edge_normal = dot(unit, box.Center - other_box.Center) < 0 ? -unit : unit;
-                                    }
-                                }
+                            if (shape.Kind == ShapeMesh) {
+                                const BvhNode bounds = bvh_nodes[shape.RootNode];
+                                const float3 axis = Rotate(QuatConjugate(shape_pose.Orientation), target.Normal);
+                                const float offset = target.Offset - dot(target.Normal, shape_pose.Position);
+                                const float nearest = dot(axis, (bounds.Low + bounds.High) * 0.5f) - dot(abs(axis), (bounds.High - bounds.Low) * 0.5f);
+                                const float roundoff = 1e-5f * max(1.f, abs(target.Offset) + length(shape_pose.Position) + length(bounds.Low) + length(bounds.High));
+                                if (nearest > offset + reach + roundoff) continue;
                             }
-                            // The face axis they overlap along least is the one to separate them on.
-                            // A challenger must beat the incumbent by a margin, relative and absolute both.
-                            // That is the tolerance Box2D-lite carries and both references keep.
-                            // Two faces of a stacked box overlap by almost the same amount.
-                            // A flipped reference axis renames every point and discards its warm start.
-                            // The relative part is a fraction of the incumbent's absolute size, the incumbent going negative when the boxes are disjoint.
-                            uint best_axis = 0, best_owner = 0;
-                            float least = INFINITY;
-                            // The `!apart` guard is composed into the loop conditions rather than run as an early continue.
-                            // A continue here miscompiled under fast math, taking the branch with its condition provably false.
-                            for (uint owner = 0; owner < 2 && !apart; ++owner) {
-                                for (uint i = 0; i < 3; ++i) {
-                                    const float3 axis = owner == 0 ? box.Axis[i] : other_box.Axis[i];
-                                    const float overlap = Overlap(box, other_box, axis);
-                                    if (overlap < -reach) {
-                                        apart = true;
-                                        break;
-                                    }
-                                    const float extent = owner == 0 ? box.Half[i] : other_box.Half[i];
-                                    const float incumbent = isinf(least) ? least : least - (1 - RelativeTolerance) * abs(least);
-                                    if (overlap < incumbent - AbsoluteTolerance * extent) {
-                                        least = overlap;
-                                        best_axis = i;
-                                        best_owner = owner;
-                                    }
-                                }
+                        }
+                        const Pose target_shape_pose = ComposePose(target_pose, target.Local); // as above, on the other side
+                        Poly plane_patch{};
+                        float pair_reach = own_reach;
+                        if (BoundedPlane(target)) {
+                            Poly query = own_poly;
+                            if (shape.Kind == ShapeMesh) {
+                                const BvhNode bounds = bvh_nodes[shape.RootNode];
+                                query.Kind = ShapeBox;
+                                query.Center = WorldPoint(shape_pose, (bounds.Low + bounds.High) * 0.5f);
+                                query.Half = (bounds.High - bounds.Low) * 0.5f;
                             }
-                            if (apart || least > 1e18f) continue;
+                            if (!PlanePatch(query, target_shape_pose, target, hull_vertices, reach, plane_patch)) continue;
+                            pair_reach = PolyReach(query, hull_vertices) + query.Radius;
+                            plane_patch.Center -= shape_pose.Position;
+                        } else if (own_reach < 0) {
+                            pair_reach = PolyReach(own_poly, hull_vertices);
+                            if (!mesh_pair) own_reach = pair_reach;
+                        }
+                        // How close two points must be to be one, the scale SupportFace resolves at.
+                        const float geometry = max(pair_reach, BoundedPlane(target) ? PolyReach(plane_patch, hull_vertices) : PolyReach(MakePoly(target_shape_pose, target), hull_vertices) + target.Radius);
+                        const float weld = 1e-3f * geometry + 1e-6f;
+                        // Whether either surface is round, which inherited friction anchors cannot assume.
+                        const bool curved = IsRound(shape.Kind) || IsRound(target.Kind);
 
-                            // Both measured as separation, negative while the boxes overlap, so this reads as the reference writes it.
-                            // The edge pair must beat the best face by a clear margin, which leaves ties to the faces.
-                            // A stack of axis-aligned boxes never reaches here, its cross products all being degenerate.
-                            const bool on_edge = least_edge < 1e18f && RelativeTolerance * -least_edge > -least + EdgeTolerance;
-                            if (on_edge) {
-                                float3 mine[2], theirs[2];
-                                uint which_mine, which_theirs;
-                                // This body's edge is the one reaching back along the normal.
-                                SupportEdge(box, edge_i, -edge_normal, mine, which_mine);
-                                SupportEdge(other_box, edge_j, edge_normal, theirs, which_theirs);
-                                normal = edge_normal;
-                                ClosestOnSegments(mine[0], mine[1], theirs[0], theirs[1], points_here[0], points_there[0]);
-                                // Named by the two edges, so their parallels do not inherit its dual.
-                                features[0] = (1u << 15) | (edge_i << 13) | (edge_j << 11) | (which_mine << 9) | (which_theirs << 7);
-                                found = 1;
-                            } else {
-                                const BoxPose reference = best_owner == 0 ? box : other_box;
-                                const BoxPose incident = best_owner == 0 ? other_box : box;
-                                float3 face_normal = reference.Axis[best_axis];
-                                if (dot(face_normal, incident.Center - reference.Center) < 0) face_normal = -face_normal;
-                                normal = best_owner == 0 ? -face_normal : face_normal;
-
-                                uint incident_axis = 0;
-                                float incident_side = 1, most_opposed = INFINITY;
-                                for (uint i = 0; i < 3; ++i) {
-                                    for (uint s = 0; s < 2; ++s) {
-                                        const float side = s == 0 ? 1 : -1;
-                                        const float alignment = dot(incident.Axis[i] * side, face_normal);
-                                        if (alignment < most_opposed) {
-                                            most_opposed = alignment;
-                                            incident_axis = i;
-                                            incident_side = side;
-                                        }
-                                    }
-                                }
-
-                                // Four corners cut by four planes is eight points, so no extra width.
-                                float3 poly[MaxFacePoints], clipped[MaxFacePoints];
-                                uint names[MaxFacePoints], clipped_names[MaxFacePoints];
-                                FaceCorners(incident, incident_axis, incident_side, poly);
-                                for (uint i = 0; i < 4; ++i) names[i] = (1u << i) | (1u << ((i + 3) % 4)); // its two edges
-                                uint poly_count = 4;
-                                // The relative clip tolerance the hull path uses. See ClipAgainst.
-                                const float clip_tolerance = 1e-5f * max(1.f, length(reference.Center) + length(reference.Half));
-                                for (uint edge = 0; edge < 2; ++edge) {
-                                    const uint side_axis = (best_axis + 1 + edge) % 3;
-                                    for (uint s = 0; s < 2; ++s) {
-                                        const float3 side_normal = reference.Axis[side_axis] * (s == 0 ? 1 : -1);
-                                        const float side_offset = dot(side_normal, reference.Center) + reference.Half[side_axis];
-                                        const uint plane = 1u << (4 + edge * 2 + s);
-                                        poly_count = ClipAgainst(poly, names, poly_count, side_normal, side_offset, plane, clip_tolerance, MaxFacePoints, clipped, clipped_names);
-                                    }
-                                }
-
-                                // The face plane sits one half-extent along the outward face_normal.
-                                const float face_offset = dot(face_normal, reference.Center) + reference.Half[best_axis];
-                                for (uint i = 0; i < poly_count && found < MaxFacePoints; ++i) {
-                                    const float depth = dot(face_normal, poly[i]) - face_offset;
-                                    if (depth >= reach) continue;
-                                    // The point is on the incident body, its partner the projection.
-                                    const float3 on_reference = poly[i] - depth * face_normal;
-                                    points_here[found] = best_owner == 0 ? on_reference : poly[i];
-                                    points_there[found] = best_owner == 0 ? poly[i] : on_reference;
-                                    // Which body owned the reference face, which axes made the two faces, and where the point sits.
-                                    // No part of this is an index into the output array.
-                                    features[found] = (best_owner << 13) | (best_axis << 11) | (incident_axis << 9) |
-                                        ((incident_side > 0 ? 1u : 0u) << 8) | names[i];
-                                    ++found;
-                                }
+                        // How many manifolds this pair has: one, or one per mesh triangle the body reaches, a batch at a time.
+                        // The walk's stack lives out here so it survives between batches.
+                        uint candidates[MaxMeshTriangles], walk[MeshStackDepth], depth = 0;
+                        float3 low = 0, high = 0;
+                        if (target.Kind == ShapeMesh && !mesh_pair) {
+                            // The body's box in the mesh's frame, let out by radius and margin.
+                            const uint corners = PolyCount(own_poly);
+                            low = INFINITY;
+                            high = -INFINITY;
+                            for (uint i = 0; i < corners; ++i) {
+                                const float3 at = LocalPoint(target_shape_pose, PolyVertex(own_poly, hull_vertices, i));
+                                low = min(low, at);
+                                high = max(high, at);
                             }
-                        } else {
-                            // A hull has no face list for the SAT, so this path uses support functions.
-                            found = ConvexManifold(own_poly, MakePoly(target_shape_pose, target), hull_vertices, hull_faces, reach, float3(0), points_here, points_there, features, normal);
+                            const float let_out = own_poly.Radius + reach;
+                            low -= let_out;
+                            high += let_out;
+                            walk[depth++] = 0;
+                        } else if (BoundedPlane(target) && shape.Kind == ShapeMesh) {
+                            walk[depth++] = 0;
                         }
 
-                        // A manifold on a face buried against a sibling is inside that body's own solid, so there is no contact.
-                        // Tested against the normal that came out rather than the faces each path chose between.
-                        // The box test names one direction from either side.
-                        if (found > 0 && (BuriedAlong(target, target_pose, hull_faces, normal) || BuriedAlong(shape, pose, hull_faces, -normal)))
-                            found = 0;
+                        for (bool walking = true; walking;) {
+                            uint manifolds = 1;
+                            if (mesh_pair) {
+                                candidates[0] = own_candidates[own_at].y;
+                                walking = false;
+                            } else if (target.Kind == ShapeMesh) {
+                                const float4 inverse = QuatConjugate(own_poly.Orientation);
+                                const float3 offset = Rotate(inverse, target_shape_pose.Position - own_poly.Center);
+                                const float3x3 rotation = QuatToMatrix(QuatMul(inverse, target_shape_pose.Orientation));
+                                manifolds = GatherTriangles(target, low, high, own_poly, offset, rotation, hull_faces, reach, bvh_nodes, walk, depth, candidates);
+                                walking = depth > 0;
+                                if (manifolds == 0) break;
+                            } else if (BoundedPlane(target) && shape.Kind == ShapeMesh) {
+                                const float4 inverse = QuatConjugate(plane_patch.Orientation);
+                                const float3 offset = Rotate(inverse, -plane_patch.Center);
+                                const float3x3 rotation = QuatToMatrix(QuatMul(inverse, shape_pose.Orientation));
+                                manifolds = GatherTriangles(shape, float3(-INFINITY), float3(INFINITY), plane_patch, offset, rotation, hull_faces, reach, bvh_nodes, walk, depth, candidates);
+                                walking = depth > 0;
+                                if (manifolds == 0) break;
+                            } else {
+                                walking = false;
+                            }
 
-                        // No two rows on one piece of geometry, then the four worth keeping.
-                        found = WeldManifold(points_here, points_there, features, found, weld);
+                            for (uint manifold = 0; manifold < manifolds; ++manifold) {
+                                // Which part of the other shape this is against, which only a mesh has.
+                                Index sub_shape = NoIndex, sub_shape_a = own_triangle;
+                                // And which leaf of each produced it.
+                                const ulong children = ChildPair(own_leaf, target_leaf);
+                                // A manifold point is a pair: where it sits on this body, and where on the other.
+                                // The two are distinct points, one always being a projection onto the other's surface.
+                                float3 points_here[MaxClipPoints], points_there[MaxClipPoints], normal;
+                                // A feature names the geometry that produced a point - which corner, or which
+                                // pair of faces and which vertex of the clip - never its position in the
+                                // output, or warm starting hands a dual to the wrong point when the touching
+                                // set changes.
+                                uint features[MaxClipPoints];
+                                uint found = 0;
+                                float2 patch{-1, 0};
+
+                                const bool hulled = shape.Kind == ShapeHull || target.Kind == ShapeHull;
+                                if (mesh_pair) {
+                                    sub_shape = target.FirstTriangle + candidates[manifold];
+                                    const Poly face = MakeTriangle(target_shape_pose, mesh_triangles[sub_shape]);
+                                    uint previous = NoIndex;
+                                    for (uint j = 0; j < ContactsPerBody && was_feature[j] != NoIndex; ++j)
+                                        if (was_other[j] == other && was_children[j] == children && was_sub_a[j] == sub_shape_a && was_sub[j] == sub_shape) {
+                                            previous = was_feature[j];
+                                            break;
+                                        }
+                                    found = MeshManifold(own_poly, face, shape.DoubleSided, target.DoubleSided, own_bounds.Center, target_bounds.Center, previous, hull_vertices, hull_faces, reach, points_here, points_there, features, normal);
+                                } else if (BoundedPlane(target)) {
+                                    Poly incident = own_poly;
+                                    if (shape.Kind == ShapeMesh) {
+                                        sub_shape_a = shape.FirstTriangle + candidates[manifold];
+                                        incident = MakeTriangle(shape_pose, mesh_triangles[sub_shape_a]);
+                                    }
+                                    incident.Center -= shape_pose.Position;
+                                    found = ConvexManifold(plane_patch, incident, hull_vertices, hull_faces, reach, -target.Normal, points_there, points_here, features, normal);
+                                    if (found == 0)
+                                        found = ConvexManifold(plane_patch, incident, hull_vertices, hull_faces, reach, float3(0), points_there, points_here, features, normal);
+                                    normal = -normal;
+                                    for (uint i = 0; i < found; ++i) {
+                                        points_here[i] += shape_pose.Position;
+                                        points_there[i] += shape_pose.Position;
+                                        if (shape.Kind == ShapeMesh && plane_back) features[i] |= PlaneBackFeature;
+                                    }
+                                } else if (target.Kind == ShapeMesh) {
+                                    const Index index = target.FirstTriangle + candidates[manifold];
+                                    Triangle triangle = mesh_triangles[index];
+                                    sub_shape = index;
+                                    Poly face = MakeTriangle(target_shape_pose, triangle);
+                                    if (OutsideFaces(own_poly, face, hull_vertices, hull_faces, reach)) continue;
+                                    const float3 first = PolyVertex(face, hull_vertices, 0);
+                                    const float3 turn = cross(PolyVertex(face, hull_vertices, 1) - first, PolyVertex(face, hull_vertices, 2) - first);
+                                    const float area = length(turn);
+                                    if (area < 1e-18f) continue; // a sliver the cook let through has no usable side
+                                    float3 outward = turn / area; // out of the surface, as the winding defines it
+                                    // Select the triangle side geometrically because penetration can exceed speculative reach.
+                                    if (dot(own_poly.Center - first, outward) < 0) {
+                                        if (!target.DoubleSided) continue;
+                                        const Index b = triangle.B;
+                                        triangle.B = triangle.C;
+                                        triangle.C = b;
+                                        // Reversing B/C reverses edges 0 and 2; edge 1 keeps its index.
+                                        const uint active = triangle.BackActiveEdges, owned = triangle.OwnedEdges;
+                                        triangle.ActiveEdges = (active & 2u) | ((active & 1u) << 2) | ((active & 4u) >> 2);
+                                        triangle.OwnedEdges = (owned & 2u) | ((owned & 1u) << 2) | ((owned & 4u) >> 2);
+                                        face = MakeTriangle(target_shape_pose, triangle);
+                                        outward = -outward;
+                                    }
+
+                                    // A mesh has no interior, so a body wholly behind a triangle is past it.
+                                    const float3 top = PolySupportPoint(own_poly, hull_vertices, outward);
+                                    if (dot(top - first, outward) + own_poly.Radius <= 0) continue;
+                                    const float3 bottom = PolySupportPoint(own_poly, hull_vertices, -outward);
+                                    const bool within = dot(bottom - first, outward) - own_poly.Radius < reach;
+                                    if (!within) continue;
+
+                                    // The triangle goes in first and with its own normal, which makes it the reference face every time.
+                                    // The manifold is then the body's face clipped into the triangle, and every point is named after the geometry under it.
+                                    // The result comes back the other way round, out of the mesh.
+                                    found = ConvexManifold(face, own_poly, hull_vertices, hull_faces, reach, -outward, points_there, points_here, features, normal);
+
+                                    // Where that finds nothing while the body is in range, the given direction is wrong for this geometry.
+                                    // A body over a crease presents, to each slope's normal, the feature of itself over the other slope, which the clip drops.
+                                    // Both triangles then come back empty and the body falls through the ridge.
+                                    // The contact is against the crease itself and has to be searched for.
+                                    // Only as a fallback, and only where this triangle has an active edge.
+                                    // An inactive edge is a seam whose neighbour holds the body on its own face.
+                                    const bool searched = found == 0 && within && triangle.ActiveEdges != 0;
+                                    if (searched)
+                                        found = ConvexManifold(face, own_poly, hull_vertices, hull_faces, reach, float3(0), points_there, points_here, features, normal);
+                                    normal = -normal;
 #if !SENSOR_PASS
-                        if (p.ReportContacts && patch.x < 0) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
+                                    // Seam ownership removes solver points without shrinking the geometric patch.
+                                    if (p.ReportContacts) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
 #endif
-                        if (cached_pair) {
-                            for (uint k = 0; k < count; ++k)
-                                if (slots[k].BodyB == other && slots[k].Children == children && slots[k].SubShape == sub_shape) {
-                                    slots[k].NominalArea = patch.x;
-                                    slots[k].NominalExtent = patch.y;
+
+                                    // A point one seam cut is cut by the triangle across it too, so both would hold one piece of geometry with a dual each.
+                                    // Dropping it from both loses nothing, only the tessellation having put it there.
+                                    // An edge that is a feature, a rim or a crease, is not a seam, and the points it cut stay.
+                                    // Bits 8 to 10 name which reference-face edges cut a point.
+                                    // Those are the triangle's own only while it is the reference (bit 28 clear).
+                                    // The tolerance is the scale the clip measured with.
+                                    float scale = 1;
+                                    for (uint v = 0; v < 3; ++v) scale = max(scale, length(PolyVertex(face, hull_vertices, v)));
+                                    const float seam = 1e-5f * scale;
+
+                                    uint kept = 0;
+                                    for (uint i = 0; i < found; ++i) {
+                                        const bool triangle_led = ((features[i] >> 28) & 1) == 0;
+                                        // Which edges cut the point, and which were seams.
+                                        const uint cut_by = triangle_led ? (features[i] >> 8) & 7 : 0u;
+                                        const uint cut_by_seam = cut_by & ~triangle.ActiveEdges;
+                                        // Two of its edges cutting one point put it at a corner of the triangle.
+                                        // Where one of the two is a feature it is a corner of the surface as well.
+                                        // A body can rest there, so it is not a point both triangles may drop.
+                                        // Dropped by both, a cube on a two-triangle face keeps 2 rows on the diagonal instead of 4 on the corners.
+                                        // The seam's owner keeps it, which is the lower-numbered triangle as the cook wrote the bit.
+                                        // The two threads therefore read opposite results from one name.
+                                        const bool corner_is_mine = (cut_by & triangle.ActiveEdges) != 0 && (cut_by_seam & ~triangle.OwnedEdges) == 0;
+                                        if (cut_by_seam != 0 && !corner_is_mine) continue;
+                                        // A searched point not on an active edge belongs to the triangle across, which holds it on its own face.
+                                        // Without this every triangle of a flat mesh takes whatever is near its plane.
+                                        // A box sliding down the middle is then caught by edges nowhere near it.
+                                        if (searched) {
+                                            bool on_feature = false;
+                                            for (uint e = 0; e < 3 && !on_feature; ++e)
+                                                on_feature = (triangle.ActiveEdges & (1u << e)) != 0 &&
+                                                    OnEdgeLine(face, hull_vertices, outward, e, points_there[i], seam);
+                                            if (!on_feature) continue;
+                                        }
+                                        // A point the seam did not cut but that landed along it anyway.
+                                        // A vertex on a plane is inside it and keeps its own name, so both triangles hold it.
+                                        // The cook's owner decides which one reports it.
+                                        bool disowned = false;
+                                        for (uint e = 0; e < 3 && !disowned; ++e)
+                                            disowned = ((triangle.ActiveEdges | triangle.OwnedEdges) & (1u << e)) == 0 &&
+                                                OnEdgeLine(face, hull_vertices, outward, e, points_there[i], seam);
+                                        if (disowned) continue;
+                                        points_here[kept] = points_here[i];
+                                        points_there[kept] = points_there[i];
+                                        features[kept] = features[i];
+                                        ++kept;
+                                    }
+                                    found = kept;
+                                } else if (curved && !hulled) {
+                                    // One of the two is round, which makes the pair a distance problem.
+                                    // The contact is the nearest point of the other shape, with the radius taken off.
+                                    // A capsule's core is a segment and can lie along what it touches, so it takes one sample per end.
+                                    // Those two are its whole manifold, its surface between them being a straight ruling.
+                                    const bool mine_is_round = IsRound(shape.Kind);
+                                    const Shape round_shape = mine_is_round ? shape : target;
+                                    const Shape against = mine_is_round ? target : shape;
+                                    const Core core = MakeCore(mine_is_round ? shape_pose : target_shape_pose, round_shape);
+                                    const Pose other_pose = mine_is_round ? target_shape_pose : shape_pose;
+                                    const bool other_is_round = IsRound(against.Kind);
+                                    const Core other_core = other_is_round ? MakeCore(other_pose, against) : Core{};
+
+                                    // Where along each core to sample, and each sample's name.
+                                    float3 samples[2], others[2];
+                                    uint names[2];
+                                    uint taken = 0;
+                                    if (other_is_round) {
+                                        const float3 mine_along = core.To - core.From, theirs_along = other_core.To - other_core.From;
+                                        const float mine_length = length(mine_along), theirs_length = length(theirs_along);
+                                        const bool parallel = mine_length > 1e-6f && theirs_length > 1e-6f &&
+                                            abs(dot(mine_along / mine_length, theirs_along / theirs_length)) > 0.999f;
+                                        if (parallel) {
+                                            // Side by side: the stretch both cores cover.
+                                            const float3 direction = mine_along / mine_length;
+                                            const float base = dot(core.From, direction);
+                                            const float their_low = dot(other_core.From, direction) - base;
+                                            const float their_high = dot(other_core.To, direction) - base;
+                                            const float low = max(0.f, min(their_low, their_high));
+                                            const float high = min(mine_length, max(their_low, their_high));
+                                            if (high - low > 1e-5f) {
+                                                for (uint end = 0; end < 2; ++end) {
+                                                    const float at = end == 0 ? low : high;
+                                                    samples[taken] = core.From + direction * at;
+                                                    // The core end that bounded this limit names it.
+                                                    const bool theirs = end == 0 ? their_low > 0 || their_high > 0 : their_high < mine_length || their_low < mine_length;
+                                                    names[taken] = (end << 1) | (theirs ? 1u : 0u);
+                                                    ++taken;
+                                                }
+                                            }
+                                        }
+                                        if (taken == 0) {
+                                            ClosestOnSegments(core.From, core.To, other_core.From, other_core.To, samples[0], others[0]);
+                                            names[0] = 0;
+                                            taken = 1;
+                                        }
+                                    } else if (against.Kind == ShapePlane) {
+                                        // A plane is flat everywhere, so the core's ends are all of it.
+                                        samples[0] = core.From;
+                                        names[0] = 0;
+                                        taken = 1;
+                                        if (distance(core.From, core.To) > 1e-6f) {
+                                            samples[1] = core.To;
+                                            names[1] = 1;
+                                            taken = 2;
+                                        }
+                                    } else {
+                                        // Against a box, the core's own ends do not give where to sample.
+                                        // A capsule can rest with its middle across a box and both ends over nothing.
+                                        // Alternating projection finds where the core comes nearest the box, converging because both shapes are convex.
+                                        // That gives the face the core lands on.
+                                        // The stretch of core over that face is where the capsule rests, and its two limits are the manifold.
+                                        const BoxPose target_box = MakeBox(other_pose, against);
+                                        float3 on_core = ClosestOnSegment(core.From, core.To, target_box.Center), on_box;
+                                        float away;
+                                        uint face = 0;
+                                        for (uint round = 0; round < 3; ++round) {
+                                            on_box = ClosestOnBox(target_box, on_core, away, face);
+                                            on_core = ClosestOnSegment(core.From, core.To, on_box);
+                                        }
+                                        on_box = ClosestOnBox(target_box, on_core, away, face);
+
+                                        const float3 out_of = OutOfBox(on_core, on_box, away);
+                                        uint axis = 0;
+                                        float most = 0;
+                                        for (uint i = 0; i < 3; ++i) {
+                                            const float aligned = abs(dot(out_of, target_box.Axis[i]));
+                                            if (aligned > most) {
+                                                most = aligned;
+                                                axis = i;
+                                            }
+                                        }
+
+                                        // Clip the core to the two slabs across that face. Both limits keep
+                                        // the name of what set them, so the pair is the same pair next step
+                                        // wherever the search started.
+                                        const float3 along = core.To - core.From;
+                                        float low = 0, high = 1;
+                                        uint low_name = 0, high_name = 1;
+                                        for (uint side = 0; side < 2; ++side) {
+                                            const uint slab = (axis + 1 + side) % 3;
+                                            const float direction = dot(along, target_box.Axis[slab]);
+                                            const float from = dot(core.From - target_box.Center, target_box.Axis[slab]);
+                                            for (uint face_side = 0; face_side < 2; ++face_side) {
+                                                const float edge = face_side == 0 ? target_box.Half[slab] : -target_box.Half[slab];
+                                                if (abs(direction) < 1e-9f) continue;
+                                                const float at = (edge - from) / direction;
+                                                const bool entering = (face_side == 0) == (direction < 0);
+                                                const uint slab_name = 2 + slab * 2 + face_side;
+                                                if (entering && at > low) {
+                                                    low = at;
+                                                    low_name = slab_name;
+                                                } else if (!entering && at < high) {
+                                                    high = at;
+                                                    high_name = slab_name;
+                                                }
+                                            }
+                                        }
+
+                                        // A sphere's core is a point, so both limits are one contact.
+                                        if (high - low > 1e-5f && length(along) * (high - low) > 1e-5f) {
+                                            samples[0] = core.From + along * low;
+                                            samples[1] = core.From + along * high;
+                                            names[0] = low_name;
+                                            names[1] = high_name;
+                                            taken = 2;
+                                        } else {
+                                            // No part of the core lies over a face, so the nearest point is the whole sample.
+                                            samples[0] = on_core;
+                                            names[0] = 8 + face;
+                                            taken = 1;
+                                        }
+                                    }
+
+                                    for (uint sample = 0; sample < taken && found < MaxFacePoints; ++sample) {
+                                        const float3 at = samples[sample];
+                                        // `out_of` points away from the other shape and `gap` spans them.
+                                        float3 nearest, out_of;
+                                        float gap;
+                                        if (against.Kind == ShapePlane) {
+                                            const float above = dot(against.Normal, at) - against.Offset;
+                                            out_of = against.Normal;
+                                            nearest = at - above * against.Normal;
+                                            gap = above - core.Radius;
+                                        } else if (other_is_round) {
+                                            const float3 on_theirs = taken == 1 ? others[0] : ClosestOnSegment(other_core.From, other_core.To, at);
+                                            const float3 apart = at - on_theirs;
+                                            const float span = length(apart);
+                                            out_of = span > 1e-9f ? apart / span : float3(0, 1, 0); // coincident, so any direction serves
+                                            nearest = on_theirs + out_of * other_core.Radius;
+                                            gap = span - other_core.Radius - core.Radius;
+                                        } else {
+                                            float away;
+                                            uint face;
+                                            nearest = ClosestOnBox(MakeBox(other_pose, against), at, away, face);
+                                            out_of = OutOfBox(at, nearest, away);
+                                            gap = away - core.Radius;
+                                        }
+
+                                        if (gap >= reach) continue;
+                                        // The convention is out of the other body towards this one.
+                                        normal = mine_is_round ? out_of : -out_of;
+                                        const float3 on_round = at - out_of * core.Radius;
+                                        points_here[found] = mine_is_round ? on_round : nearest;
+                                        points_there[found] = mine_is_round ? nearest : on_round;
+                                        features[found] = names[sample];
+                                        ++found;
+                                    }
+                                } else if (target.Kind == ShapePlane) {
+                                    // The vertices reaching through the plane are the manifold.
+                                    normal = target.Normal;
+                                    // Spread rather than the first eight, MaxFacePoints being the most one pair may report.
+                                    found = SpreadSupport(own_poly, hull_vertices, -normal, -(target.Offset + reach), MaxFacePoints, points_here, features);
+                                    for (uint i = 0; i < found; ++i) {
+                                        points_there[i] = points_here[i] - (dot(normal, points_here[i]) - target.Offset) * normal;
+                                        if (shape.Kind == ShapeMesh && plane_back) features[i] |= PlaneBackFeature;
+                                    }
+                                } else if (!hulled) {
+                                    const BoxPose other_box = MakeBox(target_shape_pose, target);
+
+                                    // Separating axis test over all fifteen axes.
+                                    // The nine cross products are the edge-on-edge axes, and the shallowest is kept.
+                                    // Two boxes crossing at an angle touch along one pair of edges.
+                                    // Taking a face there gives the wrong normal and too much penetration.
+                                    bool apart = false;
+                                    uint edge_i = 0, edge_j = 0;
+                                    float3 edge_normal = float3(0);
+                                    float least_edge = INFINITY;
+                                    for (uint i = 0; i < 3 && !apart; ++i) {
+                                        for (uint j = 0; j < 3; ++j) {
+                                            const float3 axis = cross(box.Axis[i], other_box.Axis[j]);
+                                            const float len = length(axis);
+                                            if (len < 1e-6f) continue; // parallel edges, covered by the face axes
+                                            const float3 unit = axis / len;
+                                            const float overlap = Overlap(box, other_box, unit);
+                                            // Apart by more than the reach, rather than merely apart.
+                                            // A projection gap is a lower bound on the distance.
+                                            // The early-out therefore stays sound, and everything within reach is given its slack.
+                                            if (overlap < -reach) {
+                                                apart = true;
+                                                break;
+                                            }
+                                            if (overlap < least_edge) {
+                                                least_edge = overlap;
+                                                edge_i = i;
+                                                edge_j = j;
+                                                // Out of the other body towards this one.
+                                                edge_normal = dot(unit, box.Center - other_box.Center) < 0 ? -unit : unit;
+                                            }
+                                        }
+                                    }
+                                    // The face axis they overlap along least is the one to separate them on.
+                                    // A challenger must beat the incumbent by a margin, relative and absolute both.
+                                    // That is the tolerance Box2D-lite carries and both references keep.
+                                    // Two faces of a stacked box overlap by almost the same amount.
+                                    // A flipped reference axis renames every point and discards its warm start.
+                                    // The relative part is a fraction of the incumbent's absolute size, the incumbent going negative when the boxes are disjoint.
+                                    uint best_axis = 0, best_owner = 0;
+                                    float least = INFINITY;
+                                    // The `!apart` guard is composed into the loop conditions rather than run as an early continue.
+                                    // A continue here miscompiled under fast math, taking the branch with its condition provably false.
+                                    for (uint owner = 0; owner < 2 && !apart; ++owner) {
+                                        for (uint i = 0; i < 3; ++i) {
+                                            const float3 axis = owner == 0 ? box.Axis[i] : other_box.Axis[i];
+                                            const float overlap = Overlap(box, other_box, axis);
+                                            if (overlap < -reach) {
+                                                apart = true;
+                                                break;
+                                            }
+                                            const float extent = owner == 0 ? box.Half[i] : other_box.Half[i];
+                                            const float incumbent = isinf(least) ? least : least - (1 - RelativeTolerance) * abs(least);
+                                            if (overlap < incumbent - AbsoluteTolerance * extent) {
+                                                least = overlap;
+                                                best_axis = i;
+                                                best_owner = owner;
+                                            }
+                                        }
+                                    }
+                                    if (apart || least > 1e18f) continue;
+
+                                    // Both measured as separation, negative while the boxes overlap, so this reads as the reference writes it.
+                                    // The edge pair must beat the best face by a clear margin, which leaves ties to the faces.
+                                    // A stack of axis-aligned boxes never reaches here, its cross products all being degenerate.
+                                    const bool on_edge = least_edge < 1e18f && RelativeTolerance * -least_edge > -least + EdgeTolerance;
+                                    if (on_edge) {
+                                        float3 mine[2], theirs[2];
+                                        uint which_mine, which_theirs;
+                                        // This body's edge is the one reaching back along the normal.
+                                        SupportEdge(box, edge_i, -edge_normal, mine, which_mine);
+                                        SupportEdge(other_box, edge_j, edge_normal, theirs, which_theirs);
+                                        normal = edge_normal;
+                                        ClosestOnSegments(mine[0], mine[1], theirs[0], theirs[1], points_here[0], points_there[0]);
+                                        // Named by the two edges, so their parallels do not inherit its dual.
+                                        features[0] = (1u << 15) | (edge_i << 13) | (edge_j << 11) | (which_mine << 9) | (which_theirs << 7);
+                                        found = 1;
+                                    } else {
+                                        const BoxPose reference = best_owner == 0 ? box : other_box;
+                                        const BoxPose incident = best_owner == 0 ? other_box : box;
+                                        float3 face_normal = reference.Axis[best_axis];
+                                        if (dot(face_normal, incident.Center - reference.Center) < 0) face_normal = -face_normal;
+                                        normal = best_owner == 0 ? -face_normal : face_normal;
+
+                                        uint incident_axis = 0;
+                                        float incident_side = 1, most_opposed = INFINITY;
+                                        for (uint i = 0; i < 3; ++i) {
+                                            for (uint s = 0; s < 2; ++s) {
+                                                const float side = s == 0 ? 1 : -1;
+                                                const float alignment = dot(incident.Axis[i] * side, face_normal);
+                                                if (alignment < most_opposed) {
+                                                    most_opposed = alignment;
+                                                    incident_axis = i;
+                                                    incident_side = side;
+                                                }
+                                            }
+                                        }
+
+                                        // Four corners cut by four planes is eight points, so no extra width.
+                                        float3 poly[MaxFacePoints], clipped[MaxFacePoints];
+                                        uint names[MaxFacePoints], clipped_names[MaxFacePoints];
+                                        FaceCorners(incident, incident_axis, incident_side, poly);
+                                        for (uint i = 0; i < 4; ++i) names[i] = (1u << i) | (1u << ((i + 3) % 4)); // its two edges
+                                        uint poly_count = 4;
+                                        // The relative clip tolerance the hull path uses. See ClipAgainst.
+                                        const float clip_tolerance = 1e-5f * max(1.f, length(reference.Center) + length(reference.Half));
+                                        for (uint edge = 0; edge < 2; ++edge) {
+                                            const uint side_axis = (best_axis + 1 + edge) % 3;
+                                            for (uint s = 0; s < 2; ++s) {
+                                                const float3 side_normal = reference.Axis[side_axis] * (s == 0 ? 1 : -1);
+                                                const float side_offset = dot(side_normal, reference.Center) + reference.Half[side_axis];
+                                                const uint plane = 1u << (4 + edge * 2 + s);
+                                                poly_count = ClipAgainst(poly, names, poly_count, side_normal, side_offset, plane, clip_tolerance, MaxFacePoints, clipped, clipped_names);
+                                            }
+                                        }
+
+                                        // The face plane sits one half-extent along the outward face_normal.
+                                        const float face_offset = dot(face_normal, reference.Center) + reference.Half[best_axis];
+                                        for (uint i = 0; i < poly_count && found < MaxFacePoints; ++i) {
+                                            const float depth = dot(face_normal, poly[i]) - face_offset;
+                                            if (depth >= reach) continue;
+                                            // The point is on the incident body, its partner the projection.
+                                            const float3 on_reference = poly[i] - depth * face_normal;
+                                            points_here[found] = best_owner == 0 ? on_reference : poly[i];
+                                            points_there[found] = best_owner == 0 ? poly[i] : on_reference;
+                                            // Which body owned the reference face, which axes made the two faces, and where the point sits.
+                                            // No part of this is an index into the output array.
+                                            features[found] = (best_owner << 13) | (best_axis << 11) | (incident_axis << 9) |
+                                                ((incident_side > 0 ? 1u : 0u) << 8) | names[i];
+                                            ++found;
+                                        }
+                                    }
+                                } else {
+                                    // A hull has no face list for the SAT, so this path uses support functions.
+                                    found = ConvexManifold(own_poly, MakePoly(target_shape_pose, target), hull_vertices, hull_faces, reach, float3(0), points_here, points_there, features, normal);
                                 }
-                            continue;
-                        }
-                        found = ReduceManifold(points_here, points_there, features, found, normal);
 
-                        // Whether either side has siblings, the only way two manifolds of one pair can land on the same geometry.
-                        // Two children sharing an edge present the same corner, and WeldManifold sees only one leaf pair.
-                        // The test below costs a scan of the run per point.
-                        const bool siblings = own_leaf_count > 1 || target_leaf_count > 1;
+#if !SENSOR_PASS
+                                // A manifold on a face buried against a sibling is inside that body's own solid, so there is no contact.
+                                // Tested against the normal that came out rather than the faces each path chose between.
+                                // The box test names one direction from either side.
+                                if (found > 0 && (BuriedAlong(target, target_pose, hull_faces, normal) || BuriedAlong(shape, pose, hull_faces, -normal)))
+                                    found = 0;
+#endif
 
-                        // One slot per manifold point, its feature naming where it came from.
-                        for (uint i = 0; i < found; ++i) {
-                            const float3 anchor_a = LocalPoint(pose, points_here[i]);
-                            const float3 anchor_b = LocalPoint(target_pose, points_there[i]);
-                            // One piece of geometry, one row, across leaf pairs too: the first leaf to write a place keeps it.
-                            // That is deterministic because leaves are walked in the compound's own order.
-                            bool held = false;
-                            for (uint k = 0; k < count && siblings && !held; ++k)
-                                held = slots[k].Active && slots[k].BodyB == other && slots[k].SubShape == sub_shape &&
-                                    distance(anchor_a, slots[k].AnchorA) <= weld && distance(anchor_b, slots[k].AnchorB) <= weld;
-                            if (held) continue;
+                                // No two rows on one piece of geometry, then the four worth keeping.
+                                found = WeldManifold(points_here, points_there, features, found, weld);
+#if !SENSOR_PASS
+                                if (p.ReportContacts && patch.x < 0) patch = ManifoldGeometry(points_here, found, normal, pose, target_pose, own_velocity, other_velocity);
+#endif
+                                if (cached_pair) {
+                                    for (uint k = 0; k < count; ++k)
+                                        if (slots[k].BodyB == other && slots[k].Children == children && slots[k].SubShape == sub_shape && slots[k].SubShapeA == sub_shape_a) {
+                                            slots[k].NominalArea = patch.x;
+                                            slots[k].NominalExtent = patch.y;
+                                        }
+                                    continue;
+                                }
+                                found = ReduceManifold(points_here, points_there, features, found, normal);
 
-                            // Where this point goes. With room it takes the next slot, and once the
-                            // run is full it must earn a place: the shallowest contact gives way, so
-                            // a speculative contact at positive separation goes first and returns
-                            // the moment it is the deeper. Deciding by body order leaves a box in a
-                            // lattice holding four contacts with a neighbour it merely touches and
-                            // none with the box on it.
-                            const float separation = dot(normal, points_here[i] - points_there[i]) + p.ContactMargin;
+#if !SENSOR_PASS
+                                // The test below costs a scan of the run per point.
+                                const bool siblings = own_leaf_count > 1 || target_leaf_count > 1 || sub_shape_a != NoIndex || sub_shape != NoIndex;
+#endif
+
+                                // One slot per manifold point, its feature naming where it came from.
+                                for (uint i = 0; i < found; ++i) {
+#if !SENSOR_PASS
+                                    const float3 anchor_a = LocalPoint(pose, points_here[i]);
+                                    const float3 anchor_b = LocalPoint(target_pose, points_there[i]);
+                                    bool held = false;
+                                    for (uint k = 0; k < count && siblings && !held; ++k)
+                                        held = slots[k].Active && slots[k].BodyB == other && dot(slots[k].Normal, normal) > 0.99999f &&
+                                            distance(anchor_a, slots[k].PointA) <= weld && distance(anchor_b, slots[k].PointB) <= weld;
+                                    if (held) continue;
+#endif
+
+                                    // Where this point goes. With room it takes the next slot, and once the
+                                    // run is full it must earn a place: the shallowest contact gives way, so
+                                    // a speculative contact at positive separation goes first and returns
+                                    // the moment it is the deeper. Deciding by body order leaves a box in a
+                                    // lattice holding four contacts with a neighbour it merely touches and
+                                    // none with the box on it.
+                                    const float separation = dot(normal, points_here[i] - points_there[i]) + p.ContactMargin;
 #if SENSOR_PASS
-                            if (dot(normal, points_here[i] - points_there[i]) > 0) continue;
-                            bool already = false;
-                            for (uint k = 0; k < count; ++k)
-                                already |= slots[k].BodyB == other && slots[k].Children == children;
-                            if (already) continue;
+                                    if (dot(normal, points_here[i] - points_there[i]) > 0) continue;
+                                    bool already = false;
+                                    for (uint k = 0; k < count; ++k)
+                                        already |= slots[k].BodyB == other && slots[k].Children == children;
+                                    if (already) continue;
 #endif
-                            uint at = count;
-                            if (count == ContactsPerBody) {
-                                uint shallowest = 0;
-                                for (uint k = 1; k < ContactsPerBody; ++k)
-                                    if (slots[k].C0.x > slots[shallowest].C0.x) shallowest = k;
-                                ++contact_refusals[body];
-                                if (separation >= slots[shallowest].C0.x) continue;
-                                at = shallowest;
-                            }
-                            device Contact &contact = slots[at];
-                            contact.AnchorA = anchor_a;
-                            contact.AnchorB = anchor_b;
-                            contact.PointA = anchor_a;
-                            contact.PointB = anchor_b;
-                            contact.NominalArea = patch.x;
-                            contact.NominalExtent = patch.y;
-                            contact.Normal = normal;
-                            contact.BodyA = body;
-                            contact.BodyB = other;
-                            const Material material_a = shape.HasMaterial ? shape.Surface : (body_shape.HasMaterial ? body_shape.Surface : materials[body]);
-                            const Material material_b = target.HasMaterial ? target.Surface : (other_body_shape.HasMaterial ? other_body_shape.Surface : materials[other]);
-                            const float3 relative_velocity = (own_velocity.Linear + cross(own_velocity.Angular, points_here[i] - pose.Position)) - (other_velocity.Linear + cross(other_velocity.Angular, points_there[i] - target_pose.Position));
-                            const bool resting = length(relative_velocity - normal * dot(relative_velocity, normal)) < 1e-3f;
-                            contact.Friction = Combine(resting ? material_a.StaticFriction : material_a.DynamicFriction, resting ? material_b.StaticFriction : material_b.DynamicFriction, material_a.FrictionCombine, material_b.FrictionCombine);
-                            contact.Restitution = Combine(material_a.Restitution, material_b.Restitution, material_a.RestitutionCombine, material_b.RestitutionCombine);
-                            contact.Feature = features[i];
-                            contact.SubShape = sub_shape;
-                            contact.Children = children;
+                                    uint at = count;
+                                    if (count == ContactsPerBody) {
+                                        uint shallowest = 0;
+                                        for (uint k = 1; k < ContactsPerBody; ++k)
+                                            if (slots[k].C0.x > slots[shallowest].C0.x) shallowest = k;
+                                        ++contact_refusals[body];
+                                        if (separation >= slots[shallowest].C0.x) continue;
+                                        at = shallowest;
+                                    }
+                                    device Contact &contact = slots[at];
+                                    contact.BodyA = body;
+                                    contact.BodyB = other;
+                                    contact.Feature = features[i];
+                                    contact.Children = children;
+                                    contact.Active = true;
+#if SENSOR_PASS
+                                    // Sensors retain one identity per overlapping leaf pair, without solver state.
+                                    contact.C0.x = separation;
+#else
+                                    contact.AnchorA = anchor_a;
+                                    contact.AnchorB = anchor_b;
+                                    contact.PointA = anchor_a;
+                                    contact.PointB = anchor_b;
+                                    contact.NominalArea = patch.x;
+                                    contact.NominalExtent = patch.y;
+                                    contact.Normal = normal;
+                                    const Material material_a = shape.HasMaterial ? shape.Surface : (body_shape.HasMaterial ? body_shape.Surface : materials[body]);
+                                    const Material material_b = target.HasMaterial ? target.Surface : (other_body_shape.HasMaterial ? other_body_shape.Surface : materials[other]);
+                                    const float3 relative_velocity = (own_velocity.Linear + cross(own_velocity.Angular, points_here[i] - pose.Position)) - (other_velocity.Linear + cross(other_velocity.Angular, points_there[i] - target_pose.Position));
+                                    const bool resting = length(relative_velocity - normal * dot(relative_velocity, normal)) < 1e-3f;
+                                    contact.Friction = Combine(resting ? material_a.StaticFriction : material_a.DynamicFriction, resting ? material_b.StaticFriction : material_b.DynamicFriction, material_a.FrictionCombine, material_b.FrictionCombine);
+                                    contact.Restitution = Combine(material_a.Restitution, material_b.Restitution, material_a.RestitutionCombine, material_b.RestitutionCombine);
+                                    contact.SubShape = sub_shape;
+                                    contact.SubShapeA = sub_shape_a;
 
-                            // The closing speed when the step began, which a bounce is measured against.
-                            // Ungated, the threshold and coefficient belonging to the velocity pass.
-                            contact.Approach = -dot(normal, relative_velocity); // positive while they are coming together
-                            contact.BounceImpulse = 0;
-                            contact.BounceDelta = 0;
-                            contact.Active = true;
+                                    // The closing speed when the step began, which a bounce is measured against.
+                                    // Ungated, the threshold and coefficient belonging to the velocity pass.
+                                    contact.Approach = -dot(normal, relative_velocity); // positive while they are coming together
+                                    contact.BounceImpulse = 0;
+                                    contact.BounceDelta = 0;
 
-                            contact.Penalty = penalty_floor;
-                            contact.Lambda = float3(0);
-                            contact.Stick = false;
-                            inherited[at] = NoIndex;
-                            for (uint j = 0; j < ContactsPerBody; ++j) {
-                                if (was_feature[j] == NoIndex) break; // the sentinel, with nothing to inherit past it
-                                if (was_feature[j] != contact.Feature || was_other[j] != other || was_sub[j] != sub_shape || was_children[j] != children) continue;
-                                inherited[at] = j;
-                                contact.Penalty = clamp(was_penalty[j] * p.Gamma, penalty_floor, float3(p.PenaltyMax));
-                                contact.Lambda = was_lambda[j];
-                                // Static friction: a contact that stayed inside the cone last step keeps the anchor pair it held.
-                                // C0's friction rows then measure the drift since it stuck.
-                                // Recomputed anchors would leave a loaded box creeping every step.
-                                // Not on a curved surface, whose contact sweeps across the material.
-                                // And not where the anchors land on a row this pair already wrote.
-                                // Two contacts that stuck at different times can drift onto each other with all but the same Jacobian and C0.
-                                const float3 want_a = WorldPoint(pose, was_anchor_a[j]);
-                                const float3 want_b = WorldPoint(target_pose, was_anchor_b[j]);
-                                bool onto_another = false;
-                                for (uint k = 0; k < count && !onto_another; ++k) {
-                                    if (k == at || !slots[k].Active || slots[k].BodyB != other || slots[k].SubShape != sub_shape || slots[k].Children != children) continue;
-                                    onto_another = distance(was_anchor_a[j], slots[k].AnchorA) <= weld &&
-                                        distance(was_anchor_b[j], slots[k].AnchorB) <= weld;
+                                    contact.Penalty = penalty_floor;
+                                    contact.Lambda = float3(0);
+                                    contact.Stick = false;
+                                    inherited[at] = NoIndex;
+                                    for (uint j = 0; j < ContactsPerBody; ++j) {
+                                        if (was_feature[j] == NoIndex) break; // the sentinel, with nothing to inherit past it
+                                        if (was_feature[j] != contact.Feature || was_other[j] != other || was_sub[j] != sub_shape || was_sub_a[j] != sub_shape_a || was_children[j] != children) continue;
+                                        inherited[at] = j;
+                                        contact.Penalty = clamp(was_penalty[j] * p.Gamma, penalty_floor, float3(p.PenaltyMax));
+                                        contact.Lambda = was_lambda[j];
+                                        // Static friction: a contact that stayed inside the cone last step keeps the anchor pair it held.
+                                        // C0's friction rows then measure the drift since it stuck.
+                                        // Recomputed anchors would leave a loaded box creeping every step.
+                                        // Not on a curved surface, whose contact sweeps across the material.
+                                        // And not where the anchors land on a row this pair already wrote.
+                                        // Two contacts that stuck at different times can drift onto each other with all but the same Jacobian and C0.
+                                        const float3 want_a = WorldPoint(pose, was_anchor_a[j]);
+                                        const float3 want_b = WorldPoint(target_pose, was_anchor_b[j]);
+                                        bool onto_another = false;
+                                        for (uint k = 0; k < count && !onto_another; ++k) {
+                                            if (k == at || !slots[k].Active || slots[k].BodyB != other || slots[k].Children != children || dot(slots[k].Normal, normal) <= 0.99999f) continue;
+                                            onto_another = distance(was_anchor_a[j], slots[k].AnchorA) <= weld &&
+                                                distance(was_anchor_b[j], slots[k].AnchorB) <= weld;
+                                        }
+                                        for (uint k = i + 1; k < found && !onto_another; ++k)
+                                            onto_another = distance(want_a, points_here[k]) <= weld && distance(want_b, points_there[k]) <= weld;
+                                        if (was_stick[j] && !curved && !onto_another) {
+                                            contact.AnchorA = was_anchor_a[j];
+                                            contact.AnchorB = was_anchor_b[j];
+                                            contact.Stick = true;
+                                        }
+                                        break;
+                                    }
+                                    // Eq. 15: separation in the contact basis, plus the normal row's margin.
+                                    const ContactBasis basis = MakeContactBasis(normal);
+                                    const float3 gap = WorldPoint(pose, contact.AnchorA) - WorldPoint(target_pose, contact.AnchorB);
+                                    contact.C0 = float3(dot(basis.Axis[0], gap), dot(basis.Axis[1], gap), dot(basis.Axis[2], gap)) + float3(p.ContactMargin, 0, 0);
+#endif
+                                    if (at == count) ++count;
                                 }
-                                for (uint k = i + 1; k < found && !onto_another; ++k)
-                                    onto_another = distance(want_a, points_here[k]) <= weld && distance(want_b, points_there[k]) <= weld;
-                                if (was_stick[j] && !curved && !onto_another) {
-                                    contact.AnchorA = was_anchor_a[j];
-                                    contact.AnchorB = was_anchor_b[j];
-                                    contact.Stick = true;
-                                }
-                                break;
                             }
-                            // Eq. 15: separation in the contact basis, plus the normal row's margin.
-                            const ContactBasis basis = MakeContactBasis(normal);
-                            const float3 gap = WorldPoint(pose, contact.AnchorA) - WorldPoint(target_pose, contact.AnchorB);
-                            contact.C0 = float3(dot(basis.Axis[0], gap), dot(basis.Axis[1], gap), dot(basis.Axis[2], gap)) + float3(p.ContactMargin, 0, 0);
-                            if (at == count) ++count;
                         }
                     }
                 }
@@ -2116,13 +2510,29 @@ kernel void CollectContacts(
     }
 
 #if !SENSOR_PASS
+    for (uint k = 0; k < count; ++k) {
+        device Contact &contact = slots[k];
+        uint points = 0;
+        for (uint j = 0; j < count; ++j)
+            points += slots[j].BodyB == contact.BodyB && dot(slots[j].Normal, contact.Normal) > 0.99999f;
+        const uint other = contact.BodyB;
+        float inverse = own_inverse_mass + masses[other].InvMass;
+        if (inverse == 0) {
+            const float3 a = cross(Rotate(pose.Orientation, contact.AnchorA), contact.Normal);
+            const float3 b = cross(Rotate(poses[other].Orientation, contact.AnchorB), contact.Normal);
+            inverse = dot(a, WorldInverseInertia(pose.Orientation, masses[body].InvInertiaLocal) * a) +
+                dot(b, WorldInverseInertia(poses[other].Orientation, masses[other].InvInertiaLocal) * b);
+        }
+        contact.StiffnessScale = PairStiffness(inverse, p.DeltaTime) / float(points);
+        contact.Penalty.x = max(contact.Penalty.x, contact.StiffnessScale);
+    }
     // The events, once the run has settled rather than as each point is written.
     // A contact that lost its place to a deeper one was never held, so it reports no addition and its inherited slot does not count as claimed.
     for (uint k = 0; k < count; ++k) {
         if (inherited[k] != NoIndex) claimed |= 1ul << inherited[k];
-        events[reported++] = ContactEvent{body, slots[k].BodyB, slots[k].Feature, slots[k].SubShape, slots[k].Children, uint(inherited[k] != NoIndex ? ContactPersisted : ContactAdded)};
+        events[reported++] = ContactEvent{body, slots[k].BodyB, slots[k].Feature, slots[k].SubShape, slots[k].Children, uint(inherited[k] != NoIndex ? ContactPersisted : ContactAdded), slots[k].SubShapeA};
     }
-    EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_children);
+    EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
 #endif
 }
 
@@ -2153,13 +2563,30 @@ static float TwistAngle(float4 relative, float3 axis, float near) {
 // With a twist axis it is swing-twist: the two locked rows read the swing's rotation-vector components and the twist row the unwrapped angle.
 // Neither goes near the log map's seam, where every component flips sign at once and the gain collapses.
 // Without a twist axis the whole misalignment is the plain rotation vector, which does reach that seam.
-// Both forms have the same first-order derivative, so the Jacobians are the frame's axes either way.
 static float3 AngularError(float4 relative, uint twist_axis, float unwrapped) {
     if (twist_axis > 2) return RotationVector(relative);
     const float3 axis = UnitAxis(twist_axis);
     float3 error = RotationVector(QuatMul(relative, QuatConjugate(TwistPart(relative, axis))));
     error[twist_axis] = unwrapped; // exactly where the swing has nothing, its axis being perpendicular to this one
     return error;
+}
+
+static float3 TwistGradient(float4 relative, float3 axis, float projected) {
+    const float denominator = relative.w * relative.w + projected * projected;
+    return denominator > 1e-8f ?
+        (relative.w * relative.w * axis + relative.w * cross(relative.xyz, axis) + projected * relative.xyz) / denominator :
+        axis;
+}
+
+static float3 AngularGradient(float4 relative, uint twist_axis, uint row) {
+    const float3 basis = UnitAxis(row);
+    if (twist_axis > 2) return LogGradient(RotationVector(relative), basis);
+    const float3 axis = UnitAxis(twist_axis);
+    const float3 twist_gradient = TwistGradient(relative, axis, dot(relative.xyz, axis));
+    if (row == twist_axis) return twist_gradient;
+    const float4 swing = QuatMul(relative, QuatConjugate(TwistPart(relative, axis)));
+    const float3 gradient = LogGradient(RotationVector(swing), basis);
+    return gradient - twist_gradient * dot(Rotate(swing, axis), gradient);
 }
 
 // Everything a joint's rows are measured from at the pose an iteration has reached.
@@ -2207,10 +2634,11 @@ static AxisSetup JointRowAt(Joint joint, JointMeasure measured, uint row) {
     }
     setup.Lambda = drive ? joint.Drives[row - 6].Lambda : (linear ? joint.LambdaLinear[r] : joint.LambdaAngular[r]);
     setup.Penalty = drive ? joint.Drives[row - 6].Penalty : (linear ? joint.PenaltyLinear[r] : joint.PenaltyAngular[r]);
-    setup.Axis = Rotate(measured.FrameB, UnitAxis(r));
+    const float3 frame_axis = Rotate(measured.FrameB, UnitAxis(r));
+    setup.Axis = linear ? frame_axis : Rotate(measured.FrameB, AngularGradient(measured.Relative, TwistAxis(joint.AngularModes), r));
     setup.Value = linear ? dot(measured.Reach, setup.Axis) : measured.Error[r];
     setup.Began = drive ? joint.Drives[row - 6].Began : (linear ? joint.C0Linear[r] : joint.C0Angular[r]);
-    setup.Moved = linear ? setup.Value - setup.Began : dot(measured.Turned, setup.Axis);
+    setup.Moved = linear ? setup.Value - setup.Began : dot(measured.Turned, frame_axis);
     const uint mask = drive ? 0 : (linear ? joint.LinearLimitAxes[r] : joint.AngularLimitAxes[r]);
     if (mask && (!linear || popcount(mask) > 1)) {
         float3 local = linear ? Rotate(QuatConjugate(measured.FrameB), measured.Reach) : RotationVector(measured.Relative);
@@ -2616,8 +3044,8 @@ kernel void SolveBodies(
     const Pose start = initial[body], target = inertial[body];
     const float inv_dt2 = 1 / (p.DeltaTime * p.DeltaTime);
 
-    float H[Dof][Dof];
-    float g[Dof];
+    float2 H[Dof][Dof];
+    float2 g[Dof];
     for (uint i = 0; i < Dof; ++i) {
         g[i] = 0;
         for (uint j = 0; j < Dof; ++j) H[i][j] = 0;
@@ -2632,28 +3060,29 @@ kernel void SolveBodies(
     const float m = Translates(mass) ? 1 / mass.InvMass : 0;
     const float3 offset = pose.Position - target.Position;
     for (uint i = 0; i < 3; ++i) {
-        H[i][i] = m * inv_dt2;
-        g[i] = m * inv_dt2 * offset[i];
+        H[i][i] = WideMul(float2(m, 0), float2(inv_dt2, 0));
+        g[i] = WideMul(H[i][i], float2(offset[i], 0));
     }
     const float3x3 rotation = QuatToMatrix(pose.Orientation);
     const float3x3 world_inertia = WorldTensor(rotation, heavy);
     const float3 twist = RotationVector(QuatMul(pose.Orientation, QuatConjugate(target.Orientation)));
     const float3 torque = world_inertia * twist * inv_dt2;
     for (uint i = 0; i < 3; ++i) {
-        g[3 + i] = torque[i];
-        for (uint j = 0; j < 3; ++j) H[3 + i][3 + j] = world_inertia[j][i] * inv_dt2;
+        g[3 + i] = float2(torque[i], 0);
+        for (uint j = 0; j < 3; ++j) H[3 + i][3 + j] = WideMul(float2(world_inertia[j][i], 0), float2(inv_dt2, 0));
     }
 
     // Every contact this body is party to, at a cost independent of the body count. See ContactSlot.
     const Adjacency neighbours = incoming[body];
+    bool shared_color = false;
     for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
         const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
         if (slot == NoIndex) continue;
         const Contact contact = contacts[slot];
         const bool mine_is_a = contact.BodyA == body;
+        const Index other = ContactPartner(contact, body);
+        shared_color |= Solved(masses[other], quiet[other], p) && ColorOf(colors[other]) % p.MaxColors == cursor[0];
 
-        // Jacobians are taken at the pose the step began from and held fixed across the sweeps.
-        // The constraint is then a Taylor series rather than a moving target.
         // C is always A minus B.
         const Pose start_a = mine_is_a ? start : initial[contact.BodyA];
         const Pose start_b = mine_is_a ? initial[contact.BodyB] : start;
@@ -2669,15 +3098,17 @@ kernel void SolveBodies(
         const float3 requested = contact.Penalty * constraint + contact.Lambda;
         const float3 force = ContactForce(requested, contact.Friction);
 
-        // Eq. 14's rescaling, held in [0, penalty] to keep H definite for the LDL. See RowForce.
+        // The normal secant stays in [0, penalty] to keep the body block definite.
         float3 stiffness = contact.Penalty;
-        for (uint r = 0; r < 3; ++r) {
-            if (requested[r] == force[r] || abs(constraint[r]) < 1e-9f) continue;
-            stiffness[r] = clamp((force[r] - contact.Lambda[r]) / constraint[r], 0.f, contact.Penalty[r]);
-        }
+        if (requested[0] != force[0] && abs(constraint[0]) >= 1e-9f)
+            stiffness[0] = clamp((force[0] - contact.Lambda[0]) / constraint[0], 0.f, contact.Penalty[0]);
+        // The friction secant is centered at C = -lambda / penalty, where the augmented force vanishes.
+        // Its radial projection scales force and curvature together, including the cached dual.
+        const float tangent = length(requested.yz);
+        if (tangent > 0) stiffness.yz *= min(1.f, abs(force.x) * contact.Friction / tangent);
 
         // The second-order term of Eq. 17 is dropped, as the reference drops it for contacts.
-        for (uint r = 0; r < 3; ++r) AddRow(H, g, basis.Axis[r], arm, side, force[r], stiffness[r]);
+        for (uint r = 0; r < 3; ++r) AddRow(H, g, basis.Axis[r], LogGradient(mine_is_a ? moved_a.Angular : moved_b.Angular, cross(arm, basis.Axis[r])), side, force[r], stiffness[r]);
     }
 
     // Joints, measured at the pose the sweep has reached and keeping the second-order term contacts drop.
@@ -2685,10 +3116,12 @@ kernel void SolveBodies(
         const Joint joint = joints[index];
         if (!joint.Active || (joint.BodyA != body && joint.BodyB != body)) continue;
         const bool mine_is_a = joint.BodyA == body;
+        const Index other_body = mine_is_a ? joint.BodyB : joint.BodyA;
+        shared_color |= Solved(masses[other_body], quiet[other_body], p) && ColorOf(colors[other_body]) % p.MaxColors == cursor[0];
         const Pose other = poses[mine_is_a ? joint.BodyB : joint.BodyA];
         const Pose a = mine_is_a ? pose : other, b = mine_is_a ? other : pose;
         const float side = mine_is_a ? 1 : -1;
-        const float3 arm = Rotate(pose.Orientation, mine_is_a ? joint.AnchorA : joint.AnchorB);
+        float3 arm = Rotate(pose.Orientation, mine_is_a ? joint.AnchorA : joint.AnchorB);
         const BodyMass other_mass = masses[mine_is_a ? joint.BodyB : joint.BodyA];
 
         // What a hard row is stiffened to in post-stabilization, and only there.
@@ -2701,6 +3134,8 @@ kernel void SolveBodies(
 
         // Base and drive rows share one rule. A soft row applies Eq. 7 on its extension, with no dual.
         const JointMeasure measured = MeasureJoint(joint, a, b, initial);
+        // Rotation of B changes the measurement axes and the torque arm to A's anchor.
+        if (!mine_is_a) arm += measured.Reach;
         const float3x3 inverse_inertia = WorldInverseInertia(a.Orientation, masses[joint.BodyA].InvInertiaLocal) +
             WorldInverseInertia(b.Orientation, masses[joint.BodyB].InvInertiaLocal);
 
@@ -2721,23 +3156,21 @@ kernel void SolveBodies(
             float stiffness;
             const float force = RowForce(penalty, setup.Damping / p.DeltaTime, c, damped, lambda, low, high, stiffness);
             if (is_linear) {
-                AddRow(H, g, axis, arm, side, force, stiffness);
+                AddRow(H, g, axis, cross(arm, axis), side, force, stiffness);
                 applied += force * axis;
             } else {
                 // An angular row touches the angular block alone, so it adds no geometric stiffness.
                 for (uint i = 0; i < 3; ++i) {
-                    g[3 + i] += side * axis[i] * force;
-                    for (uint j = 0; j < 3; ++j) H[3 + i][3 + j] += stiffness * axis[i] * axis[j];
+                    g[3 + i] = WideAdd(g[3 + i], WideMul(WideMul(float2(side, 0), float2(axis[i], 0)), float2(force, 0)));
+                    for (uint j = 0; j < 3; ++j) H[3 + i][3 + j] = WideAdd(H[3 + i][3 + j], WideMul(WideMul(float2(stiffness, 0), float2(axis[i], 0)), float2(axis[j], 0)));
                 }
             }
         }
 
         // Sec. 3.5's geometric stiffness, which the reference keeps for joints and drops for contacts.
-        // The arm turns as the body does, so the same force produces a different torque.
-        // d(arm x f)/dtheta is arm (x) f - (arm . f) I, the same matrix whatever axes the rows used.
-        // It is taken once from their summed force and lumped onto the diagonal by column length.
-        const float3x3 geometric = float3x3(arm * applied.x, arm * applied.y, arm * applied.z) - float3x3(dot(arm, applied));
-        for (uint i = 0; i < 3; ++i) H[3 + i][3 + i] += length(geometric[i]);
+        const float3x3 outer = float3x3(arm * applied.x, arm * applied.y, arm * applied.z);
+        const float3x3 geometric = (mine_is_a ? outer : transpose(outer)) - float3x3(dot(arm, applied));
+        for (uint i = 0; i < 3; ++i) H[3 + i][3 + i] = WideAdd(H[3 + i][3 + i], float2(length(geometric[i]), 0));
     }
 
     // And the degrees of freedom this body does not have, now that every row is gathered.
@@ -2753,8 +3186,9 @@ kernel void SolveBodies(
     SolveBlock(H, g, step);
     const float3 linear = float3(step[0], step[1], step[2]), angular = float3(step[3], step[4], step[5]);
     if (!isfinite(linear.x + linear.y + linear.z + angular.x + angular.y + angular.z)) return;
-    pose.Position += linear;
-    pose.Orientation = normalize(QuatMul(QuatFromRotationVector(angular), pose.Orientation));
+    const float relaxation = shared_color ? 0.5f : 1.f;
+    pose.Position += relaxation * linear;
+    pose.Orientation = normalize(QuatMul(QuatFromRotationVector(relaxation * angular), pose.Orientation));
     solved[body] = pose;
 }
 
@@ -2806,11 +3240,16 @@ kernel void UpdateDuals(
     const float3 requested = contact.Penalty * c + contact.Lambda;
     const float3 force = ContactForce(requested, contact.Friction);
     contact.Lambda = force;
-    if (force[0] < 0) contact.Penalty[0] = min(contact.Penalty[0] + p.Beta * abs(c[0]), p.PenaltyMax);
+    // Scale the penalty ramp with supported force.
+    // Closing travel and gravity displacement bound impact scaling; ContactMargin bounds the denominator.
+    const float travel = max(p.ContactMargin, (abs(contact.Approach) + abs(dot(p.Gravity, contact.Normal)) * p.DeltaTime) * p.DeltaTime);
+    const float beta = p.ContactBeta * contact.StiffnessScale;
+    const float normal_beta = p.ContactBeta * max(contact.StiffnessScale, abs(force.x) / max(travel, 1e-9f));
+    if (force[0] < 0) contact.Penalty[0] = min(contact.Penalty[0] + normal_beta * abs(c[0]), p.PenaltyMax);
     const float bound = abs(force[0]) * contact.Friction;
     if (length(float2(requested[1], requested[2])) <= bound) {
-        contact.Penalty[1] = min(contact.Penalty[1] + p.Beta * abs(c[1]), p.PenaltyMax);
-        contact.Penalty[2] = min(contact.Penalty[2] + p.Beta * abs(c[2]), p.PenaltyMax);
+        contact.Penalty[1] = min(contact.Penalty[1] + beta * abs(c[1]), p.PenaltyMax);
+        contact.Penalty[2] = min(contact.Penalty[2] + beta * abs(c[2]), p.PenaltyMax);
         contact.Stick = length(float2(c[1], c[2])) < p.ContactMargin;
     }
 }

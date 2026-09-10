@@ -293,3 +293,97 @@ TEST_CASE_FIXTURE(Reporting, "reporting: force application points account for an
     CHECK(length(angular_impulse - momentum) < 0.01f * length(momentum));
     CHECK(length(momentum) > 0.1f);
 }
+
+TEST_CASE_FIXTURE(Reporting, "planes: body and collider frames carry the surface") {
+    const auto turn = QuatFromRotationVector(float3{0, 0, -std::numbers::pi_v<float> / 2});
+    const Pose surface = ComposePose(At(float3{2, 3, 4}, turn), At(float3{0, 1, 0}));
+    const float3 normal = Rotate(surface.Orientation, float3{0, 1, 0});
+    for (bool compound : {false, true}) {
+        for (bool round : {false, true}) {
+            World w{context};
+            Shape plane = GroundPlane;
+            plane.Local = At(float3{0, 1, 0});
+            Index shape = w.AddShape(plane);
+            if (compound) shape = w.AddCompound(std::vector<Index>{shape});
+            w.AddBody({.Pose = At(float3{2, 3, 4}, turn), .Shape = shape, .Density = 0});
+            const auto body = w.AddBody({.Pose = At(surface.Position + 0.499f * normal), .Shape = w.AddShape(round ? Shape{.Radius = Half, .Kind = ShapeSphere} : UnitBox)});
+            w.TrackContacts = true;
+            solver.Step(w, {.Gravity = {0, 0, 0}});
+            const auto contacts = w.TakeContactChanges();
+            REQUIRE(!contacts.empty());
+            for (const auto &c : contacts) {
+                CHECK(c.A.Slot == body);
+                CHECK(simd::distance(c.Normal, normal) < 1e-4f);
+                const float3 on_plane = c.SideB.InitialPose.Position + Rotate(c.SideB.InitialPose.Orientation, c.SideB.Point);
+                CHECK(std::abs(dot(on_plane - surface.Position, normal)) < 1e-4f);
+            }
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(Reporting, "planes: a double-sided surface supports either side") {
+    for (float side : {-1.f, 1.f}) {
+        World w{context};
+        Shape plane = GroundPlane;
+        plane.DoubleSided = true;
+        w.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = w.AddShape(plane)});
+        const auto body = w.AddBody({.Pose = At(float3{0, 2 + side * Half, 0}), .Shape = w.AddShape({.Radius = Half, .Kind = ShapeSphere}), .Density = 1});
+        for (int step = 0; step < 60; ++step) solver.Step(w, {.Gravity = {0, -side * 9.81f, 0}});
+        CHECK(w.Poses[body].Position.y == doctest::Approx(2 + side * Half).epsilon(0.001));
+        CHECK(length(w.Velocities[body].Linear) < 0.01f);
+    }
+}
+
+TEST_CASE_FIXTURE(Reporting, "compounds: the root collider frame reaches both sides of collision") {
+    for (bool moving : {false, true}) {
+        World w{context};
+        w.TrackContacts = true;
+        const auto box = w.AddShape({.HalfExtents = {0.5f, 1, 1.5f}, .Kind = ShapeBox});
+        Pose cooked;
+        const auto compound = w.AddCompound(std::vector<Index>{box}, &cooked);
+        const auto rotation = QuatFromRotationVector(float3{0, 0, std::numbers::pi_v<float> / 2});
+        w.Shapes[compound].Local = ComposePose(At(float3{2, 3, 0}, rotation), cooked);
+        const auto body = w.AddBody({.Shape = compound, .Mass = moving ? AuthoredMass{1, {1, 1, 1}} : AuthoredMass{0, {0, 0, 0}}});
+        Index other;
+        if (moving) {
+            other = w.AddBody({.Pose = At(float3{0, 2.5f, 0}), .Shape = w.AddShape(GroundPlane)});
+        } else {
+            other = w.AddBody({.Pose = At(float3{2, 3.999f, 0}), .Shape = w.AddShape({.Radius = Half, .Kind = ShapeSphere})});
+        }
+        solver.Step(w, {.Gravity = {0, 0, 0}});
+        const auto events = w.TakeContactChanges();
+        REQUIRE(!events.empty());
+        for (const auto &event : events) {
+            CHECK(event.A.Slot == (moving ? body : other));
+            CHECK(simd::distance(event.Normal, float3{0, 1, 0}) < 1e-4f);
+            const auto &on = moving ? event.SideA : event.SideB;
+            const float3 point = on.InitialPose.Position + Rotate(on.InitialPose.Orientation, on.Point);
+            CHECK(point.y == doctest::Approx(moving ? 2.5f : 3.5f).epsilon(1e-4));
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(Reporting, "meshes: double-sided surfaces keep one winding and preserve seams") {
+    const float3 points[]{{-4, 0, -4}, {-4, 0, 4}, {4, 0, 4}, {4, 0, -4}};
+    const std::vector<uint32_t> indices{0, 1, 2, 0, 2, 3};
+    for (float side : {-1.f, 1.f}) {
+        World w{context};
+        const auto mesh = w.AddMesh(points, indices);
+        w.Shapes[mesh].DoubleSided = true;
+        const auto target = side < 0 ? w.AddCompound(std::vector<Index>{mesh}) : mesh;
+        w.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = target, .Friction = 0});
+        const auto box = w.AddBody({.Pose = At(float3{-0.5f, 2 + side * Half, 0}), .Velocity = {.Linear = {0.5f, 0, 0}}, .Shape = w.AddShape(UnitBox), .Density = 1, .Friction = 0});
+        w.TrackContacts = true;
+        for (int step = 0; step < 120; ++step) {
+            solver.Step(w, {.Gravity = {0, -side * 9.81f, 0}});
+            for (const auto &c : w.TakeContactChanges()) {
+                if (c.Kind == ContactRemoved) continue;
+                CHECK(dot(c.Normal, float3{0, side, 0}) > 0.99f);
+            }
+        }
+        CHECK(w.Poses[box].Position.y == doctest::Approx(2 + side * Half).epsilon(0.001));
+        CHECK(w.Poses[box].Position.x == doctest::Approx(0.5f).epsilon(0.02));
+        CHECK(w.Velocities[box].Linear.x == doctest::Approx(0.5f).epsilon(0.02));
+        CHECK(w.Shapes[mesh].TriangleCount == 2);
+    }
+}

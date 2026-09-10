@@ -4,16 +4,14 @@
 
 namespace rbp {
 
-// The AVBD parameters, at the reference implementation's defaults except for Beta, which this engine's mass scale moves.
-// Penalties are absolute rather than scaled to a body's mass, and Beta ramps them from PenaltyMin in proportion to the constraint violation.
 struct StepSettings {
     float3 Gravity{0, -9.81f, 0};
     float DeltaTime = 1.f / 60;
     uint32_t Iterations = 10;
-    // Penalty ramp per unit of violation, dependent on the length and mass scales in use, as the reference warns.
-    // A penalty held at a body's inertial stiffness m/h^2 leaves a standing error |C| = (m/h^2)(1 - Gamma)/(Iterations Beta).
-    // A thousandfold heavier body therefore needs a hundredfold larger ramp for the same sag, hence 1e7 here against the reference's 1e5.
+    // Absolute joint penalty ramp per unit of linear or angular violation.
     float Beta = 1e7f;
+    // Contact ramp per metre of violation, scaled by inertial stiffness and sustained load.
+    float ContactBeta = 10;
     float Gamma = 0.99f; // the fraction of a penalty carried into the next step
     float PenaltyMin = 1;
     float PenaltyMax = 1e9f;
@@ -61,6 +59,7 @@ private:
     // Any other change to a step changes only the contents of the buffers it binds.
     struct Recording {
         uint32_t Bodies{}, Joints{}, Iterations{}, Colors{}, ColoringPasses{};
+        uint32_t ColliderFeatures{};
     };
 
     // The kernels of a step, in the order of the pipeline table in Solver.cpp.
@@ -87,11 +86,17 @@ private:
         SpreadWakingPass,
         PublishWakingPass,
         SensorPass,
+        BoundedCollectPass,
+        BoundedSensorPass,
+        MeshCollectPass,
+        MeshSensorPass,
+        FullCollectPass,
+        FullSensorPass,
         PassCount,
     };
 
     void Encode(const Recording &, World &);
-    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads) const;
+    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads);
 
     const mtl::Context &Context;
     NS::SharedPtr<MTL::ComputePipelineState> Pipelines[PassCount];

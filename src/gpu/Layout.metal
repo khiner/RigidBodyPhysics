@@ -8,6 +8,7 @@ kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_positio
     REPORT(Velocity)
     REPORT(BodyMass)
     REPORT(Shape)
+    REPORT(Triangle)
     REPORT(Material)
     REPORT(JointDrive)
     REPORT(Filter)

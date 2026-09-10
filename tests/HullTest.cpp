@@ -4,6 +4,7 @@
 #include "Hull.h"
 #include "Shapes.h"
 #include "World.h"
+#include "fixtures/WaterWheelSign.h"
 
 #include <algorithm>
 #include <cmath>
@@ -298,5 +299,22 @@ TEST_CASE("a cooked hull says where its frame sits in the one its points arrived
     for (uint32_t corner = 0; corner < 8; ++corner) {
         const float3 there = LocalPoint(cooked.Frame, points[corner]);
         CHECK(NearestTo(there, cooked.Vertices) < 1e-4f);
+    }
+}
+
+TEST_CASE("simplification inserts each nearly collinear input corner once") {
+    const auto cooked = CookHull(WaterWheelSignPoints);
+    REQUIRE(!cooked.Vertices.empty());
+    CHECK(cooked.Vertices.size() <= MaxHullVertices);
+    CHECK(std::isfinite(cooked.Volume));
+    CHECK(cooked.Volume > 0);
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(std::isfinite(cooked.Inertia[axis]));
+        CHECK(cooked.Inertia[axis] > 0);
+    }
+    CheckFaces(cooked);
+    for (auto point : WaterWheelSignPoints) {
+        const auto local = LocalPoint(cooked.Frame, point);
+        for (const auto &face : cooked.Faces) CHECK(dot(face.Normal, local) <= face.Offset + cooked.Tolerance + 2e-6f);
     }
 }

@@ -299,6 +299,25 @@ TEST_CASE_FIXTURE(OneWorld, "a body wearing an offset shape is refused unless th
     CHECK(world.Masses[body].InvMass == doctest::Approx(0.5f));
 }
 
+TEST_CASE_FIXTURE(OneWorld, "a single-child compound preserves its mass frame exactly") {
+    const Pose local = At(float3{0.2f, -0.15f, 0.1f}, QuatFromRotationVector(float3{0.3f, 0.5f, -0.2f}));
+    const Shape piece{.HalfExtents = {0.3f, 0.4f, 0.5f}, .Kind = ShapeBox, .Local = local};
+    const Index child = world.AddShape(piece);
+    Pose frame{};
+    const Index compound = world.AddCompound(std::vector<Index>{child}, &frame);
+    REQUIRE(compound != NoIndex);
+    CHECK(simd::all(frame.Position == local.Position));
+    CHECK(simd::all(frame.Orientation == local.Orientation));
+    const Pose inside = world.Shapes[world.Child(compound, 0)].Local;
+    CHECK(simd::all(inside.Position == IdentityPose.Position));
+    CHECK(simd::all(inside.Orientation == IdentityPose.Orientation));
+    for (const float density : {0.001f, 1.f, 1000.f}) {
+        const BodyMass bare = MassProperties(piece, density), wrapped = MassOf(world, compound, density);
+        CHECK(bare.InvMass == wrapped.InvMass);
+        CHECK(simd::all(bare.InvInertiaLocal == wrapped.InvInertiaLocal));
+    }
+}
+
 // A compound is the hull cook's arithmetic over children, so the same closed forms apply.
 TEST_CASE_FIXTURE(OneWorld, "a solid described in two halves weighs what the solid weighs") {
     std::vector<Index> halves;

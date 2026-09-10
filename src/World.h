@@ -161,7 +161,8 @@ struct ContactSide {
 struct ContactChange {
     BodyId A, B;
     uint32_t Feature = 0; // identifies the geometry the point came from, stable while the contact persists
-    Index SubShape = NoIndex; // which triangle of a mesh, NoIndex for a shape that is one piece
+    Index SubShape = NoIndex;
+    Index SubShapeA = NoIndex;
     uint64_t Children = 0; // and which leaf of each compound, packed as Contact::Children is
     ContactEventKind Kind = ContactAdded;
     // The force each row is applying, in the contact's own basis: the normal row first, then the two friction rows.
@@ -181,7 +182,7 @@ struct ContactChange {
     float NominalArea = 0, NominalExtent = 0;
 
     ContactManifold Manifold() const {
-        return A.Slot < B.Slot ? ContactManifold{A, B, OwnChild(Children), OtherChild(Children), NoIndex, SubShape} : ContactManifold{B, A, OtherChild(Children), OwnChild(Children), SubShape, NoIndex};
+        return A.Slot < B.Slot ? ContactManifold{A, B, OwnChild(Children), OtherChild(Children), SubShapeA, SubShape} : ContactManifold{B, A, OtherChild(Children), OwnChild(Children), SubShape, SubShapeA};
     }
     // AVBD constraint force in newtons, including support. B receives its negative.
     float3 ForceOnA() const {
@@ -305,7 +306,7 @@ struct World {
 
     // Adds refused because a pool was full, a scene sizing problem rather than a runtime one.
     struct Overflows {
-        uint32_t Bodies{}, Shapes{}, Joints{}, Jointed{}, ShapeVertices{}, HullFaces{}, Triangles{}, BvhNodes{}, CompoundChildren{};
+        uint32_t Bodies{}, Shapes{}, Joints{}, ShapeVertices{}, HullFaces{}, Triangles{}, BvhNodes{}, CompoundChildren{};
     };
     Overflows Overflow{};
 
@@ -332,7 +333,7 @@ struct World {
     Index Child(Index compound, uint32_t i) const { return ChildOf(Shapes[compound], i, CompoundChildren.All().data()); }
     mtl::Buffer<Material> Materials;
     mtl::Buffer<Filter> Filters;
-    mtl::Buffer<Index> Jointed; // JointsPerBody slots per body, NoIndex past the end of the run
+    mtl::Buffer<Index> Jointed; // Body offsets precede two partner indices per collision-suppressing joint.
 
     // Solver state, per body and per contact slot, named for the algorithm.
     // Kept with everything else the GPU addresses, being indexed the same way and living exactly as long.
@@ -345,6 +346,7 @@ struct World {
     mtl::Buffer<uint32_t> Colors, NextColors; // kept across steps, since the coloring is incremental
     mtl::Buffer<Contact> Contacts;
     // Allocated on first sensor step. One point per overlapping leaf pair, separate from solid contacts.
+    // Only Active, pair identity, Feature and C0.x are populated.
     mtl::Buffer<Contact> SensorContacts;
     mtl::Buffer<uint32_t> SensorRefusals;
     std::span<const SensorOverlap> Overlaps() const { return SensorOverlaps; }
@@ -410,9 +412,7 @@ private:
     // A compound removing its own children requires skipping those checks.
     void ReleaseShape(Index);
 
-    // The slots naming the bodies this one is jointed to, and so does not collide with.
-    // A fixed run per body, filled at the first gap and cleared back to a gap, because the kernel reading it sweeps the whole run.
-    std::span<Index> JointedRun(Index body) const { return Jointed.All().subspan(body * JointsPerBody, JointsPerBody); }
+    void RebuildJointed();
 
     uint32_t NumBodies{}, NumShapes{}, NumJoints{};
     RunPool VertexPool, FacePool, TrianglePool, NodePool, ChildPool;

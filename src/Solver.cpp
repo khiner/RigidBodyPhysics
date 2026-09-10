@@ -29,6 +29,30 @@ uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
     return std::clamp(used + 1, 1u, std::min(settings.MaxColors, MaxSupportedColors));
 }
 
+constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2;
+
+uint32_t ColliderFeatures(const World &world) {
+    uint32_t features = 0;
+    bool mesh_seen = false;
+    for (Index body = 0; body < world.BodyCount(); ++body) {
+        const Index root = world.BodyShapes[body];
+        if (root == NoIndex) continue;
+        const Shape &shape = world.Shapes[root];
+        bool mesh = shape.Kind == ShapeMesh;
+        features |= IsBoundedPlane(shape) ? BoundedPlanes : 0u;
+        if (shape.Kind == ShapeCompound)
+            for (uint32_t leaf = 0; leaf < shape.VertexCount; ++leaf) {
+                const Shape &child = world.Shapes[world.Child(root, leaf)];
+                features |= IsBoundedPlane(child) ? BoundedPlanes : 0u;
+                mesh |= child.Kind == ShapeMesh;
+            }
+        if (mesh && mesh_seen) features |= MeshPairs;
+        mesh_seen |= mesh;
+        if (features == (BoundedPlanes | MeshPairs)) break;
+    }
+    return features;
+}
+
 // The kernel each pass runs, in the order of Solver::Pass.
 // A prefix supplies a #define when one kernel text is compiled more than one way.
 constexpr struct {
@@ -36,7 +60,7 @@ constexpr struct {
     std::string_view Prefix;
 } Kernels[]{
     {"Integrate"},
-    {"CollectContacts"},
+    {"CollectContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0"},
     {"CountIncoming"},
     {"ScanIncoming"},
     {"FillIncoming"},
@@ -56,13 +80,20 @@ constexpr struct {
     {"CountQuiet"},
     {"SpreadWaking"},
     {"PublishWaking"},
+    {"CollectSensorContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
+    {"CollectContacts", "#define MESH_PAIRS 0"},
+    {"CollectSensorContacts", "#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
+    {"CollectContacts", "#define BOUNDED_PLANES 0"},
+    {"CollectSensorContacts", "#define BOUNDED_PLANES 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
+    {"CollectContacts"},
     {"CollectSensorContacts", "#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
 };
 } // namespace
 
 Solver::Solver(const mtl::Context &context) : Context(context) {
     static_assert(std::size(Kernels) == PassCount, "one kernel per pass, in the enum's order");
-    for (uint32_t pass = 0; pass < PassCount; ++pass)
+    // Additional collider specializations compile lazily when a world first uses them.
+    for (uint32_t pass = 0; pass < BoundedCollectPass; ++pass)
         Pipelines[pass] = context.Pipeline(gpu::SolveSource, Kernels[pass].Name, Kernels[pass].Prefix);
 
     NS::Error *error{};
@@ -91,12 +122,14 @@ Solver::~Solver() {
     mtl::Drain(Context.Queue.get()); // see mtl::Drain
 }
 
-void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads) const {
+void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads) {
+    if (!Pipelines[pass]) Pipelines[pass] = Context.Pipeline(gpu::SolveSource, Kernels[pass].Name, Kernels[pass].Prefix);
     MTL::ComputePipelineState *pipeline = Pipelines[pass].get();
     // Every pass reads the previous pass's writes, so every dispatch takes a barrier.
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     encoder->setComputePipelineState(pipeline);
-    const auto group = std::min<uint32_t>(threads, pipeline->maxTotalThreadsPerThreadgroup());
+    const bool per_body = pass == CollectPass || pass == SensorPass || pass >= BoundedCollectPass || pass == SolvePass || pass == StabilizePass;
+    const auto group = std::min<uint32_t>(threads, per_body ? 8u : pipeline->maxTotalThreadsPerThreadgroup());
     encoder->dispatchThreads({threads, 1, 1}, {group, 1, 1});
 }
 
@@ -107,11 +140,13 @@ void Solver::Step(World &world, const StepSettings &settings) {
     const uint32_t joints = world.JointCount();
     // A scene using two colors would otherwise spend most of a step's dispatches on six empty color passes.
     const uint32_t colors = ColorsNeeded(world, settings);
+    const uint32_t collider_features = ColliderFeatures(world);
 
     Params[0] = {
         .Gravity = settings.Gravity,
         .DeltaTime = settings.DeltaTime,
         .Beta = settings.Beta,
+        .ContactBeta = settings.ContactBeta,
         .Gamma = settings.Gamma,
         .PenaltyMin = settings.PenaltyMin,
         .PenaltyMax = settings.PenaltyMax,
@@ -165,7 +200,7 @@ void Solver::Step(World &world, const StepSettings &settings) {
     static_assert(sizeof(bindings) / sizeof(bindings[0]) == BindingCount, "one address per slot the table holds");
     for (uint32_t slot = 0; slot < BindingCount; ++slot) Table->setAddress(bindings[slot], slot);
 
-    Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses}, world);
+    Encode({.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses, .ColliderFeatures = collider_features}, world);
 
     // Queue signalling publishes the GPU's writes to the host safely, per Architecture.md.
     const MTL4::CommandBuffer *list[]{Commands.get()};
@@ -197,7 +232,8 @@ void Solver::Encode(const Recording &recording, World &world) {
     Dispatch(encoder, IntegratePass, bodies);
     // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from, before WarmStart moves the body to its starting guess.
     // This is the reference's order, and the only one that expands the Taylor series about the pose the constraint was measured at.
-    Dispatch(encoder, CollectPass, bodies);
+    constexpr Pass collectors[]{CollectPass, BoundedCollectPass, MeshCollectPass, FullCollectPass};
+    Dispatch(encoder, collectors[recording.ColliderFeatures], bodies);
     // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
     Dispatch(encoder, CountIncomingPass, slots);
     Dispatch(encoder, ScanIncomingPass, 1);
@@ -237,7 +273,8 @@ void Solver::Encode(const Recording &recording, World &world) {
         world.EnsureSensorBuffers();
         Table->setAddress(world.SensorContacts.Address(), 5);
         Table->setAddress(world.SensorRefusals.Address(), 26);
-        Dispatch(encoder, SensorPass, bodies);
+        constexpr Pass sensor_collectors[]{SensorPass, BoundedSensorPass, MeshSensorPass, FullSensorPass};
+        Dispatch(encoder, sensor_collectors[recording.ColliderFeatures], bodies);
     }
 
     encoder->endEncoding();

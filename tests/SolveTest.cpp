@@ -107,7 +107,7 @@ void CheckManifolds(const World &world) {
         for (uint32_t i = 0; i < ContactsPerBody; ++i) {
             if (!slots[i].Active) continue;
             for (uint32_t j = i + 1; j < ContactsPerBody; ++j) {
-                if (!slots[j].Active || slots[j].BodyB != slots[i].BodyB || slots[j].SubShape != slots[i].SubShape) continue;
+                if (!slots[j].Active || slots[j].BodyB != slots[i].BodyB || dot(slots[j].Normal, slots[i].Normal) <= 0.99999f) continue;
                 // WeldManifold's own scale, so the check is no stricter than the kernel.
                 const float apart = 1e-3f * std::max(ShapeReach(world, world.BodyShapes[body]), ShapeReach(world, world.BodyShapes[slots[i].BodyB])) + 1e-6f;
                 const float here = simd::distance(ContactPoint(world, slots[i], true), ContactPoint(world, slots[j], true));
@@ -142,12 +142,12 @@ float NormalForce(const World &world, Index body) {
 
 // Every active contact, keyed the way warm starting keys them.
 // The leaf pair is part of the key because two children of one compound can share a feature against the same partner.
-using ContactKeySet = std::set<std::tuple<Index, Index, uint32_t, uint64_t>>;
+using ContactKeySet = std::set<std::tuple<Index, Index, Index, Index, uint32_t, uint64_t>>;
 
 ContactKeySet ContactKeys(const World &world) {
     ContactKeySet keys;
     for (const Contact &contact : world.Contacts.All())
-        if (contact.Active) keys.emplace(contact.BodyA, contact.BodyB, contact.Feature, contact.Children);
+        if (contact.Active) keys.emplace(contact.BodyA, contact.BodyB, contact.SubShapeA, contact.SubShape, contact.Feature, contact.Children);
     return keys;
 }
 
@@ -1224,6 +1224,36 @@ TEST_CASE_FIXTURE(OnDevice, "a hinge released past the half turn swings through 
     CHECK(off_the_arm < 5e-3f);
 }
 
+TEST_CASE_FIXTURE(OnDevice, "reducing a resting contact load releases its cached friction force") {
+    World world{context};
+    AddGround(world, {.Friction = 1});
+    const auto box = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = world.AddShape(UnitBox), .Mass = AuthoredMass{.Mass = 1, .Inertia = {0, 0, 0}}, .Friction = 1});
+    StepSettings settings{.Gravity = {400, -1000, 0}, .SleepSteps = ~0u};
+    for (uint32_t step = 0; step < 120; ++step) solver.Step(world, settings);
+    REQUIRE(simd::length(world.Velocities[box].Linear) < 0.01f);
+    settings.Gravity = {0, -100, 0};
+    for (uint32_t step = 0; step < 20; ++step) {
+        solver.Step(world, settings);
+        CHECK(std::abs(world.Velocities[box].Linear.x) < 0.01f);
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "a stiff hinge preserves a light rotor's free angular motion") {
+    World world{context};
+    const auto frame = QuatFromRotationVector(float3{0.4f, 0.7f, -0.2f});
+    const auto axis = Rotate(frame, float3{0, 0, 1});
+    const auto rotor = world.AddBody({.Velocity = {.Angular = axis}, .Mass = AuthoredMass{.Mass = 0.001f, .Inertia = {1e-8f, 1e-8f, 1e-8f}}});
+    const auto axle = world.AddBody({});
+    REQUIRE(world.AddJoint({.BodyA = rotor, .BodyB = axle, .Frame = frame, .Angular = {AxisLocked, AxisLocked, AxisFree}}) != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}, .DeltaTime = 1.f / 240, .PenaltyMin = 1e7f, .PenaltyMax = 1e7f};
+    for (uint32_t step = 0; step < 240; ++step) {
+        solver.Step(world, settings);
+        REQUIRE(simd::length(world.Velocities[rotor].Angular - axis) < 0.01f);
+    }
+    const auto expected = QuatFromRotationVector(axis);
+    CHECK(simd::length(RotationVector(QuatMul(world.Poses[rotor].Orientation, QuatConjugate(expected)))) < 0.01f);
+}
+
 TEST_CASE_FIXTURE(OnDevice, "a driven hinge turns twenty revolutions on a tilted axle and reports every one") {
     // Twenty turns is twenty times past the half turn a quaternion can represent.
     // The joint accumulates the twist a step at a time, so the value climbs rather than folding back.
@@ -1814,6 +1844,39 @@ TEST_CASE_FIXTURE(OnDevice, "a joint between two moving bodies gives each what i
         CHECK(simd::length(ended.Linear - began.Linear) < 1e-3f * simd::length(began.Linear));
         CHECK(drift < 1);
     }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "a stiff joint remains stable when its bodies share a solve color") {
+    World world{context};
+    const AuthoredMass mass{.Mass = 1, .Inertia = {0, 0, 0}};
+    const auto a = world.AddBody({.Pose = At(float3{-0.5f, 0, 0}), .Velocity = {.Linear = {0.5f, 0, 0}}, .Mass = mass});
+    const auto b = world.AddBody({.Pose = At(float3{0.5f, 0, 0}), .Velocity = {.Linear = {-0.5f, 0, 0}}, .Mass = mass});
+    REQUIRE(world.AddJoint({.BodyA = a, .BodyB = b, .Linear = {AxisLocked, AxisFree, AxisFree}}) != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}, .PenaltyMin = 1e6f, .PenaltyMax = 1e6f, .MaxColors = 1};
+    for (uint32_t step = 0; step < 20; ++step) {
+        solver.Step(world, settings);
+        REQUIRE(simd::length(world.Velocities[a].Linear) < 1);
+        REQUIRE(simd::length(world.Velocities[b].Linear) < 1);
+        CHECK(simd::length(world.Poses[a].Position + world.Poses[b].Position) < 1e-5f);
+        CHECK(std::abs(world.Poses[b].Position.x - world.Poses[a].Position.x - 1) < 0.01f);
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "a slider spring transfers torque to its moving reference frame") {
+    World world{context};
+    const auto a = world.AddBody({.Pose = At(float3{1, 1, 0}), .Mass = AuthoredMass{}});
+    const auto b = world.AddBody({.Mass = AuthoredMass{}});
+    REQUIRE(world.AddJoint({.BodyA = a, .BodyB = b, .AtA = float3{1, 1, 0}, .AtB = float3{0, 0, 0}, .Linear = {AxisFree, AxisLocked, AxisFree}, .LinearStiffness = {0, 1, 0}}) != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}, .DeltaTime = 0.01f};
+    solver.Step(world, settings);
+    CHECK(std::abs(world.Velocities[a].Linear.y + settings.DeltaTime) < 0.01f * settings.DeltaTime);
+    CHECK(std::abs(world.Velocities[b].Angular.z - settings.DeltaTime) < 0.01f * settings.DeltaTime);
+    const float3 momentum = world.Velocities[a].Linear + world.Velocities[b].Linear;
+    const float3 angular = simd::cross(world.Poses[a].Position, world.Velocities[a].Linear) +
+        simd::cross(world.Poses[b].Position, world.Velocities[b].Linear) +
+        world.Velocities[a].Angular + world.Velocities[b].Angular;
+    CHECK(simd::length(momentum) < 1e-5f);
+    CHECK(simd::length(angular) < 1e-5f);
 }
 
 TEST_CASE_FIXTURE(OnDevice, "a joint stops its two bodies colliding, unless it is asked not to") {
@@ -2419,6 +2482,32 @@ TEST_CASE_FIXTURE(OneWorld, "a slot is not handed out again until a step has rep
     CHECK(world.Alive(later));
 }
 
+TEST_CASE_FIXTURE(OneWorld, "all joint partners remain excluded when one body has many joints") {
+    const auto hub = world.AddBody({.Shape = world.AddShape({.HalfExtents = {30, 1, 1}, .Kind = ShapeBox})});
+    const auto shape = world.AddShape({.HalfExtents = {0.25f, 0.25f, 0.25f}, .Kind = ShapeBox});
+    std::vector<Index> joints;
+    Index last = NoIndex;
+    for (uint32_t i = 0; i < 24; ++i) {
+        last = world.AddBody({.Pose = At(float3{float(i) - 12, 0, 0}), .Shape = shape, .Density = 0});
+        joints.push_back(world.AddJoint({.BodyA = hub, .BodyB = last, .Linear = {AxisFree, AxisFree, AxisFree}}));
+        REQUIRE(joints.back() != NoIndex);
+    }
+    const auto duplicate = world.AddJoint({.BodyA = hub, .BodyB = last, .Linear = {AxisFree, AxisFree, AxisFree}});
+    REQUIRE(duplicate != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}};
+    solver.Step(world, settings);
+    CHECK(ActiveContacts(world, hub) == 0);
+    CHECK(simd::length(world.Poses[hub].Position) == 0);
+    REQUIRE(world.RemoveJoint(joints.back()));
+    solver.Step(world, settings);
+    CHECK(ActiveContacts(world, hub) == 0);
+    REQUIRE(world.RemoveJoint(duplicate));
+    solver.Step(world, settings);
+    REQUIRE(ActiveContacts(world, hub) > 0);
+    for (const auto &contact : Slots(world, hub))
+        if (contact.Active) CHECK(contact.BodyB == last);
+}
+
 TEST_CASE_FIXTURE(OneWorld, "a retired joint stops holding, and lets its bodies collide again") {
     // A joint suppresses contacts between its bodies, so retiring it clears that entry from both runs and the two collide again.
     const StepSettings settings{.Gravity = {0, 0, 0}}; // so the only force in the scene is the contact
@@ -2434,8 +2523,8 @@ TEST_CASE_FIXTURE(OneWorld, "a retired joint stops holding, and lets its bodies 
         REQUIRE(world.RemoveJoint(joint));
         CHECK(!world.RemoveJoint(joint)); // a second removal reports failure
         CHECK(world.JointCount() == 0); // the slot is freed, and it was the last joint
-        CHECK(world.Jointed[hanging * JointsPerBody] == NoIndex);
-        CHECK(world.Jointed[anchor * JointsPerBody] == NoIndex);
+        CHECK(world.Jointed[hanging] == world.Jointed[hanging + 1]);
+        CHECK(world.Jointed[anchor] == world.Jointed[anchor + 1]);
         Run(solver, world, 200, settings);
         CHECK(world.Poses[hanging].Position.x > 1 - MaxPenetration); // pushed out to where it touches
     }
@@ -2443,7 +2532,7 @@ TEST_CASE_FIXTURE(OneWorld, "a retired joint stops holding, and lets its bodies 
     SUBCASE("or with the body it held") {
         REQUIRE(world.RemoveBody(hanging));
         CHECK(world.JointCount() == 0); // a joint to a body that is gone would hold the other end to nothing
-        CHECK(world.Jointed[anchor * JointsPerBody] == NoIndex);
+        CHECK(world.Jointed[anchor] == world.Jointed[anchor + 1]);
     }
 }
 
@@ -3251,6 +3340,21 @@ Index RidgeMesh(World &world, float extent, float height) {
 }
 } // namespace
 
+TEST_CASE_FIXTURE(OnDevice, "a mesh contact recovers penetration deeper than the speculative reach") {
+    for (const uint32_t side : {0u, 1u, 8u}) {
+        CAPTURE(side);
+        World world{context};
+        AddFloor(world, side, 0, 0);
+        const auto box = world.AddBody({.Pose = At(float3{0.13f, Half - 0.01f, 0.07f}), .Shape = world.AddShape(UnitBox), .Friction = 0});
+        StepSettings settings{.DeltaTime = 1.f / 240, .SleepSteps = ~0u};
+        solver.Step(world, settings);
+        CHECK(Rest(world, box).Contacts == 4);
+        for (uint32_t step = 0; step < 120; ++step) solver.Step(world, settings);
+        CHECK(std::abs(world.Poses[box].Position.y - Half) < 0.001f);
+        CHECK(simd::length(world.Velocities[box].Linear) < 0.001f);
+    }
+}
+
 TEST_CASE_FIXTURE(OnDevice, "a floor of triangles holds a box exactly where a plane does") {
     // Off the grid lines on purpose, since a corner exactly on a seam is a knife edge with a test of its own.
     const auto drop = [&](uint32_t side) {
@@ -3268,6 +3372,45 @@ TEST_CASE_FIXTURE(OnDevice, "a floor of triangles holds a box exactly where a pl
         CHECK(settled.Contacts == 4);
         CHECK(settled.Normal.y == doctest::Approx(1).epsilon(1e-4));
     }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "overlapping mesh triangles do not duplicate support or consume contact capacity") {
+    const float3 points[]{{-3, 0, -3}, {0, 0, 3}, {3, 0, -3}};
+    std::vector<uint32_t> indices;
+    for (uint32_t triangle = 0; triangle < 12; ++triangle) indices.insert(indices.end(), {0, 1, 2});
+    world.AddBody({.Shape = world.AddMesh(points, indices), .Density = 0});
+    const auto box = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = world.AddShape(UnitBox)});
+    world.TrackContacts = true;
+    for (uint32_t step = 0; step < 180; ++step) {
+        solver.Step(world);
+        REQUIRE(ActiveContacts(world, box) == ManifoldPoints);
+        REQUIRE(world.ContactRefusals[box] == 0);
+    }
+    CheckResting(world.Poses[box].Position.y);
+    CHECK(simd::length(world.Velocities[box].Linear) < 1e-3f);
+    float load = 0;
+    for (const auto &contact : Slots(world, box))
+        if (contact.Active) load -= contact.Lambda.x * contact.Normal.y;
+    CHECK(load == doctest::Approx(Gravity / world.Masses[box].InvMass).epsilon(0.01));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "coincident mesh contact points retain distinct surface normals") {
+    const float3 points[]{{-3, 0, -3}, {0, 0, 3}, {3, 0, -3}, {0, -3, -3}, {0, 3, -3}};
+    world.AddBody({.Shape = world.AddMesh(points, std::vector<uint32_t>{0, 1, 2, 3, 4, 1}), .Density = 0});
+    const auto box = world.AddBody({.Pose = At(float3{Half, Half, 0}), .Shape = world.AddShape(UnitBox)});
+    const StepSettings settings{.Gravity = {-Gravity, -Gravity, 0}};
+    for (uint32_t step = 0; step < 180; ++step) {
+        solver.Step(world, settings);
+        REQUIRE(ActiveContacts(world, box) == 2 * ManifoldPoints);
+        CheckManifolds(world);
+    }
+    float3 load{0, 0, 0};
+    for (const auto &contact : Slots(world, box))
+        if (contact.Active) load -= contact.Lambda.x * contact.Normal;
+    CHECK(load.x == doctest::Approx(Gravity / world.Masses[box].InvMass).epsilon(0.01));
+    CHECK(load.y == doctest::Approx(Gravity / world.Masses[box].InvMass).epsilon(0.01));
+    CHECK(world.Poses[box].Position.x == doctest::Approx(Half).epsilon(0.005));
+    CHECK(world.Poses[box].Position.y == doctest::Approx(Half).epsilon(0.005));
 }
 
 TEST_CASE_FIXTURE(OnDevice, "a ridge is an edge a body rests on and crosses, not one it catches on") {
@@ -3575,28 +3718,437 @@ TEST_CASE_FIXTURE(OneWorld, "a mesh body moves only where the host says what it 
     CHECK(world.Poses[moving].Position.y < 4 - 0.5f);
 }
 
-TEST_CASE_FIXTURE(OneWorld, "a moving mesh rests on a box, and a plane holds it nothing") {
-    // A pair is owned by a body that presents a manifold, and neither a plane nor a mesh presents one.
-    // A mesh against a plane has no owner and no contact, so a moving mesh needs a box to rest on.
+TEST_CASE_FIXTURE(OneWorld, "a plane strip supports spanning bodies and remains unbounded along its length") {
+    const auto floor = world.AddBody({.Shape = world.AddShape({.HalfExtents = {0.3f, 0, 0}, .Normal = {0, 1, 0}, .Kind = ShapePlane}), .Density = 0});
+    const auto box = world.AddShape(UnitBox);
+    const auto spanning = world.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = box});
+    const auto far = world.AddBody({.Pose = At(float3{0, 2, 10000}), .Shape = box});
+    const auto outside = world.AddBody({.Pose = At(float3{2, 2, 0}), .Shape = box});
+    Run(solver, world, 180);
+    for (const auto body : {spanning, far}) {
+        CHECK(world.Poses[body].Position.y == doctest::Approx(Half).epsilon(0.004));
+        CHECK(length(world.Velocities[body].Linear) < 0.005f);
+        REQUIRE(ActiveContacts(world, body) >= 2);
+        for (const auto &contact : Slots(world, body)) {
+            if (!contact.Active) continue;
+            CHECK(contact.BodyB == floor);
+            CHECK(std::abs(ContactPoint(world, contact, false).x) <= 0.301f);
+        }
+    }
+    CHECK(world.Poses[outside].Position.y < -2);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "round shapes meet a plane strip at its face and edge") {
+    const auto plane = world.AddShape({.HalfExtents = {0.3f, 0, 0}, .Normal = {0, 1, 0}, .Kind = ShapePlane});
+    world.AddBody({.Shape = plane, .Density = 0});
+    SUBCASE("a sphere reaches the edge with its centre outside the strip") {
+        const auto sphere = world.AddBody({.Pose = At(float3{0.45f, 0.199f, 0}), .Shape = world.AddShape({.Radius = 0.25f, .Kind = ShapeSphere})});
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        REQUIRE(ActiveContacts(world, sphere) == 1);
+        const auto &contact = Slots(world, sphere)[0];
+        CHECK(ContactPoint(world, contact, false).x == doctest::Approx(0.3f).epsilon(0.005));
+        CHECK(std::abs(ContactPoint(world, contact, false).y) < 0.001f);
+        CHECK(contact.Normal.x == doctest::Approx(0.6f).epsilon(0.01));
+        CHECK(contact.Normal.y == doctest::Approx(0.8f).epsilon(0.01));
+    }
+    SUBCASE("a capsule spans the strip with both ends outside") {
+        const auto capsule = world.AddBody({.Pose = At(float3{0, 2, 0}, QuatFromRotationVector(float3{0, 0, std::numbers::pi_v<float> / 2})), .Shape = world.AddShape({.HalfExtents = {0, 0.8f, 0}, .Radius = 0.2f, .Kind = ShapeCapsule})});
+        Run(solver, world, 180);
+        CHECK(world.Poses[capsule].Position.y == doctest::Approx(0.2f).epsilon(0.01));
+        CHECK(length(world.Velocities[capsule].Linear) < 0.005f);
+    }
+    SUBCASE("a sphere reaches a finite plane corner") {
+        world.Shapes[plane].HalfExtents.z = 0.3f;
+        const auto sphere = world.AddBody({.Pose = At(float3{0.45f, 0.1495f, 0.45f}), .Shape = world.AddShape({.Radius = 0.26f, .Kind = ShapeSphere})});
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        REQUIRE(ActiveContacts(world, sphere) == 1);
+        const auto &contact = Slots(world, sphere)[0];
+        CHECK(simd::distance(ContactPoint(world, contact, false), float3{0.3f, 0, 0.3f}) < 0.001f);
+        CHECK(simd::distance(contact.Normal, simd::normalize(float3{1, 1, 1})) < 0.005f);
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "a mesh spans a plane strip without vertices over it") {
+    const auto plane = world.AddShape({.HalfExtents = {0.3f, 0, 0}, .Normal = {0, 1, 0}, .Kind = ShapePlane});
+    const auto shape = BoxMesh(world, 0.4f);
+    bool mesh_first = false;
+    SUBCASE("the plane has the lower body index") {}
+    SUBCASE("the mesh has the lower body index") { mesh_first = true; }
+    const auto add_mesh = [&] { return world.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = shape, .Mass = {{.Mass = 10, .Inertia = {1, 1, 1}}}}); };
+    const auto add_plane = [&] { return world.AddBody({.Shape = plane, .Density = 0}); };
+    const auto first = mesh_first ? add_mesh() : add_plane();
+    const auto second = mesh_first ? add_plane() : add_mesh();
+    const auto mesh = mesh_first ? first : second, floor = mesh_first ? second : first;
+    Run(solver, world, 180);
+    CHECK(world.Poses[mesh].Position.y == doctest::Approx(0.4f).epsilon(0.005));
+    CHECK(length(world.Velocities[mesh].Linear) < 0.005f);
+    REQUIRE(ActiveContacts(world, mesh) >= 2);
+    for (const auto &contact : Slots(world, mesh))
+        if (contact.Active) CHECK(std::abs(ContactPoint(world, contact, false).x) <= 0.301f);
+    world.TrackContacts = true;
+    solver.Step(world);
+    const auto changes = world.TakeContactChanges();
+    REQUIRE_FALSE(changes.empty());
+    for (const auto &change : changes) {
+        CHECK(change.A == world.IdOf(mesh));
+        CHECK(change.B == world.IdOf(floor));
+        CHECK(change.SubShape == NoIndex);
+        CHECK(change.SubShapeA >= world.Shapes[shape].FirstTriangle);
+        CHECK(change.SubShapeA < world.Shapes[shape].FirstTriangle + world.Shapes[shape].TriangleCount);
+        const auto manifold = change.Manifold();
+        CHECK((mesh_first ? manifold.SubShapeA : manifold.SubShapeB) == change.SubShapeA);
+        CHECK((mesh_first ? manifold.SubShapeB : manifold.SubShapeA) == NoIndex);
+    }
+    REQUIRE(world.RemoveBody(floor));
+    const auto removed = world.TakeContactChanges();
+    REQUIRE(removed.size() == changes.size());
+    std::multiset<std::pair<Index, uint32_t>> identities;
+    for (const auto &change : changes) identities.emplace(change.SubShapeA, change.Feature);
+    for (const auto &change : removed) {
+        CHECK(change.Kind == ContactRemoved);
+        const auto at = identities.find({change.SubShapeA, change.Feature});
+        REQUIRE(at != identities.end());
+        identities.erase(at);
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "bounded plane leaves follow local transforms and sensor filters") {
+    const Pose scene = At(float3{1, 2, 3}, QuatFromRotationVector(float3{0.3f, 0.2f, -0.4f}));
+    Shape plane{.HalfExtents = {0, 0, 0.3f}, .Normal = {0, -1, 0}, .Offset = -0.1f, .Kind = ShapePlane, .Local = At(float3{0, 0.2f, 0}, QuatFromRotationVector(float3{0, 0.4f, 0})), .DoubleSided = 1};
+    bool sensor = false, below = false;
+    SUBCASE("a compound strip supports a box") {}
+    SUBCASE("a finite rectangle supports a box") { plane.HalfExtents.x = 0.3f; }
+    SUBCASE("a strip sensor reports geometric overlap only") { sensor = true; }
+    SUBCASE("a double-sided rectangle supports from below") {
+        plane.HalfExtents.x = 0.3f;
+        below = true;
+    }
+    const auto compound = world.AddCompound(std::vector<Index>{world.AddShape(plane)});
+    REQUIRE(compound != NoIndex);
+    const auto floor = world.AddBody({.Pose = scene, .Shape = compound, .Density = 0, .Sensor = sensor});
+    const auto box = world.AddBody({.Pose = ComposePose(scene, At(float3{0, sensor ? 0.7f : (below ? -2.f : 2.f), 0})), .Shape = world.AddShape(UnitBox)});
+    const float3 normal = Rotate(scene.Orientation, float3{0, 1, 0});
+    if (sensor) {
+        world.TrackSensors = true;
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        CHECK(ActiveContacts(world) == 0);
+        REQUIRE(world.Overlaps().size() == 1);
+        world.Poses[box] = ComposePose(scene, At(float3{0, 0.7f, 3}));
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        CHECK(world.Overlaps().empty());
+        world.Poses[box] = ComposePose(scene, At(float3{0, 0.7f, 0}));
+        world.Filters[box].Collides = 0;
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        CHECK(world.Overlaps().empty());
+    } else {
+        Run(solver, world, 180, {.Gravity = (below ? Gravity : -Gravity) * normal});
+        CHECK(LocalPoint(scene, world.Poses[box].Position).y == doctest::Approx(below ? -0.2f : 0.8f).epsilon(0.005));
+        CHECK(length(world.Velocities[box].Linear) < 0.005f);
+        REQUIRE(ActiveContacts(world, box) >= 2);
+        for (const auto &contact : Slots(world, box)) {
+            if (!contact.Active) continue;
+            CHECK(contact.BodyB == floor);
+            const float3 local = LocalPoint(plane.Local, LocalPoint(scene, ContactPoint(world, contact, false)));
+            CHECK(std::abs(local.z) <= 0.301f);
+            if (plane.HalfExtents.x > 0) CHECK(std::abs(local.x) <= 0.301f);
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "plane bounds can change between steps without retaining obsolete triangle contacts") {
+    const auto plane = world.AddShape(GroundPlane);
+    world.AddBody({.Shape = plane, .Density = 0});
+    const auto mesh = world.AddBody({.Pose = At(float3{0, 0.4f, 0}), .Shape = BoxMesh(world, 0.4f), .Mass = {{.Mass = 10, .Inertia = {1, 1, 1}}}});
+    world.TrackContacts = true;
+    Run(solver, world, 90);
+    (void)world.TakeContactChanges();
+    for (const bool bounded : {true, false}) {
+        world.Shapes[plane].HalfExtents.x = bounded ? 0.3f : 0;
+        world.Wake(mesh);
+        solver.Step(world);
+        CHECK(world.Poses[mesh].Position.y == doctest::Approx(0.4f).epsilon(0.01));
+        REQUIRE(ActiveContacts(world, mesh) >= 2);
+        for (const auto &contact : Slots(world, mesh))
+            if (contact.Active) CHECK((contact.SubShapeA != NoIndex) == bounded);
+        const auto changes = world.TakeContactChanges();
+        uint32_t removed = 0;
+        for (const auto &change : changes) {
+            if (change.Kind != ContactRemoved) continue;
+            CHECK((change.SubShapeA != NoIndex) != bounded);
+            ++removed;
+        }
+        CHECK(removed >= 2);
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "a moving mesh rests on both a box and a plane") {
     constexpr float MeshHalf = 0.4f;
     const Index shape = BoxMesh(world, MeshHalf);
     REQUIRE(shape != NoIndex);
     AddGround(world);
-    world.AddBody({.Pose = At(float3{4, -0.25f, 0}), .Shape = world.AddShape({.HalfExtents = {2, 0.25f, 2}, .Kind = ShapeBox}), .Density = 0});
+    world.AddBody({.Pose = At(float3{4, 0.75f, 0}), .Shape = world.AddShape({.HalfExtents = {2, 0.25f, 2}, .Kind = ShapeBox}), .Density = 0});
     const AuthoredMass mass{.Mass = 10, .Inertia = {1, 1, 1}};
     const auto over_plane = world.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = shape, .Mass = mass});
     const auto over_box = world.AddBody({.Pose = At(float3{4, 2, 0}), .Shape = shape, .Mass = mass});
 
     Run(solver, world, 300);
     // Where its own half extent puts it, a contact margin in, the same result a box shape gets.
-    CHECK(world.Poses[over_box].Position.y < MeshHalf);
-    CHECK(world.Poses[over_box].Position.y > MeshHalf - MaxPenetration);
+    CHECK(world.Poses[over_box].Position.y < 1 + MeshHalf);
+    CHECK(world.Poses[over_box].Position.y > 1 + MeshHalf - MaxPenetration);
     CHECK(std::abs(float(world.Velocities[over_box].Linear.y)) < 1e-3f);
-    CHECK(world.Poses[over_plane].Position.y < -5); // straight through the plane, which is the contract
+    CHECK(world.Poses[over_plane].Position.y < MeshHalf);
+    CHECK(world.Poses[over_plane].Position.y > MeshHalf - MaxPenetration);
+    CHECK(std::abs(float(world.Velocities[over_plane].Linear.y)) < 1e-3f);
+    CHECK(ActiveContacts(world, over_plane) > 0);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "a moving mesh rests on a triangle floor in either body order") {
+    bool mesh_first = true, double_sided = false;
+    float height = 1;
+    SUBCASE("moving mesh first") {}
+    SUBCASE("floor first") { mesh_first = false; }
+    SUBCASE("double-sided meshes") { double_sided = true; }
+    SUBCASE("initial penetration") { height = 0.39f; }
+    const auto mesh_shape = BoxMesh(world, 0.4f);
+    const auto floor_shape = FloorMesh(world, 4, 3);
+    world.Shapes[mesh_shape].DoubleSided = world.Shapes[floor_shape].DoubleSided = double_sided;
+    const BodyDesc moving{.Pose = At(float3{0.13f, height, 0.07f}), .Shape = mesh_shape, .Mass = {{.Mass = 10, .Inertia = {1, 1, 1}}}};
+    const BodyDesc floor{.Shape = floor_shape, .Density = 0};
+    const auto first = world.AddBody(mesh_first ? moving : floor);
+    const auto second = world.AddBody(mesh_first ? floor : moving);
+    const auto body = mesh_first ? first : second;
+    Run(solver, world, 180);
+    CHECK(world.Poses[body].Position.y == doctest::Approx(0.4f).epsilon(0.01));
+    CHECK(simd::length(world.Velocities[body].Linear) < 0.01f);
+    REQUIRE(ActiveContacts(world, body) >= 3);
+    for (const auto &contact : Slots(world, body)) {
+        if (!contact.Active) continue;
+        CHECK(contact.SubShapeA != NoIndex);
+        CHECK(contact.SubShape != NoIndex);
+    }
+}
+
+TEST_CASE_FIXTURE(OneWorld, "two moving meshes settle on a bounded plane") {
+    Shape plane = GroundPlane;
+    plane.HalfExtents = {3, 0, 3};
+    world.AddBody({.Shape = world.AddShape(plane), .Density = 0});
+    const auto shape = BoxMesh(world, 0.4f);
+    const AuthoredMass mass{.Mass = 10, .Inertia = {1, 1, 1}};
+    const auto lower = world.AddBody({.Pose = At(float3{0, 1, 0}), .Shape = shape, .Mass = mass});
+    const auto upper = world.AddBody({.Pose = At(float3{0.04f, 2, 0.02f}), .Shape = shape, .Mass = mass});
+    Run(solver, world, 240);
+    CHECK(world.Poses[lower].Position.y == doctest::Approx(0.4f).epsilon(0.01));
+    CHECK(world.Poses[upper].Position.y == doctest::Approx(1.2f).epsilon(0.01));
+    CHECK(simd::length(world.Velocities[lower].Linear) < 0.01f);
+    CHECK(simd::length(world.Velocities[upper].Linear) < 0.01f);
+    float support = 0;
+    for (const auto &contact : Slots(world, lower))
+        if (contact.Active && contact.BodyB == upper) support += contact.Lambda.x * contact.Normal.y;
+    CHECK(support == doctest::Approx(Gravity * mass.Mass).epsilon(0.01));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "transformed mesh sensors preserve compound overlap lifetimes") {
+    bool sensor_first = true;
+    SUBCASE("sensor first") {}
+    SUBCASE("probe first") { sensor_first = false; }
+    const Pose scene = At(float3{1, 2, 3}, QuatFromRotationVector(float3{0.2f, 0.1f, 0.3f}));
+    const auto mesh = BoxMesh(world, 0.4f);
+    world.Shapes[mesh].DoubleSided = true;
+    world.Shapes[mesh].Local.Position = {0, 0.2f, 0};
+    const auto compound = world.AddCompound(std::vector<Index>{mesh, mesh});
+    const BodyDesc sensor_desc{.Pose = scene, .Shape = compound, .Density = 0, .Sensor = true};
+    const BodyDesc probe_desc{.Pose = ComposePose(scene, At(float3{0.6f, 0, 0})), .Shape = mesh, .Density = 0};
+    const auto first = world.AddBody(sensor_first ? sensor_desc : probe_desc);
+    const auto second = world.AddBody(sensor_first ? probe_desc : sensor_desc);
+    const auto sensor = sensor_first ? first : second, probe = sensor_first ? second : first;
+    const auto pair = [&](uint32_t leaf) {
+        return SensorOverlap{world.IdOf(first), world.IdOf(second), sensor_first ? ChildPair(leaf, 0) : ChildPair(0, leaf)};
+    };
+    world.TrackSensors = true;
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 2);
+    for (uint32_t leaf = 0; leaf < 2; ++leaf) CHECK(std::ranges::find(world.Overlaps(), pair(leaf)) != world.Overlaps().end());
+    CHECK(world.TakeSensorChanges().size() == 2);
+    CHECK(std::ranges::none_of(world.Contacts.All(), [](const Contact &contact) { return contact.Active; }));
+    solver.Step(world);
+    CHECK(world.TakeSensorChanges().empty());
+    auto &leaf = world.Shapes[world.Child(compound, 1)];
+    leaf.HasFilter = 1;
+    leaf.Mask.Collides = 0;
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 1);
+    CHECK(world.Overlaps()[0] == pair(0));
+    const auto removed = world.TakeSensorChanges();
+    REQUIRE(removed.size() == 1);
+    CHECK(removed[0].Pair == pair(1));
+    CHECK_FALSE(removed[0].Entered);
+    world.Poses[probe] = ComposePose(scene, At(float3{2, 0, 0}));
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+    REQUIRE(world.TakeSensorChanges().size() == 1);
+    CHECK(simd::length(world.Velocities[sensor].Linear) == 0);
+    CHECK(simd::length(world.Velocities[probe].Linear) == 0);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "crossing thin mesh strips preserve support from either side") {
+    bool below = false;
+    SUBCASE("from above") {}
+    SUBCASE("from below") { below = true; }
+    const float3 floor_points[]{{-0.15f, 0, -2}, {-0.15f, 0, 2}, {0.15f, 0, 2}, {0.15f, 0, -2}};
+    const float3 body_points[]{{-2, -0.4f, -0.15f}, {2, -0.4f, -0.15f}, {2, -0.4f, 0.15f}, {-2, -0.4f, 0.15f}};
+    const std::vector<uint32_t> indices{0, 1, 2, 0, 2, 3};
+    const auto floor = world.AddMesh(floor_points, indices);
+    const auto shape = world.AddMesh(body_points, indices);
+    world.Shapes[floor].DoubleSided = world.Shapes[shape].DoubleSided = true;
+    world.AddBody({.Shape = floor, .Density = 0});
+    const auto body = world.AddBody({.Pose = At(float3{0, below ? -1.f : 1.f, 0}), .Shape = shape, .Mass = {{.Mass = 10, .Inertia = {1, 1, 1}}}});
+    Run(solver, world, 180, {.Gravity = {0, below ? Gravity : -Gravity, 0}});
+    CHECK(world.Poses[body].Position.y == doctest::Approx(0.4f).epsilon(0.01));
+    CHECK(simd::length(world.Velocities[body].Linear) < 0.01f);
+    CHECK(ActiveContacts(world, body) >= 3);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "mesh pair collision preserves an empty gap between disconnected feet") {
+    std::vector<float3> points;
+    std::vector<uint32_t> indices;
+    for (const float side : {-1.f, 1.f}) {
+        const uint32_t first = points.size();
+        for (const auto point : {float3{side * 0.5f, -0.4f, -0.4f}, float3{side * 0.8f, -0.4f, -0.4f}, float3{side * 0.8f, -0.4f, 0.4f}, float3{side * 0.5f, -0.4f, 0.4f}})
+            points.push_back(point);
+        indices.insert(indices.end(), {first, first + 1, first + 2, first, first + 2, first + 3});
+    }
+    const auto feet = world.AddMesh(points, indices);
+    world.Shapes[feet].DoubleSided = true;
+    const auto pedestal = BoxMesh(world, 0.2f);
+    world.AddBody({.Shape = pedestal, .Density = 0});
+    const auto body = world.AddBody({.Pose = At(float3{0, 1, 0}), .Shape = feet, .Mass = {{.Mass = 10, .Inertia = {1, 1, 1}}}});
+    Run(solver, world, 60);
+    CHECK(world.Poses[body].Position.y < -3);
+    CHECK(ActiveContacts(world, body) == 0);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "mesh plane contacts follow local poses and preserve disconnected support") {
+    const Pose scene = At(float3{1, 2, 3}, QuatFromRotationVector(float3{0.2f, 0.1f, 0.3f}));
+    const Pose local = At(float3{0, 0.2f, 0}, QuatFromRotationVector(float3{0.3f, 0.2f, 0.1f}));
+    std::vector<float3> points;
+    std::vector<uint32_t> indices;
+    for (const float side : {-1.f, 1.f}) {
+        const uint32_t first = points.size();
+        for (const auto point : {float3{side * 0.5f, -0.4f, -0.4f}, float3{side * 0.8f, -0.4f, -0.4f}, float3{side * 0.8f, -0.4f, 0.4f}, float3{side * 0.5f, -0.4f, 0.4f}})
+            points.push_back(Rotate(QuatConjugate(local.Orientation), point));
+        indices.insert(indices.end(), {first, first + 1, first + 2, first, first + 2, first + 3});
+    }
+    points.push_back(float3{0, -2, 0});
+    Index mesh_shape = world.AddMesh(points, indices, local);
+    Shape plane = GroundPlane;
+    plane.Offset = 0.25f;
+    plane.Local = At(float3{0, 0.25f, 0});
+    Index plane_shape = world.AddShape(plane);
+    bool compound = false, mesh_first = true;
+    SUBCASE("separate colliders, mesh first") {}
+    SUBCASE("separate colliders, plane first") { mesh_first = false; }
+    SUBCASE("compound colliders, mesh first") { compound = true; }
+    SUBCASE("compound colliders, plane first") {
+        compound = true;
+        mesh_first = false;
+    }
+    SUBCASE("a double-sided plane faces the mesh") {
+        world.Shapes[plane_shape].Normal = {0, -1, 0};
+        world.Shapes[plane_shape].Offset = -plane.Offset;
+        world.Shapes[plane_shape].DoubleSided = 1;
+    }
+    SUBCASE("a double-sided plane uses the offset mesh geometry") {
+        const float3 shift{0, 2, 0};
+        for (auto &point : points) point += shift;
+        Pose shifted = local;
+        shifted.Position -= Rotate(local.Orientation, shift);
+        mesh_shape = world.AddMesh(points, indices, shifted);
+        world.Shapes[plane_shape].DoubleSided = 1;
+    }
+    SUBCASE("a bounded double-sided plane supports the thin mesh") {
+        world.Shapes[plane_shape].Normal = {0, -1, 0};
+        world.Shapes[plane_shape].Offset = -plane.Offset;
+        world.Shapes[plane_shape].HalfExtents.x = 0.6f;
+        world.Shapes[plane_shape].DoubleSided = 1;
+    }
+    if (compound) {
+        mesh_shape = world.AddCompound(std::vector<Index>{mesh_shape});
+        plane_shape = world.AddCompound(std::vector<Index>{plane_shape});
+    }
+    REQUIRE(mesh_shape != NoIndex);
+    REQUIRE(plane_shape != NoIndex);
+    const auto add_mesh = [&] {
+        return world.AddBody({.Pose = ComposePose(scene, At(float3{0, 2, 0})), .Shape = mesh_shape, .Mass = {{.Mass = 1, .Inertia = {1, 1, 1}}}});
+    };
+    const auto add_plane = [&] { return world.AddBody({.Pose = scene, .Shape = plane_shape, .Density = 0}); };
+    Index mesh = NoIndex, floor = NoIndex;
+    if (mesh_first) {
+        mesh = add_mesh();
+        floor = add_plane();
+    } else {
+        floor = add_plane();
+        mesh = add_mesh();
+    }
+    const float3 normal = Rotate(scene.Orientation, float3{0, 1, 0});
+    Run(solver, world, 300, {.Gravity = -Gravity * normal});
+    CHECK(LocalPoint(scene, world.Poses[mesh].Position).y == doctest::Approx(0.7f).epsilon(0.003));
+    CHECK(length(world.Velocities[mesh].Linear) < 0.005f);
+    CHECK(length(world.Velocities[mesh].Angular) < 0.005f);
+    CHECK(ActiveContacts(world, floor) == 0);
+    bool left = false, right = false;
+    for (const Contact &contact : Slots(world, mesh)) {
+        if (!contact.Active) continue;
+        CHECK(contact.BodyB == floor);
+        const float3 on_mesh = LocalPoint(scene, ContactPoint(world, contact, true));
+        left |= on_mesh.x < -0.49f;
+        right |= on_mesh.x > 0.49f;
+        CHECK(std::abs(on_mesh.x) > 0.49f);
+        CHECK(LocalPoint(scene, ContactPoint(world, contact, false)).y == doctest::Approx(0.5f).epsilon(1e-5));
+    }
+    CHECK(left);
+    CHECK(right);
+    world.TrackContacts = true;
+    solver.Step(world, {.Gravity = -Gravity * normal});
+    const auto changes = world.TakeContactChanges();
+    REQUIRE_FALSE(changes.empty());
+    float support = 0;
+    for (const auto &change : changes) {
+        CHECK(change.A == world.IdOf(mesh));
+        CHECK(change.B == world.IdOf(floor));
+        CHECK(dot(change.Normal, normal) > 0.999f);
+        support -= change.Lambda.x;
+    }
+    CHECK(support == doctest::Approx(Gravity).epsilon(0.02));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "mesh plane sensors report overlaps without creating solid contacts") {
+    const auto shape = BoxMesh(world, 0.4f);
+    bool mesh_sensor = false;
+    SUBCASE("the plane is a sensor") {}
+    SUBCASE("the mesh is a sensor") { mesh_sensor = true; }
+    const auto mesh = world.AddBody({.Pose = At(float3{0, 0.3f, 0}), .Shape = shape, .Density = 0, .Sensor = mesh_sensor});
+    AddGround(world, {.Sensor = !mesh_sensor});
+    world.TrackSensors = true;
+    solver.Step(world);
+    CHECK(ActiveContacts(world) == 0);
+    REQUIRE(world.Overlaps().size() == 1);
+    auto changes = world.TakeSensorChanges();
+    REQUIRE(changes.size() == 1);
+    CHECK(changes[0].Entered);
+    CHECK(world.Poses[mesh].Position.y == 0.3f);
+    world.Poses[mesh].Position.y = 2;
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+    changes = world.TakeSensorChanges();
+    REQUIRE(changes.size() == 1);
+    CHECK_FALSE(changes[0].Entered);
+    world.Poses[mesh].Position.y = 0.3f;
+    world.Filters[mesh].Collides = 0;
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
 }
 
 TEST_CASE_FIXTURE(OneWorld, "the convex side owns a pair against a mesh whatever the indices say") {
-    // A pair belongs to the lower-indexed of two dynamic bodies, and a mesh body's own thread returns before colliding, so ownership passes to the convex side.
     // Built mesh-first on purpose.
     const Index shape = BoxMesh(world, 0.4f);
     REQUIRE(shape != NoIndex);
@@ -3615,7 +4167,6 @@ TEST_CASE_FIXTURE(OneWorld, "the convex side owns a pair against a mesh whatever
     REQUIRE(mesh < box);
 
     Run(solver, world, 600);
-    // The mesh owns nothing, and the box above it owns the pair despite its higher index.
     CHECK(ActiveContacts(world, mesh) == 0);
     CHECK(ActiveContacts(world, box) > 0);
     for (const Contact &contact : Slots(world, box))
@@ -3654,6 +4205,7 @@ TEST_CASE_FIXTURE(OneWorld, "a mesh cube's bottom face is held on all four of it
     float yaw = 0;
     bool square_on = true;
     SUBCASE("set down square on") { }
+    SUBCASE("with both sides of the mesh enabled") { world.Shapes[shape].DoubleSided = true; }
     SUBCASE("and turned ten degrees about the upright") {
         yaw = 10 * std::numbers::pi_v<float> / 180;
         square_on = false;
@@ -3724,7 +4276,7 @@ TEST_CASE_FIXTURE(OnDevice, "a paddle wheel of one-sided quads turns, and its ba
         World world{context};
         const Index shape = WheelMesh(world, 16, paddles);
         REQUIRE(shape != NoIndex);
-        AddGround(world); // so a ball that misses stops, rather than falling for ever at ghost speeds
+        AddGround(world, {.Pose = At(float3{0, -2, 0})});
         const auto wheel = world.AddBody({.Pose = At(float3{0, 0, 0}), .Shape = shape, .Mass = WheelMass(), .AngularDamping = 0.6f});
         // A hinge about z, with the axes body B's, and B is upright so the free axis is the world's z.
         const auto axle = world.AddBody({});
@@ -4214,7 +4766,7 @@ TEST_CASE_FIXTURE(OneWorld, "a wheel pinned by an infinite mass turns on no join
     // Its inertia covers one axis, so the block drops a single direction rather than a whole half.
     const Index shape = WheelMesh(world, 16, 8);
     REQUIRE(shape != NoIndex);
-    AddGround(world); // so a ball that misses stops, rather than falling for ever at ghost speeds
+    AddGround(world, {.Pose = At(float3{0, -2, 0})});
     const auto wheel = world.AddBody({.Shape = shape, .Mass = {{.Mass = 0, .Inertia = {0, 0, 20 * WheelRadius * WheelRadius / 2}}},
                                       .Friction = 0.5f, .AngularDamping = 0.6f});
     REQUIRE(wheel != NoIndex);
@@ -4698,6 +5250,60 @@ TEST_CASE_FIXTURE(OneWorld, "integration: sensors include static pairs and respe
     CHECK(world.Overlaps().empty());
 }
 
+TEST_CASE_FIXTURE(OneWorld, "integration: coincident sensor leaves retain separate overlap lifetimes") {
+    bool sensor_first = true;
+    SUBCASE("sensor owns the pair") {}
+    SUBCASE("sensor is the partner") { sensor_first = false; }
+    const auto sphere = world.AddShape({.Radius = 0.5f, .Kind = ShapeSphere});
+    const auto compound = world.AddCompound(std::vector<Index>{sphere, sphere});
+    const BodyDesc sensor_desc{.Shape = compound, .Density = 0, .Sensor = true};
+    const BodyDesc probe_desc{.Pose = At(float3{0.75f, 0, 0}), .Shape = sphere, .Density = 0};
+    const auto first = world.AddBody(sensor_first ? sensor_desc : probe_desc);
+    const auto second = world.AddBody(sensor_first ? probe_desc : sensor_desc);
+    const auto sensor = sensor_first ? first : second, probe = sensor_first ? second : first;
+    const auto pair = [&](uint32_t leaf) {
+        return SensorOverlap{world.IdOf(first), world.IdOf(second), sensor_first ? ChildPair(leaf, 0) : ChildPair(0, leaf)};
+    };
+    world.TrackSensors = true;
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 2);
+    for (uint32_t leaf = 0; leaf < 2; ++leaf) CHECK(std::ranges::find(world.Overlaps(), pair(leaf)) != world.Overlaps().end());
+    CHECK(world.TakeSensorChanges().size() == 2);
+    solver.Step(world);
+    CHECK(world.TakeSensorChanges().empty());
+    auto &leaf = world.Shapes[world.Child(world.BodyShapes[sensor], 1)];
+    leaf.HasFilter = 1;
+    leaf.Mask.Collides = 0;
+    solver.Step(world);
+    REQUIRE(world.Overlaps().size() == 1);
+    CHECK(world.Overlaps()[0] == pair(0));
+    const auto removed = world.TakeSensorChanges();
+    REQUIRE(removed.size() == 1);
+    CHECK(removed[0].Pair == pair(1));
+    CHECK_FALSE(removed[0].Entered);
+    world.Poses[probe].Position.x = 2;
+    solver.Step(world);
+    CHECK(world.Overlaps().empty());
+    CHECK(world.TakeSensorChanges().size() == 1);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "integration: sensor overlaps include a compound's internal faces") {
+    bool sensor_first = true;
+    SUBCASE("sensor owns the pair") {}
+    SUBCASE("sensor is the partner") { sensor_first = false; }
+    Shape left = UnitBox, right = UnitBox;
+    left.Local.Position.x = -Half;
+    right.Local.Position.x = Half;
+    Pose frame;
+    const auto compound = world.AddCompound(std::vector<Index>{world.AddShape(left), world.AddShape(right)}, &frame);
+    const BodyDesc sensor_desc{.Pose = frame, .Shape = compound, .Density = 0, .Sensor = true};
+    const BodyDesc probe_desc{.Pose = At(float3{0.05f, 0, 0}), .Shape = world.AddShape({.Radius = 0.2f, .Kind = ShapeSphere}), .Density = 0};
+    world.AddBody(sensor_first ? sensor_desc : probe_desc);
+    world.AddBody(sensor_first ? probe_desc : sensor_desc);
+    solver.Step(world);
+    CHECK(world.Overlaps().size() == 2);
+}
+
 TEST_CASE_FIXTURE(OneWorld, "integration: compound mesh leaves support a convex body") {
     const auto mesh = FloorMesh(world, 1, 4);
     const auto compound = world.AddCompound(std::vector<Index>{mesh});
@@ -4866,4 +5472,83 @@ TEST_CASE_FIXTURE(OneWorld, "collider filters: shared compounds inherit each bod
     solver.Step(world);
     CHECK(SameMask(world.Filters[a].Aggregate, {1, 16}));
     CHECK(SameMask(world.Filters[b].Aggregate, {4, 8}));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "head-on impacts preserve momentum across mesh and box masses") {
+    float direction = 1, scale = 1, drift = 0, ratio = 1, speed = 1, tolerance_scale = 1;
+    float dt = StepSettings{}.DeltaTime;
+    uint32_t iterations = StepSettings{}.Iterations;
+    bool convex = false;
+    SUBCASE("left mesh first") {}
+    SUBCASE("right mesh first") { direction = -1; }
+    SUBCASE("convex boxes") { convex = true; }
+    SUBCASE("one gram meshes") { scale = 0.001f; }
+    SUBCASE("one tonne meshes") { scale = 1000; }
+    SUBCASE("translating meshes") { drift = 0.5f; }
+    SUBCASE("unequal meshes") { ratio = 2; }
+    SUBCASE("ten metres per second") {
+        speed = 10;
+        tolerance_scale = 10;
+    }
+    SUBCASE("one hundred metres per second at 240 Hz with twenty iterations") {
+        speed = 100;
+        dt = 1.f / 240;
+        iterations = 20;
+    }
+    const auto shape = convex ? world.AddShape({.HalfExtents = {0.4f, 0.4f, 0.4f}, .Kind = ShapeBox}) : BoxMesh(world, 0.4f);
+    world.Shapes[shape].DoubleSided = true;
+    const AuthoredMass mass{.Mass = scale, .Inertia = float3{0.1f, 0.1f, 0.1f} * scale};
+    const AuthoredMass mass_a{.Mass = scale * ratio, .Inertia = mass.Inertia * ratio};
+    const auto a = world.AddBody({.Pose = At(float3{-direction, 0, 0}), .Velocity = {.Linear = {direction * speed + drift, 0, 0}}, .Shape = shape, .Mass = mass_a});
+    const auto b = world.AddBody({.Pose = At(float3{direction, 0, 0}), .Velocity = {.Linear = {-direction * speed + drift, 0, 0}}, .Shape = shape, .Mass = mass});
+    const float3 velocity{direction * speed * (ratio - 1) / (ratio + 1) + drift, 0, 0};
+    const float3 center = (ratio * world.Poses[a].Position + world.Poses[b].Position) / (ratio + 1);
+    float worst_momentum = 0, worst_center = 0;
+    for (uint32_t step = 0; step < uint32_t(std::lround(2 / dt)); ++step) {
+        solver.Step(world, {.Gravity = {0, 0, 0}, .DeltaTime = dt, .Iterations = iterations});
+        CheckManifolds(world);
+        const auto current_velocity = (ratio * world.Velocities[a].Linear + world.Velocities[b].Linear) / (ratio + 1);
+        const auto current_center = (ratio * world.Poses[a].Position + world.Poses[b].Position) / (ratio + 1);
+        worst_momentum = std::max(worst_momentum, simd::length(current_velocity - velocity));
+        worst_center = std::max(worst_center, simd::length(current_center - center - velocity * (float(step + 1) * dt)));
+    }
+    CHECK(worst_momentum < 0.002f * tolerance_scale);
+    CHECK(worst_center < 0.002f * tolerance_scale);
+    CHECK(direction * (world.Poses[b].Position.x - world.Poses[a].Position.x) == doctest::Approx(0.8f).epsilon(0.005));
+    CHECK(simd::length((ratio * world.Poses[a].Position + world.Poses[b].Position) / (ratio + 1) - center - velocity * 2) < 0.002f * tolerance_scale);
+    CHECK(simd::length((ratio * world.Velocities[a].Linear + world.Velocities[b].Linear) / (ratio + 1) - velocity) < 0.002f * tolerance_scale);
+    CHECK(simd::length(world.Velocities[a].Linear - velocity) < 0.01f * tolerance_scale);
+    CHECK(simd::length(world.Velocities[b].Linear - velocity) < 0.01f * tolerance_scale);
+    CHECK(simd::length(world.Velocities[a].Angular) < 0.01f * tolerance_scale);
+    CHECK(simd::length(world.Velocities[b].Angular) < 0.01f * tolerance_scale);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "glancing sphere impacts conserve isolated momentum and dissipate energy") {
+    float speed = 1;
+    SUBCASE("one metre per second") {}
+    SUBCASE("ten metres per second") { speed = 10; }
+    constexpr float Radius = 0.4f, Inertia = 0.4f * Radius * Radius;
+    const auto shape = world.AddShape({.Radius = Radius, .Kind = ShapeSphere});
+    const AuthoredMass mass{.Mass = 1, .Inertia = {Inertia, Inertia, Inertia}};
+    const auto a = world.AddBody({.Pose = At(float3{-1, 0.15f, 0}), .Velocity = {.Linear = {speed, 0, 0}}, .Shape = shape, .Mass = mass, .Friction = 0});
+    const auto b = world.AddBody({.Pose = At(float3{1, -0.15f, 0}), .Velocity = {.Linear = {-speed, 0, 0}}, .Shape = shape, .Mass = mass, .Friction = 0});
+    const float3 initial_angular{0, 0, -0.3f * speed};
+    float worst_linear = 0, worst_angular = 0, highest_energy = 0, closest = INFINITY;
+    for (uint32_t step = 0; step < 120; ++step) {
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        const auto va = world.Velocities[a], vb = world.Velocities[b];
+        const float3 angular = simd::cross(world.Poses[a].Position, va.Linear) + simd::cross(world.Poses[b].Position, vb.Linear) + Inertia * (va.Angular + vb.Angular);
+        worst_linear = std::max(worst_linear, simd::length(va.Linear + vb.Linear));
+        worst_angular = std::max(worst_angular, simd::length(angular - initial_angular));
+        highest_energy = std::max(highest_energy, 0.5f * (simd::length_squared(va.Linear) + simd::length_squared(vb.Linear) + Inertia * (simd::length_squared(va.Angular) + simd::length_squared(vb.Angular))));
+        closest = std::min(closest, simd::distance(world.Poses[a].Position, world.Poses[b].Position));
+    }
+    CHECK(worst_linear < 0.004f * speed);
+    CHECK(worst_angular < 0.01f * simd::length(initial_angular));
+    CHECK(highest_energy <= speed * speed * 1.002f);
+    CHECK(closest > 2 * Radius - MaxPenetration);
+    CHECK(world.Velocities[a].Linear.y > 0.1f * speed);
+    CHECK(world.Velocities[b].Linear.y < -0.1f * speed);
+    CHECK(simd::length(world.Velocities[a].Angular) < 0.001f);
+    CHECK(simd::length(world.Velocities[b].Angular) < 0.001f);
 }

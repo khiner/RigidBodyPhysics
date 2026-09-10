@@ -25,6 +25,7 @@ constexpr Layout HostLayouts[]{
     {"Velocity", sizeof(Velocity), alignof(Velocity)},
     {"BodyMass", sizeof(BodyMass), alignof(BodyMass)},
     {"Shape", sizeof(Shape), alignof(Shape)},
+    {"Triangle", sizeof(Triangle), alignof(Triangle)},
     {"Material", sizeof(Material), alignof(Material)},
     {"JointDrive", sizeof(JointDrive), alignof(JointDrive)},
     {"Filter", sizeof(Filter), alignof(Filter)},
