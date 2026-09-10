@@ -175,6 +175,7 @@ GPU_CONSTANT uint CollisionLanes = 64;
 GPU_CONSTANT uint SolveLanes = 32;
 GPU_CONSTANT uint SolveDof = 6;
 GPU_CONSTANT uint SolveBodiesPerGroup = SolveLanes / SolveDof;
+GPU_CONSTANT uint SmallSolveWaves = 8;
 GPU_CONSTANT uint RadixWaves = RadixBlockSize / RadixSimdWidth;
 inline uint RadixBlocks(uint bodies) { return (bodies + RadixBlockSize - 1) / RadixBlockSize; }
 inline uint BroadPhaseRoot(uint bodies) { return bodies == 1 ? 0 : bodies; }
@@ -327,6 +328,18 @@ struct Filter {
 // One load therefore supplies both the conflict test and the neighbour's coloring priority, which is degree first and index as the tie.
 GPU_CONSTANT uint ColorDegreeShift = 8;
 GPU_CONSTANT uint MaxColorDegree = 255;
+GPU_CONSTANT uint MaxSupportedColors = 32;
+// Island scratch begins with indirect dispatch arguments, then roots, counts and bounded member lists.
+GPU_CONSTANT uint IslandBodyLimit = SolveLanes;
+GPU_CONSTANT uint IslandPublishAt = 3, IslandContactDualAt = 6, IslandJointDualAt = 9;
+GPU_CONSTANT uint IslandLargeAt = 12, IslandColorsAt = 13;
+GPU_CONSTANT uint IslandHeaderWords = IslandColorsAt + MaxSupportedColors * 3;
+GPU_CONSTANT uint IslandWordsPerBody = 2 + IslandBodyLimit;
+
+struct ColorWork {
+    uint Counts[MaxSupportedColors], Offsets[MaxSupportedColors + 1], Cursors[MaxSupportedColors];
+    uint ColoringActive, ColoringChanged;
+};
 inline uint ColorOf(uint word) { return word & 0xFFu; }
 // Degree order applies only between two bodies that have both gone quiet.
 // While either is still moving its degree changes step to step, and colors reshuffled mid-collapse leave conflicted pairs solving Jacobi.
@@ -579,9 +592,21 @@ struct QueryArenaHeader {
     uint ContextCount, ResultCount, ContextCapacity, ResultCapacity;
     uint ContextOffset, TaskOffset, ResultOffset, BatchOffset;
     uint BatchCount, BatchCapacity, Bytes;
+    uint Reuse, Valid, GeometryValid, DynamicSame;
+    uint GeometryX, GeometryY, GeometryZ;
+    uint InputX, InputY, InputZ;
+    uint GeometryChecked;
 };
 GPU_CONSTANT uint QueryHeaderWords = sizeof(QueryArenaHeader) / sizeof(uint);
-static_assert(sizeof(QueryArenaHeader) == 60);
+// Small worlds partition query preparation to increase parallelism.
+inline uint QueryPartitions(uint bodies) { return bodies <= 32 ? 8u : 1u; }
+inline uint QueryOwnerOffset(uint bodies) { return QueryHeaderWords + bodies * QueryPartitions(bodies); }
+inline uint QueryHeadOffset(uint bodies, uint body, uint part) { return QueryHeaderWords + body * QueryPartitions(bodies) + part; }
+
+static_assert(sizeof(QueryArenaHeader) == 104);
+struct QueryInputSpec {
+    uint Offsets[16], Words;
+};
 GPU_CONSTANT uint QueryScratchBytes = 32u * 1024u * 1024u;
 
 // Named for the paper's symbols, so the kernels diff against the references.

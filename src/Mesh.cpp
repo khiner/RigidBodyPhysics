@@ -7,13 +7,9 @@
 namespace rbp {
 
 namespace {
-// Triangles per leaf.
-// Small enough that a leaf is a few narrowphase calls rather than a scan, large enough that the tree is not mostly nodes.
 constexpr uint32_t LeafSize = 4;
 
-// How far from flat two faces must fold before the edge between them is a feature.
-// Below this they are one surface to anything sliding over them, and marking the seam a feature would make a body catch on it.
-// One degree, above the noise in a normal computed from three points and below any real crease.
+// Treat folds below one degree as coplanar to suppress contacts on tessellation edges.
 constexpr float ActiveEdgeSine = 0.0175f;
 
 float3 Normal(const std::vector<float3> &points, const Triangle &triangle) {
@@ -22,9 +18,8 @@ float3 Normal(const std::vector<float3> &points, const Triangle &triangle) {
     return area > 0 ? turn / area : float3{0, 0, 0};
 }
 
-// Reorders the triangles into tree order and builds the tree.
-// Split on the longest axis of the centroids at their median, which needs no cost model and is deterministic for a given input.
-uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &points, std::vector<BvhNode> &nodes, uint32_t first, uint32_t count) {
+uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &points, std::vector<BvhNode> &nodes, uint32_t first, uint32_t count, uint32_t depth = 0) {
+    // Minimize surface area times triangle count over binned centroid splits.
     const uint32_t self = nodes.size();
     nodes.push_back({});
     float3 low{INFINITY, INFINITY, INFINITY}, high{-INFINITY, -INFINITY, -INFINITY};
@@ -50,16 +45,74 @@ uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &poin
         spread_high = simd::max(spread_high, centre(triangles[i]));
     }
     const float3 spread = spread_high - spread_low;
-    const uint32_t axis = spread.x >= spread.y && spread.x >= spread.z ? 0 : (spread.y >= spread.z ? 1 : 2);
     const auto begin = triangles.begin() + first;
-    const uint32_t half = count / 2;
-    std::nth_element(begin, begin + half, begin + count, [&](const Triangle &a, const Triangle &b) {
-        return centre(a)[axis] < centre(b)[axis];
-    });
+    uint32_t half = count / 2;
+    constexpr uint32_t Bins = 16;
+    struct Bin {
+        float3 Low{INFINITY, INFINITY, INFINITY}, High{-INFINITY, -INFINITY, -INFINITY};
+        uint32_t Count{};
+        void Include(const Bin &b) {
+            if (!b.Count) return;
+            Low = simd::min(Low, b.Low);
+            High = simd::max(High, b.High);
+            Count += b.Count;
+        }
+        double Cost() const {
+            if (!Count) return 0;
+            const float3 d = High - Low;
+            return Count * (double(d.x) * d.y + double(d.y) * d.z + double(d.z) * d.x);
+        }
+    };
+    double best = INFINITY;
+    uint32_t selected_axis = 0, selected_bin = 0;
+    const auto bin_index = [&](const Triangle &t, uint32_t dimension) {
+        return std::min(Bins - 1, uint32_t((centre(t)[dimension] - spread_low[dimension]) / spread[dimension] * Bins));
+    };
+    // Bound tree depth by the GPU traversal stack capacity.
+    const uint64_t child_capacity = uint64_t(LeafSize) << (30 - depth);
+    for (uint32_t dimension = 0; dimension < 3; ++dimension) {
+        if (!(spread[dimension] > 0)) continue;
+        Bin bins[Bins], right[Bins];
+        for (uint32_t i = first; i < first + count; ++i) {
+            Bin &bin = bins[bin_index(triangles[i], dimension)];
+            ++bin.Count;
+            for (const Index corner : {triangles[i].A, triangles[i].B, triangles[i].C}) {
+                bin.Low = simd::min(bin.Low, points[corner]);
+                bin.High = simd::max(bin.High, points[corner]);
+            }
+        }
+        Bin accumulated;
+        for (uint32_t b = Bins; b-- > 0;) {
+            accumulated.Include(bins[b]);
+            right[b] = accumulated;
+        }
+        Bin left;
+        for (uint32_t b = 0; b + 1 < Bins; ++b) {
+            left.Include(bins[b]);
+            if (!left.Count || !right[b + 1].Count || left.Count > child_capacity || right[b + 1].Count > child_capacity) continue;
+            const double cost = left.Cost() + right[b + 1].Cost();
+            if (cost < best) {
+                best = cost;
+                selected_axis = dimension;
+                selected_bin = b;
+            }
+        }
+    }
+    if (std::isfinite(best)) {
+        half = uint32_t(std::stable_partition(begin, begin + count, [&](const Triangle &t) {
+                            return bin_index(t, selected_axis) <= selected_bin;
+                        }) -
+                        begin);
+    } else {
+        const uint32_t axis = spread.x >= spread.y && spread.x >= spread.z ? 0 : (spread.y >= spread.z ? 1 : 2);
+        std::nth_element(begin, begin + half, begin + count, [&](const Triangle &a, const Triangle &b) {
+            return centre(a)[axis] < centre(b)[axis];
+        });
+    }
 
-    // The left child is built first and lands immediately after this node, so only the right one needs an index of its own.
-    Build(triangles, points, nodes, first, half);
-    nodes[self].First = Build(triangles, points, nodes, first + half, count - half);
+    // The left child immediately follows its parent.
+    Build(triangles, points, nodes, first, half, depth + 1);
+    nodes[self].First = Build(triangles, points, nodes, first + half, count - half, depth + 1);
     nodes[self].Count = 0;
     return self;
 }

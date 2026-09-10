@@ -129,13 +129,19 @@ static float2 WideSum(float a, float b) {
 static float2 WideAdd(float2 a, float2 b) {
 #pragma clang fp reassociate(off) contract(off)
     const float2 sum = WideSum(a.x, b.x);
-    return WideSum(sum.x, sum.y + a.y + b.y);
+    // Normalized input pairs permit Fast2Sum for the final normalization.
+    const float error = sum.y + a.y + b.y;
+    const float high = sum.x + error;
+    return float2(high, error - (high - sum.x));
 }
 static float2 WideMul(float2 a, float2 b) {
 #pragma clang fp reassociate(off) contract(off)
     const float product = a.x * b.x;
     const float error = fma(a.x, b.x, -product) + a.x * b.y + a.y * b.x + a.y * b.y;
-    return WideSum(product, error);
+    // Normalized input pairs keep the product larger than its correction.
+    // Fast2Sum retains that correction with three operations instead of six.
+    const float sum = product + error;
+    return float2(sum, error - (sum - product));
 }
 static float2 WideDiv(float2 a, float2 b) {
 #pragma clang fp reassociate(off) contract(off)
@@ -293,13 +299,13 @@ kernel void Integrate(
 // The starting guess the sweeps begin from, which is not the inertial target.
 // Gravity enters in proportion to how much recent acceleration matched it, so a resting body is not guessed into the floor each step.
 // VBD's adaptive warm start, run after collision. See Integrate.
-kernel void WarmStart(
-    device Pose *poses [[buffer(0)]], device const Pose *initial [[buffer(1)]],
-    device const Velocity *velocities [[buffer(3)]], device Velocity *previous [[buffer(9)]],
-    device const BodyMass *masses [[buffer(4)]], device Displacement *displacements [[buffer(10)]],
-    device BodyIterate *iterates [[buffer(11)]],
-    constant StepParams &p [[buffer(7)]],
-    uint body [[thread_position_in_grid]]
+static void WarmStartBody(
+    device Pose *poses, device const Pose *initial,
+    device const Velocity *velocities, device Velocity *previous,
+    device const BodyMass *masses, device Displacement *displacements,
+    device BodyIterate *iterates,
+    constant StepParams &p,
+    uint body
 ) {
     if (body >= p.BodyCount) return;
     const BodyMass mass = masses[body];
@@ -307,18 +313,12 @@ kernel void WarmStart(
     const Velocity v = velocities[body];
     const float dt = p.DeltaTime;
     if (!Moves(mass)) {
-        // A kinematic body is moved to where the host is taking it, for the same reason a dynamic body is moved to its guess.
-        // Eq. 15 measures constraints in the displacement of the two bodies.
-        // A body left where it started therefore contributes nothing to any row and produces no velocity.
-        // The flight is x + h v, with no gravity and no adaptive weight.
+        // Advance kinematic poses before solving so contact constraints see their imposed motion.
         if (Driven(mass, v, p)) poses[body] = FreeFlight(pose, v, float3(0), 0, dt);
         displacements[body] = Since(poses[body], pose);
         iterates[body] = {poses[body], displacements[body]};
         return;
     }
-    // The body's own gravity on both sides of the weighting: the direction recent acceleration is compared against, and the amount the guess then carries.
-    // Both velocities are the damped ones Integrate wrote, so this weighs the acceleration the body had.
-    // A body at terminal velocity is not accelerating and must not be guessed a step of gravity further.
     const float3 pull = (Translates(mass) ? mass.GravityScale : 0) * p.Gravity;
     const float gravity = length(pull);
     const float3 fall = gravity > 1e-6f ? pull / gravity : float3(0);
@@ -328,6 +328,23 @@ kernel void WarmStart(
     poses[body] = FreeFlight(pose, v, pull, weight, dt);
     displacements[body] = Since(poses[body], pose);
     iterates[body] = {poses[body], displacements[body]};
+}
+
+kernel void WarmStart(
+    device Pose *poses [[buffer(0)]], device const Pose *initial [[buffer(1)]],
+    device const Velocity *velocities [[buffer(3)]], device Velocity *previous [[buffer(9)]],
+    device const BodyMass *masses [[buffer(4)]], device Displacement *displacements [[buffer(10)]],
+    device BodyIterate *iterates [[buffer(11)]],
+    device ColorWork &color_work [[buffer(26)]],
+    constant StepParams &p [[buffer(7)]],
+    uint body [[thread_position_in_grid]]
+) {
+    if (p.BodyCount > SolveLanes && body < MaxSupportedColors) color_work.Counts[body] = 0;
+    if (p.BodyCount > SolveLanes && body == 0) {
+        color_work.ColoringActive = 1;
+        color_work.ColoringChanged = 0;
+    }
+    WarmStartBody(poses, initial, velocities, previous, masses, displacements, iterates, p, body);
 }
 
 // An oriented box, with its axes already in world space.
@@ -441,14 +458,14 @@ static uint PolySupport(Poly poly, device const float3 *pool, float3 direction, 
     return best;
 }
 
-static float3 PolySupportPoint(Poly poly, device const float3 *pool, float3 direction) {
+static float3 PolySupportPoint(Poly poly, device const float3 *pool, float3 direction, uint lane = NoIndex) {
     if (poly.Kind == ShapeCylinder) {
         const float3 local = Rotate(QuatConjugate(poly.Orientation), direction);
         const float radial = length(local.xz);
         const float3 point = float3(radial > 0 ? poly.Half.x * local.x / radial : 0, local.y >= 0 ? poly.Half.y : -poly.Half.y, radial > 0 ? poly.Half.x * local.z / radial : 0);
         return poly.Center + Rotate(poly.Orientation, point);
     }
-    return PolyVertex(poly, pool, PolySupport(poly, pool, direction));
+    return PolyVertex(poly, pool, PolySupport(poly, pool, direction, poly.Kind == ShapeHull ? lane : NoIndex));
 }
 
 // With lane != NoIndex, all 32 SIMD lanes project the same polytope into the same frame.
@@ -502,7 +519,7 @@ static bool PlanePatch(Poly own, Pose pose, Shape plane, device const float3 *po
 }
 
 // Face-plane rejection excludes triangles whose bounds overlap the convex body.
-static bool OutsideFaces(Poly convex, Poly triangle, device const float3 *pool, device const HullFace *faces, float margin) {
+static bool OutsideFaces(Poly convex, Poly triangle, device const float3 *pool, device const HullFace *faces, float margin, uint lane = NoIndex) {
     if (convex.Kind != ShapeHull && convex.Kind != ShapeBox && convex.Kind != ShapeCylinder) return false;
     margin += convex.Radius;
     float3 points[3];
@@ -535,10 +552,16 @@ static bool OutsideFaces(Poly convex, Poly triangle, device const float3 *pool, 
         const float3 high = max(points[0], max(points[1], points[2]));
         return any(low > convex.Half + margin) || any(high < -convex.Half - margin);
     }
-    for (uint i = 0; i < convex.FaceCount; ++i) {
-        const HullFace face = faces[convex.FirstFace + i];
-        const float nearest = min(dot(face.Normal, points[0]), min(dot(face.Normal, points[1]), dot(face.Normal, points[2])));
-        if (nearest > face.Offset + margin) return true;
+    const uint width = lane == NoIndex ? 1u : 32u;
+    for (uint base = 0; base < convex.FaceCount; base += width) {
+        const uint i = base + (lane == NoIndex ? 0u : lane);
+        bool outside = false;
+        if (i < convex.FaceCount) {
+            const HullFace face = faces[convex.FirstFace + i];
+            const float nearest = min(dot(face.Normal, points[0]), min(dot(face.Normal, points[1]), dot(face.Normal, points[2])));
+            outside = nearest > face.Offset + margin;
+        }
+        if (lane != NoIndex ? simd_any(outside) : outside) return true;
     }
     return false;
 }
@@ -1306,13 +1329,13 @@ static uint ConvexManifold(
     Poly a, Poly b, device const float3 *pool, device const HullFace *hull_faces, float margin, float3 known, thread float3 *here,
     thread float3 *there, thread uint *names, thread float3 &normal, uint lane = NoIndex
 ) {
-    float3 axis; // out of b towards a
-    float distance; // between the cores, and negative by the overlap when they are inside each other
+    float3 axis;
+    float distance;
     const bool told = any(known != 0);
     if (told) {
         axis = known;
-        const float3 near_a = PolySupportPoint(a, pool, -axis);
-        const float3 near_b = PolySupportPoint(b, pool, axis);
+        const float3 near_a = PolySupportPoint(a, pool, -axis, lane);
+        const float3 near_b = PolySupportPoint(b, pool, axis, lane);
         distance = dot(near_a - near_b, axis);
     } else if (!ConvexSeparation(a, b, pool, axis, distance, lane)) return 0;
     const float gap = distance - a.Radius - b.Radius;
@@ -1320,12 +1343,11 @@ static uint ConvexManifold(
 
     float3 face_a[MaxFacePoints], face_b[MaxFacePoints];
     uint name_a[MaxFacePoints], name_b[MaxFacePoints];
-    float3 plane_a, plane_b; // each out of its own polytope, towards the other
+    float3 plane_a, plane_b;
     const uint count_a = SupportFace(a, pool, hull_faces, -axis, face_a, name_a, plane_a, lane, b.Center - a.Center);
     const uint count_b = SupportFace(b, pool, hull_faces, axis, face_b, name_b, plane_b, lane, a.Center - b.Center);
 
     if (count_a < 3 && count_b < 3) {
-        // Neither presents a face, so this is the nearest pair of two points or segments.
         float3 on_a, on_b;
         ClosestOnSegments(face_a[0], face_a[count_a - 1], face_b[0], face_b[count_b - 1], on_a, on_b);
         normal = axis;
@@ -1335,13 +1357,8 @@ static uint ConvexManifold(
         return 1;
     }
 
-    // Whichever face lies flatter against the normal holds the contact, and the other is clipped into it.
-    // A caller that handed in the direction handed in a's own face normal, so a takes the reference outright.
-    // Left to the comparison that is a tie within the rounding of a normalize.
-    // A box lying flat across a mesh would then name half its manifold after the body rather than the geometry.
-    // Those points would then be out of reach of the seam rule.
     const bool reference_is_a = count_a >= 3 && (told || count_b < 3 || abs(dot(plane_a, axis)) >= abs(dot(plane_b, axis)));
-    const float3 reference_plane = reference_is_a ? plane_a : plane_b; // out of the reference, towards the incident
+    const float3 reference_plane = reference_is_a ? plane_a : plane_b;
     normal = reference_is_a ? -reference_plane : reference_plane;
     thread float3 *reference = reference_is_a ? face_a : face_b;
     thread float3 *incident = reference_is_a ? face_b : face_a;
@@ -1355,10 +1372,10 @@ static uint ConvexManifold(
     uint poly_count = incident_count;
     for (uint i = 0; i < incident_count; ++i) {
         poly[i] = incident[i];
-        // A corner sits on its two edges, and a lone point or segment end is named by itself alone.
+
         poly_names[i] = incident_count >= 3 ? ((1u << i) | (1u << ((i + incident_count - 1) % incident_count))) : (1u << i);
     }
-    // Relative to where the face is, a dot product's rounding scaling with its inputs.
+
     float scale = 1;
     for (uint i = 0; i < reference_count; ++i) scale = max(scale, length(reference[i]));
     const float tolerance = 1e-5f * scale;
@@ -1409,20 +1426,19 @@ static uint ConvexManifold(
         }
     } else if (incident_count >= 3) {
         for (uint e = 0; e < reference_count; ++e) {
-            float3 unit; // out of the reference face, so the kept part is inside it
+            float3 unit;
             if (!SidePlane(reference, reference_count, e, reference_plane, unit)) continue;
             poly_count = ClipAgainst(poly, poly_names, poly_count, unit, dot(unit, reference[e]), 1u << (8 + e), tolerance, MaxClipPoints, clipped, clipped_names);
         }
     } else if (incident_count == 1) {
-        // One point, which the loop below would keep unconditionally.
-        // It is on the reference face only when inside every side plane, a corner level with a face but off to the side not being in contact.
+        // Reject a lone incident point outside a side plane; polygon clipping would retain it unconditionally.
         for (uint e = 0; e < reference_count; ++e) {
             float3 unit;
             if (!SidePlane(reference, reference_count, e, reference_plane, unit)) continue;
             if (dot(unit, poly[0] - reference[e]) > tolerance) poly_count = 0;
         }
     } else if (incident_count == 2) {
-        // A segment, clipped as an interval because Sutherland-Hodgman would emit its cut point twice.
+        // Interval clipping emits each segment intersection once.
         const float3 from = poly[0], along = poly[1] - poly[0];
         float low = 0, high = 1;
         uint low_name = 1u << 0, high_name = 1u << 1;
@@ -1432,7 +1448,7 @@ static uint ConvexManifold(
             const float offset = dot(unit, reference[e]);
             const float at_from = dot(unit, from) - offset, at_to = dot(unit, poly[1]) - offset;
             const float slope = at_to - at_from;
-            if (abs(slope) < 1e-12f) { // parallel to the plane, so wholly in or wholly out
+            if (abs(slope) < 1e-12f) {
                 if (at_from > tolerance) poly_count = 0;
                 continue;
             }
@@ -1450,14 +1466,14 @@ static uint ConvexManifold(
             poly[1] = from + along * high;
             poly_names[0] = low_name;
             poly_names[1] = high_name;
-            // Clipped down to a point, which is one contact rather than two in the same place.
+
             poly_count = high - low > 1e-6f ? 2 : 1;
         } else {
             poly_count = 0;
         }
     }
 
-    uint reference_face = 63, incident_face = 63; // each named by its lowest vertex index, which is geometry
+    uint reference_face = 63, incident_face = 63;
     for (uint i = 0; i < reference_count; ++i) reference_face = min(reference_face, reference_names[i]);
     for (uint i = 0; i < incident_count; ++i) incident_face = min(incident_face, incident_names[i]);
     const float reference_offset = dot(reference_plane, reference[0]);
@@ -1466,7 +1482,6 @@ static uint ConvexManifold(
 
     uint found = 0;
     for (uint i = 0; i < poly_count && found < MaxClipPoints; ++i) {
-        // How far the incident point stands off the reference face plane, before the radii come off.
         const float stand_off = dot(reference_plane, poly[i]) - reference_offset;
         if (stand_off - reference_radius - incident_radius >= margin) continue;
         const float3 on_reference = poly[i] - (stand_off - reference_radius) * reference_plane;
@@ -1799,9 +1814,30 @@ static uint GatherTriangles(
     return found;
 }
 
+static bool TriangleBoundsOverlap(
+    Shape a, Shape b, uint ai, uint bi, float3 offset, float3x3 rotation, float margin,
+    device const Triangle *triangles, device const float3 *vertices
+) {
+    const Triangle ta = triangles[a.FirstTriangle + ai], tb = triangles[b.FirstTriangle + bi];
+    const float3 al = min(vertices[ta.A], min(vertices[ta.B], vertices[ta.C]));
+    const float3 ah = max(vertices[ta.A], max(vertices[ta.B], vertices[ta.C]));
+    const float3 bl = min(vertices[tb.A], min(vertices[tb.B], vertices[tb.C]));
+    const float3 bh = max(vertices[tb.A], max(vertices[tb.B], vertices[tb.C]));
+    const float3 ca = (al + ah) * 0.5f, cb = (bl + bh) * 0.5f;
+    const float3 ra = (ah - al) * 0.5f, rb = (bh - bl) * 0.5f;
+    const float3 d = offset + rotation * ca - cb;
+    const float guard = margin + 1e-5f * max(1.f, length(offset) + length(ca) + length(cb) + length(ra) + length(rb));
+    const float3 ea = abs(rotation[0]) * ra.x + abs(rotation[1]) * ra.y + abs(rotation[2]) * ra.z;
+    if (any(abs(d) > ea + rb + guard)) return false;
+    const float3x3 inverse = transpose(rotation);
+    const float3 eb = abs(inverse[0]) * rb.x + abs(inverse[1]) * rb.y + abs(inverse[2]) * rb.z;
+    return !any(abs(inverse * d) > eb + ra + guard);
+}
+
+// Walk both trees, then refine overlapping leaves without changing candidate order.
 static uint GatherMeshPairs(
     Shape a, Shape b, float3 offset, float3x3 rotation, float margin,
-    device const BvhNode *nodes, thread uint2 *stack, thread uint &depth, thread uint2 *out
+    device const BvhNode *nodes, device const Triangle *triangles, device const float3 *vertices, bool cached, uint lane, thread uint2 *stack, thread uint &depth, thread uint2 *out
 ) {
     uint found = 0;
     while (depth > 0) {
@@ -1821,9 +1857,27 @@ static uint GatherMeshPairs(
                 stack[depth++] = at;
                 return found;
             }
-            for (uint i = 0; i < na.Count; ++i)
-                for (uint j = 0; j < nb.Count; ++j)
-                    out[found++] = uint2(na.First + i, nb.First + j);
+            // At most four triangles per leaf fit their Cartesian pairs in one SIMD mask.
+            const uint pairs = na.Count * nb.Count;
+            uint present = (1u << pairs) - 1;
+            // Empty visited queries update patch metadata when reporting starts on sleeping contacts.
+            if (!cached) {
+#if COLLECT_LANES >= 32
+                const uint pair = lane % 32;
+                bool keep = false;
+                if (pair < pairs) keep = TriangleBoundsOverlap(a, b, na.First + pair / nb.Count, nb.First + pair % nb.Count, offset, rotation, margin, triangles, vertices);
+                present = uint(ulong(simd_ballot(keep)));
+#else
+                present = 0;
+                for (uint pair = 0; pair < pairs; ++pair)
+                    if (TriangleBoundsOverlap(a, b, na.First + pair / nb.Count, nb.First + pair % nb.Count, offset, rotation, margin, triangles, vertices)) present |= 1u << pair;
+#endif
+            }
+            while (present) {
+                const uint pair = ctz(present);
+                present &= present - 1;
+                out[found++] = uint2(na.First + pair / nb.Count, nb.First + pair % nb.Count);
+            }
             continue;
         }
         if (depth + 2 > 2 * MeshStackDepth) continue;
@@ -1869,7 +1923,13 @@ static CollisionMask LeafFilter(Shape root, uint leaf, Filter body, device const
     return root.Kind == ShapeCompound ? ResolveFilter(shapes[ChildOf(root, leaf, children)], inherited) : inherited;
 }
 
+#ifndef CACHE_BOUNDS_HINT
+#define CACHE_BOUNDS_HINT 0
+#endif
 kernel void BuildBodyBounds(
+#if CACHE_BOUNDS_HINT
+    device QueryArenaHeader *query_header [[buffer(11)]], device uint *query_snapshot [[buffer(18)]],
+#endif
     device const Pose *poses [[buffer(0)]], device const Index *body_shapes [[buffer(6)]],
     device const Shape *shapes [[buffer(8)]], device BodyBounds *bounds [[buffer(14)]],
     device const Velocity *velocities [[buffer(3)]],
@@ -1885,6 +1945,24 @@ kernel void BuildBodyBounds(
     const uint lane = 0;
 #endif
     if (body >= p.BodyCount) return;
+#if CACHE_BOUNDS_HINT
+    if (lane == 0) {
+        bool changed = false;
+        for (uint word = 0; word < sizeof(Pose) / sizeof(uint); ++word) {
+            const uint at = body * (sizeof(Pose) / sizeof(uint)) + word;
+            const uint value = ((device const uint *)poses)[at];
+            changed |= query_snapshot[at] != value;
+            query_snapshot[at] = value;
+        }
+        if (changed && query_header->Valid) {
+            atomic_store_explicit((device atomic_uint *)&query_header->Reuse, 0u, memory_order_relaxed);
+            atomic_store_explicit((device atomic_uint *)&query_header->DynamicSame, 0u, memory_order_relaxed);
+            atomic_store_explicit((device atomic_uint *)&query_header->InputX, 0u, memory_order_relaxed);
+            atomic_store_explicit((device atomic_uint *)&query_header->GeometryX, 0u, memory_order_relaxed);
+        }
+    }
+#endif
+
     BodyBounds result{float3(INFINITY), float3(-INFINITY)};
     const Index root = body_shapes[body];
     if (root != NoIndex) {
@@ -1976,13 +2054,120 @@ static device QueryBatch *QueryBatches(device uint *pool) { return (device Query
 static device QueryContext *QueryContexts(device uint *pool) { return (device QueryContext *)((device uchar *)pool + QueryHeader(pool).ContextOffset); }
 static device QueuedQuery *QueryRecords(device uint *pool) { return (device QueuedQuery *)((device uchar *)pool + QueryHeader(pool).TaskOffset); }
 static device GeometryManifold *QueryResults(device uint *pool) { return (device GeometryManifold *)((device uchar *)pool + QueryHeader(pool).ResultOffset); }
+
+kernel void ResetQueryReuse(device uint *pool [[buffer(11)]], constant QueryInputSpec &spec [[buffer(9)]]) {
+    device QueryArenaHeader &h = QueryHeader(pool);
+    h.DynamicSame = h.Valid;
+    h.Reuse = h.DynamicSame && h.GeometryValid;
+    h.GeometryX = h.DynamicSame && !h.GeometryChecked ? (spec.Offsets[13] - spec.Offsets[8] + 127) / 128 : 0;
+    h.GeometryY = h.GeometryZ = 1;
+    h.InputX = (spec.Words - (spec.Offsets[13] - spec.Offsets[8]) + 127) / 128;
+    h.InputY = h.InputZ = 1;
+}
+kernel void CheckQueryInputs(
+    device const uint *poses [[buffer(0)]], device const uint *velocities [[buffer(3)]],
+    device const uint *masses [[buffer(4)]], device const Contact *contacts [[buffer(5)]], device const uint *body_shapes [[buffer(6)]],
+    constant StepParams &p [[buffer(7)]], device const uint *shapes [[buffer(8)]], constant QueryInputSpec &spec [[buffer(9)]],
+    device const uint *materials [[buffer(10)]], device uint *pool [[buffer(11)]], device const uint *children [[buffer(15)]],
+    device uint *snapshot [[buffer(18)]], device const uint *filters [[buffer(19)]], device const uint *jointed [[buffer(20)]],
+    device const uint *quiet [[buffer(21)]], device const uint *vertices [[buffer(27)]], device const uint *triangles [[buffer(28)]],
+    device const uint *nodes [[buffer(29)]], device const uint *faces [[buffer(30)]],
+    uint id [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint skip = spec.Offsets[13] - spec.Offsets[8];
+    if (id >= spec.Offsets[8]) id += skip;
+    bool changed = false;
+    if (id < spec.Words) {
+        uint region = 0;
+        while (region < 15 && id >= spec.Offsets[region + 1]) ++region;
+        const uint at = id - spec.Offsets[region];
+        uint value = 0;
+        switch (region) {
+            case 0: value = poses[at]; break;
+            case 1: value = velocities[at]; break;
+            case 2: value = masses[at]; break;
+            case 3: value = body_shapes[at]; break;
+            case 4: value = shapes[at]; break;
+            case 5: value = materials[at]; break;
+            case 6: value = filters[at]; break;
+            case 7: value = jointed[at]; break;
+            case 8: value = vertices[at]; break;
+            case 9: value = faces[at]; break;
+            case 10: value = triangles[at]; break;
+            case 11: value = nodes[at]; break;
+            case 12: value = children[at]; break;
+            default: break;
+        }
+        if (region == 13) value = ((constant uint *)&p)[at];
+        else if (region == 14) {
+            value = Frozen(((device const BodyMass *)masses)[at], ((device const Velocity *)velocities)[at], quiet[at], p);
+            // Partial queues must be rebuilt so overflow owners retain their normal recomputation.
+            if (at < p.BodyCount && QueryHeader(pool).Valid && pool[QueryOwnerOffset(p.BodyCount) + at]) changed = true;
+        } else if (region == 15) {
+            device const Contact &c = contacts[at / 8];
+            switch (at % 8) {
+                case 0: value = c.Active; break;
+                case 1: value = c.BodyB; break;
+                case 2: value = c.Feature; break;
+                case 3: value = c.SubShape; break;
+                case 4: value = c.SubShapeA; break;
+                case 5: value = uint(c.Children); break;
+                case 6: value = uint(c.Children >> 32); break;
+                case 7: value = as_type<uint>(c.NominalArea); break;
+            }
+        }
+        changed |= snapshot[id] != value;
+        snapshot[id] = value;
+    }
+    const bool wave_changed = simd_any(changed);
+    if (lane == 0 && wave_changed) {
+        atomic_store_explicit((device atomic_uint *)&QueryHeader(pool).Reuse, 0u, memory_order_relaxed);
+        atomic_store_explicit((device atomic_uint *)&QueryHeader(pool).DynamicSame, 0u, memory_order_relaxed);
+        atomic_store_explicit((device atomic_uint *)&QueryHeader(pool).GeometryX, 0u, memory_order_relaxed);
+    }
+}
+kernel void CheckQueryGeometry(
+    constant QueryInputSpec &spec [[buffer(9)]], device uint *pool [[buffer(11)]],
+    device const uint *children [[buffer(15)]], device uint *snapshot [[buffer(18)]],
+    device const uint *vertices [[buffer(27)]], device const uint *triangles [[buffer(28)]],
+    device const uint *nodes [[buffer(29)]], device const uint *faces [[buffer(30)]],
+    uint id [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    // Motion can suppress this dispatch; only an executed check validates the snapshot.
+    if (id == 0) QueryHeader(pool).GeometryChecked = 1;
+    id += spec.Offsets[8];
+    bool changed = false;
+    if (id < spec.Offsets[13]) {
+        uint region = 8;
+        while (region < 12 && id >= spec.Offsets[region + 1]) ++region;
+        const uint at = id - spec.Offsets[region];
+        uint value = 0;
+        switch (region) {
+            case 8: value = vertices[at]; break;
+            case 9: value = faces[at]; break;
+            case 10: value = triangles[at]; break;
+            case 11: value = nodes[at]; break;
+            case 12: value = children[at]; break;
+        }
+        changed = snapshot[id] != value;
+        snapshot[id] = value;
+    }
+    const bool wave_changed = simd_any(changed);
+    if (lane == 0 && wave_changed) atomic_store_explicit((device atomic_uint *)&QueryHeader(pool).Reuse, 0u, memory_order_relaxed);
+}
 kernel void ResetQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]) {
     if (body >= p.BodyCount) return;
+    if (QueryHeader(pool).Reuse) {
+        if (body == 0) QueryHeader(pool).TaskCount = 0;
+        return;
+    }
     if (body == 0) {
+        QueryHeader(pool).GeometryValid = QueryHeader(pool).DynamicSame;
+        QueryHeader(pool).Valid = 1;
         QueryHeader(pool).TaskCount = 0;
         QueryHeader(pool).DispatchY = QueryHeader(pool).DispatchZ = 1;
         QueryHeader(pool).ContextCount = QueryHeader(pool).ResultCount = QueryHeader(pool).BatchCount = 0;
-        const uint bytes = QueryHeader(pool).Bytes, begin = ((QueryHeaderWords + 2 * p.BodyCount) * sizeof(uint) + 15) & ~15u;
+        const uint bytes = QueryHeader(pool).Bytes, begin = ((QueryOwnerOffset(p.BodyCount) + p.BodyCount) * sizeof(uint) + 15) & ~15u;
         const uint part = (bytes - begin) / 4;
         QueryHeader(pool).TaskCapacity = part / sizeof(QueuedQuery);
         QueryHeader(pool).ContextCapacity = part / sizeof(QueryContext);
@@ -1993,8 +2178,9 @@ kernel void ResetQueries(device uint *pool [[buffer(11)]], constant StepParams &
         QueryHeader(pool).ResultOffset = (QueryHeader(pool).TaskOffset + QueryHeader(pool).TaskCapacity * sizeof(QueuedQuery) + 15) & ~15u;
         QueryHeader(pool).ResultCapacity = (bytes - QueryHeader(pool).ResultOffset) / sizeof(GeometryManifold);
     }
-    pool[QueryHeaderWords + body] = NoIndex;
-    pool[QueryHeaderWords + p.BodyCount + body] = 0;
+    for (uint part = 0; part < QueryPartitions(p.BodyCount); ++part)
+        pool[QueryHeadOffset(p.BodyCount, body, part)] = NoIndex;
+    pool[QueryOwnerOffset(p.BodyCount) + body] = 0;
 }
 
 static GeometryManifold QueryGeometry(
@@ -2042,7 +2228,7 @@ static GeometryManifold QueryGeometry(
         Triangle triangle = mesh_triangles[index];
         sub_shape = index;
         Poly face = MakeTriangle(q.TargetShapePose, triangle);
-        if (OutsideFaces(q.OwnPoly, face, hull_vertices, hull_faces, q.Reach)) return {};
+        if (OutsideFaces(q.OwnPoly, face, hull_vertices, hull_faces, q.Reach, lane)) return {};
         const float3 first = PolyVertex(face, hull_vertices, 0);
         const float3 turn = cross(PolyVertex(face, hull_vertices, 1) - first, PolyVertex(face, hull_vertices, 2) - first);
         const float area = length(turn);
@@ -2063,16 +2249,16 @@ static GeometryManifold QueryGeometry(
         }
 
         // A mesh has no interior, so a body wholly behind a triangle is past it.
-        const float3 top = PolySupportPoint(q.OwnPoly, hull_vertices, outward);
+        const float3 top = PolySupportPoint(q.OwnPoly, hull_vertices, outward, lane);
         if (dot(top - first, outward) + q.OwnPoly.Radius <= 0) return {};
-        const float3 bottom = PolySupportPoint(q.OwnPoly, hull_vertices, -outward);
+        const float3 bottom = PolySupportPoint(q.OwnPoly, hull_vertices, -outward, lane);
         const bool within = dot(bottom - first, outward) - q.OwnPoly.Radius < q.Reach;
         if (!within) return {};
 
         // The triangle goes in first and with its own normal, which makes it the reference face every time.
         // The manifold is then the body's face clipped into the triangle, and every point is named after the geometry under it.
         // The result comes back the other way round, out of the mesh.
-        found = ConvexManifold(face, q.OwnPoly, hull_vertices, hull_faces, q.Reach, -outward, points_there, points_here, features, normal);
+        found = ConvexManifold(face, q.OwnPoly, hull_vertices, hull_faces, q.Reach, -outward, points_there, points_here, features, normal, lane);
 
         // Where that finds nothing while the body is in range, the given direction is wrong for this geometry.
         // A body over a crease presents, to each slope's normal, the feature of itself over the other slope, which the clip drops.
@@ -2082,7 +2268,7 @@ static GeometryManifold QueryGeometry(
         // An inactive edge is a seam whose neighbour holds the body on its own face.
         const bool searched = found == 0 && within && triangle.ActiveEdges != 0;
         if (searched)
-            found = ConvexManifold(face, q.OwnPoly, hull_vertices, hull_faces, q.Reach, float3(0), points_there, points_here, features, normal);
+            found = ConvexManifold(face, q.OwnPoly, hull_vertices, hull_faces, q.Reach, float3(0), points_there, points_here, features, normal, lane);
         normal = -normal;
 #if !SENSOR_PASS
         // Seam ownership removes solver points without shrinking the geometric patch.
@@ -2481,20 +2667,20 @@ static GeometryManifold QueryGeometry(
 }
 
 kernel void EvaluateQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], device const float3 *vertices [[buffer(27)]], device const HullFace *faces [[buffer(30)]], device const Triangle *triangles [[buffer(28)]], uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    if (group >= min(QueryHeader(pool).TaskCount, QueryHeader(pool).TaskCapacity)) return;
+    if (QueryHeader(pool).Reuse || group >= min(QueryHeader(pool).TaskCount, QueryHeader(pool).TaskCapacity)) return;
     device QueuedQuery &task = QueryRecords(pool)[group];
     if (task.Batch >= QueryHeader(pool).BatchCapacity) return;
     device QueryBatch &batch = QueryBatches(pool)[task.Batch];
     device QueryContext &context = QueryContexts(pool)[batch.Context];
     GeometryQuery query = context.Query;
-    const bool cooperate = COLLECT_LANES >= 32 && ConvexLeaf(query.Shape.Kind) && ConvexLeaf(query.Target.Kind) && (query.Shape.Kind == ShapeHull || query.Target.Kind == ShapeHull);
+    const bool cooperate = COLLECT_LANES >= 32 && ((ConvexLeaf(query.Shape.Kind) && ConvexLeaf(query.Target.Kind) && (query.Shape.Kind == ShapeHull || query.Target.Kind == ShapeHull)) || (query.Shape.Kind == ShapeHull && query.Target.Kind == ShapeMesh));
     if (!cooperate && lane != 0) return;
     query.Weld = task.Weld;
     if (query.MeshPair) query.OwnPoly = MakeTriangle(query.ShapePose, triangles[task.OwnTriangle]);
     const GeometryManifold result = QueryGeometry(query, task.Candidate, task.OwnTriangle, task.Previous, vertices, faces, triangles, cooperate ? lane : NoIndex);
     if (lane == 0 && result.Visited && (result.Count || context.Cached)) {
         const uint at = atomic_fetch_add_explicit((device atomic_uint *)(&QueryHeader(pool).ResultCount), 1u, memory_order_relaxed);
-        if (at >= QueryHeader(pool).ResultCapacity) atomic_fetch_add_explicit((device atomic_uint *)(pool + QueryHeaderWords + p.BodyCount + context.Owner), 1u, memory_order_relaxed);
+        if (at >= QueryHeader(pool).ResultCapacity) atomic_fetch_add_explicit((device atomic_uint *)(pool + QueryOwnerOffset(p.BodyCount) + context.Owner), 1u, memory_order_relaxed);
         else {
             QueryResults(pool)[at] = result;
             task.Result = at;
@@ -2674,18 +2860,41 @@ kernel void CollectContacts(
 #if COLLECT_LANES == 1
     const uint lane = 0;
 #endif
+#if PREPARE_QUERIES
+    const uint partitions = QueryPartitions(p.BodyCount);
+    const uint partition = body % partitions;
+    body /= partitions;
+#endif
     if (body >= p.BodyCount) return;
+#if PREPARE_QUERIES
+    if (QueryHeader(query_pool).Reuse) return;
+    const Index partition_shape = body_shapes[body];
+    if (partition_shape == NoIndex) return;
+    const Shape partition_root = shapes[partition_shape];
+    if (partition_root.Kind == ShapePlane) return;
+    const uint partition_leaves = partition_root.Kind == ShapeCompound ? partition_root.VertexCount : 1;
+    const uint partner_partitions = max(partitions / max(partition_leaves, 1u), 1u);
+    const uint leaf_partitions = partitions / partner_partitions;
+    const uint partition_width = partition_leaves / leaf_partitions + uint(partition_leaves % leaf_partitions != 0);
+    const uint first_leaf = (partition / partner_partitions) * partition_width;
+    if (first_leaf >= partition_leaves) return;
+    const uint last_leaf = first_leaf + min(partition_width, partition_leaves - first_leaf);
+    const uint partner_width = p.BodyCount / partner_partitions + uint(p.BodyCount % partner_partitions != 0);
+    const uint first_partner = (partition % partner_partitions) * partner_width;
+    if (first_partner >= p.BodyCount) return;
+    const uint last_partner = first_partner + min(partner_width, p.BodyCount - first_partner);
+#endif
 #if QUEUED_QUERIES
-    if (query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+    if (query_pool[QueryOwnerOffset(p.BodyCount) + body]) return;
 #elif RECOMPUTE_QUERIES
-    if (!query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+    if (!query_pool[QueryOwnerOffset(p.BodyCount) + body]) return;
 #endif
 
     if (!PREPARE_QUERIES && lane == 0) contact_refusals[body] = 0;
 #if PREPARE_QUERIES || QUEUED_QUERIES
     device QueuedQuery *query_records = QueryRecords(query_pool);
     COLLECT_STORAGE uint query_base, context_base, batch_base;
-    COLLECT_STORAGE bool first_context;
+    COLLECT_STORAGE bool first_context, query_failed;
     device QueryBatch *query_batches = QueryBatches(query_pool);
     device QueryContext *query_contexts = QueryContexts(query_pool);
     uint query_tail = NoIndex;
@@ -2788,23 +2997,25 @@ kernel void CollectContacts(
     if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
 #if QUEUED_QUERIES
     if (lane == 0) {
-        for (Index context_at = query_pool[QueryHeaderWords + body]; context_at != NoIndex; context_at = query_batches[context_at].Next) {
-            device const QueryBatch &batch = query_batches[context_at];
-            device const QueryContext &context = query_contexts[batch.Context];
-            for (uint word = 0; word < 2; ++word) {
-                uint present = batch.Present[word];
-                while (present) {
-                    const uint query_at = batch.First + 32 * word + ctz(present);
-                    present &= present - 1;
-                    const QueuedQuery record = query_records[query_at];
-                    const GeometryQuery q = context.Query;
-                    const Index other = context.Other;
-                    const uint own_leaf = context.OwnLeaf, target_leaf = context.TargetLeaf;
-                    const Shape other_body_shape = shapes[body_shapes[other]];
-                    const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
+        for (uint part = 0; part < QueryPartitions(p.BodyCount); ++part) {
+            for (Index context_at = query_pool[QueryHeadOffset(p.BodyCount, body, part)]; context_at != NoIndex; context_at = query_batches[context_at].Next) {
+                device const QueryBatch &batch = query_batches[context_at];
+                device const QueryContext &context = query_contexts[batch.Context];
+                for (uint word = 0; word < 2; ++word) {
+                    uint present = batch.Present[word];
+                    while (present) {
+                        const uint query_at = batch.First + 32 * word + ctz(present);
+                        present &= present - 1;
+                        const QueuedQuery record = query_records[query_at];
+                        const GeometryQuery q = context.Query;
+                        const Index other = context.Other;
+                        const uint own_leaf = context.OwnLeaf, target_leaf = context.TargetLeaf;
+                        const Shape other_body_shape = shapes[body_shapes[other]];
+                        const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
 
-                    const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
-                    CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                        const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
+                        CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                    }
                 }
             }
         }
@@ -2812,7 +3023,11 @@ kernel void CollectContacts(
 #else
     // Every leaf of this body against every leaf of every other, run full or not.
     // Which contacts a body keeps must not depend on the order the partners were visited in, and the refusal count below is then exact.
+#if PREPARE_QUERIES
+    for (uint own_leaf = first_leaf; own_leaf < last_leaf; ++own_leaf) {
+#else
     for (uint own_leaf = 0; own_leaf < own_leaf_count; ++own_leaf) {
+#endif
         Shape shape = shapes[body_shape.Kind == ShapeCompound ? ChildOf(body_shape, own_leaf, compound_children) : shape_index];
         if (body_shape.Kind == ShapeCompound) shape.Local = ComposePose(body_shape.Local, shape.Local);
         if (shape.Kind == ShapePlane) continue;
@@ -2829,7 +3044,11 @@ kernel void CollectContacts(
         const uint geometry_lane = COLLECT_LANES >= 32 ? lane % 32 : NoIndex;
         float own_reach = shape.Kind == ShapeMesh ? -1 : PolyReach(leaf_poly, hull_vertices, geometry_lane) + shape.Radius;
 #if BROAD_PHASE_MODE == 1
+#if PREPARE_QUERIES
+        for (uint other = first_partner; other < last_partner; ++other) {
+#else
         for (uint other = 0; other < p.BodyCount; ++other) {
+#endif
             if (!(broad_phase[body].Candidates & (1u << other))) continue;
 #else
         for (uint other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, 0); other != NoIndex; other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, other + 1)) {
@@ -2914,7 +3133,7 @@ kernel void CollectContacts(
                         const float4 inverse = QuatConjugate(target_bounds.Orientation);
                         const float3 offset = Rotate(inverse, shape_pose.Position - ComposePose(target_pose, target.Local).Position);
                         const float3x3 rotation = QuatToMatrix(QuatMul(inverse, shape_pose.Orientation));
-                        own_count = GatherMeshPairs(shape, target, offset, rotation, reach, bvh_nodes, own_walk, own_depth, own_candidates);
+                        own_count = GatherMeshPairs(shape, target, offset, rotation, reach, bvh_nodes, mesh_triangles, hull_vertices, cached_pair, lane, own_walk, own_depth, own_candidates);
                         own_walking = own_depth > 0;
                     } else {
                         own_walking = false;
@@ -3026,16 +3245,18 @@ kernel void CollectContacts(
                                     first_context = context_base == NoIndex;
                                     if (first_context) context_base = ReserveQueries((device atomic_uint *)(&QueryHeader(query_pool).ContextCount), QueryHeader(query_pool).ContextCapacity, 1);
                                     batch_base = ReserveQueries((device atomic_uint *)(&QueryHeader(query_pool).BatchCount), QueryHeader(query_pool).BatchCapacity, 1);
-                                    if (query_base == NoIndex || context_base >= QueryHeader(query_pool).ContextCapacity || batch_base >= QueryHeader(query_pool).BatchCapacity) query_pool[QueryHeaderWords + p.BodyCount + body] += query_count;
+                                    query_failed = query_base == NoIndex || context_base >= QueryHeader(query_pool).ContextCapacity || batch_base >= QueryHeader(query_pool).BatchCapacity;
+                                    if (query_failed) atomic_fetch_add_explicit((device atomic_uint *)(query_pool + QueryOwnerOffset(p.BodyCount) + body), query_count, memory_order_relaxed);
                                     else {
-                                        if (query_tail == NoIndex) query_pool[QueryHeaderWords + body] = batch_base;
+                                        if (query_tail == NoIndex) query_pool[QueryHeadOffset(p.BodyCount, body, partition)] = batch_base;
                                         else query_batches[query_tail].Next = batch_base;
                                         query_tail = batch_base;
                                     }
                                 }
                                 if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                                 if (lane < query_count && query_base != NoIndex && query_base + lane < QueryHeader(query_pool).TaskCapacity) query_records[query_base + lane].Batch = NoIndex;
-                                if (query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+                                // Use a group-local exit decision to keep barriers uniform when other partitions fail concurrently.
+                                if (query_failed) return;
 #endif
                                 const uint manifold = mesh_pair ? 0 : batch + lane;
                                 const bool cooperate = COLLECT_LANES >= 32 && ConvexLeaf(shape.Kind) && ConvexLeaf(target.Kind) && (shape.Kind == ShapeHull || target.Kind == ShapeHull);
@@ -3181,13 +3402,13 @@ struct JointMeasure {
     float4 Relative;
 };
 
-static JointMeasure MeasureJoint(Joint joint, Pose a, Pose b, device const Pose *initial) {
-    const float4 frame_b = JointFrame(b.Orientation, joint.FrameB);
-    const float4 relative = RelativeFrame(JointFrame(a.Orientation, joint.FrameA), frame_b);
-    const uint twist_axis = TwistAxis(joint.AngularModes);
-    // Unwrap against the step's initial twist without advancing it during iterations.
-    const float unwrapped = twist_axis <= 2 ? TwistAngle(relative, UnitAxis(twist_axis), joint.Twist) : 0;
-    return {frame_b, WorldPoint(a, joint.AnchorA) - WorldPoint(b, joint.AnchorB), AngularError(relative, twist_axis, unwrapped), RotationVector(QuatMul(a.Orientation, QuatConjugate(initial[joint.BodyA].Orientation))) - RotationVector(QuatMul(b.Orientation, QuatConjugate(initial[joint.BodyB].Orientation))), relative};
+template<typename JointPointer>
+static JointMeasure MeasureJoint(JointPointer joint, Pose a, Pose b, device const Pose *initial) {
+    const float4 frame_b = JointFrame(b.Orientation, joint->FrameB);
+    const float4 relative = RelativeFrame(JointFrame(a.Orientation, joint->FrameA), frame_b);
+    const uint twist_axis = TwistAxis(joint->AngularModes);
+    const float unwrapped = twist_axis <= 2 ? TwistAngle(relative, UnitAxis(twist_axis), joint->Twist) : 0;
+    return {frame_b, WorldPoint(a, joint->AnchorA) - WorldPoint(b, joint->AnchorB), AngularError(relative, twist_axis, unwrapped), RotationVector(QuatMul(a.Orientation, QuatConjugate(initial[joint->BodyA].Orientation))) - RotationVector(QuatMul(b.Orientation, QuatConjugate(initial[joint->BodyB].Orientation))), relative};
 }
 
 // The configuration of one axis of a joint, in its row's units: metres and newtons for a linear axis, radians and newton metres for an angular one.
@@ -3205,24 +3426,25 @@ struct AxisSetup {
 };
 
 // Six base rows followed by six independent drives, each in linear XYZ then angular XYZ order.
-static AxisSetup JointRowAt(Joint joint, JointMeasure measured, uint row) {
+template<typename JointPointer>
+static AxisSetup JointRowAt(JointPointer joint, JointMeasure measured, uint row) {
     const uint r = row % 3;
     const bool linear = row % 6 < 3;
     const bool drive = row >= 6;
     AxisSetup setup;
-    if (!drive) setup = linear ? AxisSetup{AxisMode(joint.LinearModes, r), joint.LinearStiffness[r], joint.LinearDamping[r], joint.LinearMotorSpeed[r], joint.LinearMotorTarget[r], joint.LinearMotorMaxForce[r], joint.LinearLimitLow[r], joint.LinearLimitHigh[r]} : AxisSetup{AxisMode(joint.AngularModes, r), joint.AngularStiffness[r], joint.AngularDamping[r], joint.MotorSpeed[r], joint.MotorTarget[r], joint.MotorMaxTorque[r], joint.LimitLow[r], joint.LimitHigh[r]};
+    if (!drive) setup = linear ? AxisSetup{AxisMode(joint->LinearModes, r), joint->LinearStiffness[r], joint->LinearDamping[r], joint->LinearMotorSpeed[r], joint->LinearMotorTarget[r], joint->LinearMotorMaxForce[r], joint->LinearLimitLow[r], joint->LinearLimitHigh[r]} : AxisSetup{AxisMode(joint->AngularModes, r), joint->AngularStiffness[r], joint->AngularDamping[r], joint->MotorSpeed[r], joint->MotorTarget[r], joint->MotorMaxTorque[r], joint->LimitLow[r], joint->LimitHigh[r]};
     else {
-        const JointDrive d = joint.Drives[row - 6];
+        const JointDrive d = joint->Drives[row - 6];
         setup = AxisSetup{d.Enabled ? uint(AxisPositioned) : uint(AxisFree), d.Stiffness, d.Damping, d.Speed, d.Target, d.MaxForce, 0, 0};
     }
-    setup.Lambda = drive ? joint.Drives[row - 6].Lambda : (linear ? joint.LambdaLinear[r] : joint.LambdaAngular[r]);
-    setup.Penalty = drive ? joint.Drives[row - 6].Penalty : (linear ? joint.PenaltyLinear[r] : joint.PenaltyAngular[r]);
+    setup.Lambda = drive ? joint->Drives[row - 6].Lambda : (linear ? joint->LambdaLinear[r] : joint->LambdaAngular[r]);
+    setup.Penalty = drive ? joint->Drives[row - 6].Penalty : (linear ? joint->PenaltyLinear[r] : joint->PenaltyAngular[r]);
     const float3 frame_axis = Rotate(measured.FrameB, UnitAxis(r));
-    setup.Axis = linear ? frame_axis : Rotate(measured.FrameB, AngularGradient(measured.Relative, TwistAxis(joint.AngularModes), r));
+    setup.Axis = linear ? frame_axis : Rotate(measured.FrameB, AngularGradient(measured.Relative, TwistAxis(joint->AngularModes), r));
     setup.Value = linear ? dot(measured.Reach, setup.Axis) : measured.Error[r];
-    setup.Began = drive ? joint.Drives[row - 6].Began : (linear ? joint.C0Linear[r] : joint.C0Angular[r]);
+    setup.Began = drive ? joint->Drives[row - 6].Began : (linear ? joint->C0Linear[r] : joint->C0Angular[r]);
     setup.Moved = linear ? setup.Value - setup.Began : dot(measured.Turned, frame_axis);
-    const uint mask = drive ? 0 : (linear ? joint.LinearLimitAxes[r] : joint.AngularLimitAxes[r]);
+    const uint mask = drive ? 0 : (linear ? joint->LinearLimitAxes[r] : joint->AngularLimitAxes[r]);
     if (mask && (!linear || popcount(mask) > 1)) {
         float3 local = linear ? Rotate(QuatConjugate(measured.FrameB), measured.Reach) : RotationVector(measured.Relative);
         if (linear || mask == 7) {
@@ -3233,11 +3455,8 @@ static AxisSetup JointRowAt(Joint joint, JointMeasure measured, uint row) {
         } else if (popcount(mask) == 1) {
             float4 q = measured.Relative;
             if (q.w < 0) q = -q;
-            const float denominator = q.w * q.w + q[r] * q[r];
             setup.Value = 2 * atan2(q[r], q.w);
-            const float3 axis = UnitAxis(r);
-            const float3 gradient = denominator > 1e-8f ? (q.w * q.w * axis + q.w * cross(q.xyz, axis) + q[r] * q.xyz) / denominator : axis;
-            setup.Axis = Rotate(measured.FrameB, gradient);
+            setup.Axis = Rotate(measured.FrameB, TwistGradient(q, UnitAxis(r), q[r]));
         } else {
             const float3 axis = UnitAxis(ctz(7u ^ mask));
             const float3 turned = Rotate(measured.Relative, axis);
@@ -3319,19 +3538,19 @@ static float RowForce(
 }
 
 // Joints are re-measured every iteration, so a step records only C0 and the penalty decay.
-kernel void PrepareJoints(
-    device Joint *joints [[buffer(16)]], device const Pose *poses [[buffer(0)]],
-    constant StepParams &p [[buffer(7)]], uint index [[thread_position_in_grid]]
+static void PrepareJointsBody(
+    device Joint *joints, device const Pose *poses,
+    constant StepParams &p, uint index
 ) {
     if (index >= p.JointCount) return;
     device Joint &joint = joints[index];
     if (!joint.Active) return;
     const Pose a = poses[joint.BodyA], b = poses[joint.BodyB];
-    // Both errors as the step found them, resolved along the joint frame's own three axes.
+
     const float4 frame_b = JointFrame(b.Orientation, joint.FrameB);
     const float3 reach = WorldPoint(a, joint.AnchorA) - WorldPoint(b, joint.AnchorB);
     for (uint r = 0; r < 3; ++r) joint.C0Linear[r] = dot(reach, Rotate(frame_b, UnitAxis(r)));
-    // The one place the accumulated twist advances, this being the only joint kernel that runs once a step.
+    // Advance accumulated twist once per step.
     const float4 relative = RelativeFrame(JointFrame(a.Orientation, joint.FrameA), frame_b);
     const uint twist_axis = TwistAxis(joint.AngularModes);
     if (twist_axis <= 2) joint.Twist = TwistAngle(relative, UnitAxis(twist_axis), joint.Twist);
@@ -3339,8 +3558,8 @@ kernel void PrepareJoints(
     const JointMeasure measure{frame_b, reach, joint.C0Angular, float3(0), relative};
     const Joint before = joint;
     for (uint r = 0; r < 3; ++r) {
-        if (popcount(joint.LinearLimitAxes[r]) > 1) joint.C0Linear[r] = JointRowAt(before, measure, r).Value;
-        if (joint.AngularLimitAxes[r]) joint.C0Angular[r] = JointRowAt(before, measure, r + 3).Value;
+        if (popcount(joint.LinearLimitAxes[r]) > 1) joint.C0Linear[r] = JointRowAt(&before, measure, r).Value;
+        if (joint.AngularLimitAxes[r]) joint.C0Angular[r] = JointRowAt(&before, measure, r + 3).Value;
     }
     for (uint r = 0; r < 6; ++r) {
         device JointDrive &drive = joint.Drives[r];
@@ -3348,56 +3567,62 @@ kernel void PrepareJoints(
         drive.Penalty = min(clamp(drive.Penalty * p.Gamma, p.PenaltyMin, p.PenaltyMax), drive.Stiffness);
         if (!IsHard(drive.Stiffness)) drive.Lambda = 0;
     }
-    // Eq. 19's decay then Eq. 16's cap: a soft row ramps to its material stiffness and no further.
+
     joint.PenaltyLinear = min(clamp(joint.PenaltyLinear * p.Gamma, p.PenaltyMin, p.PenaltyMax), joint.LinearStiffness);
     joint.PenaltyAngular = min(clamp(joint.PenaltyAngular * p.Gamma, p.PenaltyMin, p.PenaltyMax), joint.AngularStiffness);
-    // A soft row carries no dual, so any stale value is cleared here.
+
     for (uint r = 0; r < 3; ++r) {
         if (!IsHard(joint.LinearStiffness[r])) joint.LambdaLinear[r] = 0;
         if (!IsHard(joint.AngularStiffness[r])) joint.LambdaAngular[r] = 0;
     }
 }
 
-// Eqs. 11 and 16 for joints.
-kernel void UpdateJointDuals(
+kernel void PrepareJoints(
     device Joint *joints [[buffer(16)]], device const Pose *poses [[buffer(0)]],
-    device const Pose *initial [[buffer(1)]], constant StepParams &p [[buffer(7)]],
-    uint index [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]
+    constant StepParams &p [[buffer(7)]], uint index [[thread_position_in_grid]]
 ) {
-    if (index >= p.JointCount) return;
+    PrepareJointsBody(joints, poses, p, index);
+}
+
+// Eqs. 11 and 16 for joints.
+static bool UpdateJointDual(
+    device Joint *joints, device const Pose *poses,
+    device const Pose *initial, constant StepParams &p,
+    threadgroup float2 *updated, uint index, uint lane
+) {
+    if (index >= p.JointCount) return false;
     device Joint &joint = joints[index];
-    if (!joint.Active) return;
-    threadgroup float2 updated[12];
+    if (!joint.Active) return false;
+    bool changed = false;
     if (lane < 12) {
-        const Joint state = joint;
-        const JointMeasure measured = MeasureJoint(state, poses[state.BodyA], poses[state.BodyB], initial);
+        device const Joint &state = joint;
+        const JointMeasure measured = MeasureJoint(&state, poses[state.BodyA], poses[state.BodyB], initial);
         const uint row = lane;
-        const uint r = row % 3;
-        const bool linear = row % 6 < 3;
-        const AxisSetup setup = JointRowAt(state, measured, row);
-        // Read out and written back at the end, MSL having no reference over two device lanes.
+        const AxisSetup setup = JointRowAt(&state, measured, row);
+
         float lambda = setup.Lambda, penalty = setup.Penalty;
+        const uint old_lambda = as_type<uint>(lambda), old_penalty = as_type<uint>(penalty);
         float c, damped, low, high;
-        // A free row and a row off its stops hold nothing, so neither carries a dual forward.
+
         if (setup.Mode == AxisFree || !JointRow(setup, p.DeltaTime, c, damped, low, high)) {
             lambda = 0;
         } else if (!IsHard(setup.Stiffness)) {
-            // Eq. 16's other branch and Algorithm 1 line 33: no dual, and the ramp stops at the material stiffness.
-            // Ramping up to it rather than starting there keeps the stiffness ratio on a body small in the early iterations (Sec. 3.4).
+            // Soft rows have no dual and cap the penalty at material stiffness.
             penalty = min(penalty + p.Beta * abs(c), setup.Stiffness);
         } else {
-            // The dual is the elastic half alone, clamped in the shifted frame. See RowForce.
             const float damping_force = setup.Damping / p.DeltaTime * damped;
             const float requested = penalty * c + lambda + damping_force;
             lambda = clamp(requested, low, high) - damping_force;
-            // Ramps only while strictly inside the bounds, tested against the requested force.
+
             if (requested > low && requested < high) penalty = min(penalty + p.Beta * abs(c), p.PenaltyMax);
         }
+        changed = old_lambda != as_type<uint>(lambda) || old_penalty != as_type<uint>(penalty);
         updated[row] = float2(lambda, penalty);
     }
+    const bool any_changed = simd_any(changed);
     // All rows finish reading the joint before its single writer publishes the updates.
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-    if (lane != 0) return;
+    simdgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (lane != 0) return false;
     for (uint row = 0; row < 12; ++row) {
         const uint r = row % 3;
         const bool linear = row % 6 < 3;
@@ -3413,6 +3638,16 @@ kernel void UpdateJointDuals(
             joint.PenaltyAngular[r] = penalty;
         }
     }
+    return any_changed;
+}
+
+kernel void UpdateJointDuals(
+    device Joint *joints [[buffer(16)]], device const Pose *poses [[buffer(0)]],
+    device const Pose *initial [[buffer(1)]], constant StepParams &p [[buffer(7)]],
+    uint index [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup float2 updated[12];
+    UpdateJointDual(joints, poses, initial, p, updated, index, lane);
 }
 
 kernel void ScanIncoming(
@@ -3469,10 +3704,10 @@ kernel void OffsetIncoming(
     incoming[body].Cursor = start;
 }
 
-kernel void FillIncoming(
-    device Adjacency *incoming [[buffer(17)]], device uint *slots [[buffer(18)]],
-    device const Contact *contacts [[buffer(5)]], constant StepParams &p [[buffer(7)]],
-    uint body [[thread_position_in_grid]]
+static void FillIncomingBody(
+    device Adjacency *incoming, device uint *slots,
+    device const Contact *contacts, constant StepParams &p,
+    uint body
 ) {
     if (body >= p.BodyCount) return;
     for (uint i = 0; i < ContactsPerBody; ++i) {
@@ -3484,21 +3719,37 @@ kernel void FillIncoming(
     }
 }
 
+kernel void FillIncoming(
+    device Adjacency *incoming [[buffer(17)]], device uint *slots [[buffer(18)]],
+    device const Contact *contacts [[buffer(5)]], constant StepParams &p [[buffer(7)]],
+    uint body [[thread_position_in_grid]]
+) {
+    FillIncomingBody(incoming, slots, contacts, p, body);
+}
+
 // Solved bodies require contacts in slot order.
 // Unsolved bodies use this list only for order-independent waking writes.
-kernel void SortIncoming(
-    device const Adjacency *incoming [[buffer(17)]], device uint *slots [[buffer(18)]],
-    device const BodyMass *masses [[buffer(4)]],
-    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
+static void SortIncomingBody(
+    device const Adjacency *incoming, device uint *slots,
+    device const BodyMass *masses,
+    constant StepParams &p, uint body
 ) {
     if (body >= p.BodyCount || !Moves(masses[body])) return;
     const uint start = incoming[body].Start, count = incoming[body].Count;
-    for (uint i = 1; i < count; ++i) { // insertion sort, over a run a body's neighbours keep short
+    for (uint i = 1; i < count; ++i) {
         const uint value = slots[start + i];
         uint j = i;
         for (; j > 0 && slots[start + j - 1] > value; --j) slots[start + j] = slots[start + j - 1];
         slots[start + j] = value;
     }
+}
+
+kernel void SortIncoming(
+    device const Adjacency *incoming [[buffer(17)]], device uint *slots [[buffer(18)]],
+    device const BodyMass *masses [[buffer(4)]],
+    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
+) {
+    SortIncomingBody(incoming, slots, masses, p, body);
 }
 
 // The separation the normal row measures from, before this step's motion.
@@ -3595,23 +3846,23 @@ static void NoteNeighbour(
 // Two amendments, both gated on the pair having gone quiet. See Prioritized.
 // Priority goes by contact degree before index, Welsh-Powell's ordering, because index order is add order.
 // And a quiet body moves down to the lowest free color, which lets a settled coloring improve.
-kernel void UpdateColors(
-    device const uint *colors [[buffer(12)]], device uint *next [[buffer(13)]],
-    device const Contact *contacts [[buffer(5)]], device const BodyMass *masses [[buffer(4)]],
-    device const Joint *joints [[buffer(16)]], device const Adjacency *incoming [[buffer(17)]],
-    device const uint *incoming_slots [[buffer(18)]], device const uint *quiet [[buffer(21)]],
-    device const uint *joint_incidence [[buffer(20)]],
-    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
+static void UpdateColorsBody(
+    device const uint *colors, device uint *next,
+    device const Contact *contacts, device const BodyMass *masses,
+    device const Joint *joints, device const Adjacency *incoming,
+    device const uint *incoming_slots, device const uint *quiet,
+    device const uint *joint_incidence,
+    constant StepParams &p, uint body
 ) {
     if (body >= p.BodyCount) return;
     const uint mine = ColorOf(colors[body]);
     next[body] = colors[body];
     if (!Moves(masses[body])) return;
-    // A sleeping body keeps its color, the sweeps skipping it, so that color constrains nothing.
+
     if (Asleep(quiet[body], p)) return;
     const bool my_quiet = quiet[body] > 0;
 
-    // Two sweeps, because degree must be complete before priority is judged. See NoteNeighbour.
+    // Complete degree counts before comparing priorities.
     uint degree = 0, taken = 0, taken_all = 0;
     const Adjacency neighbours = incoming[body];
     for (uint sweep = 0; sweep < 2; ++sweep) {
@@ -3619,10 +3870,10 @@ kernel void UpdateColors(
             const uint slot = ContactSlot(i, body * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
             if (slot == NoIndex) continue;
             const Index other = ContactPartner(contacts[slot], body);
-            if (!Moves(masses[other])) continue; // the sweeps do not move it, so this body cannot race it
+            if (!Moves(masses[other])) continue;
             NoteNeighbour(sweep, other, colors[other], body, my_quiet && quiet[other] > 0, degree, taken, taken_all);
         }
-        // A joint couples two bodies as a contact does, and without this a jointed pair shares a color and races.
+
         for (uint at = joint_incidence[body]; at < joint_incidence[body + 1]; ++at) {
             const uint index = joint_incidence[at];
             const Index other = JointPartner(joints[index], body, masses);
@@ -3634,23 +3885,50 @@ kernel void UpdateColors(
 
     uint chosen = mine;
     if ((taken & (1u << min(mine, 31u))) != 0) {
-        // Conflicted: move to the lowest color no prioritized neighbour holds, or stay and solve Jacobi.
         const uint best = LowestFree(taken);
         if (best < p.MaxColors) chosen = best;
     } else if (my_quiet) {
-        // Quiet and unconflicted: compact down to a color that is entirely free.
         const uint best = LowestFree(taken_all);
         if (best < mine) chosen = best;
     }
     next[body] = (degree << ColorDegreeShift) | chosen;
 }
 
-kernel void PublishColors(
-    device uint *colors [[buffer(12)]], device const uint *next [[buffer(13)]],
-    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
+kernel void UpdateColors(
+    device const uint *colors [[buffer(12)]], device uint *next [[buffer(13)]],
+    device const Contact *contacts [[buffer(5)]], device const BodyMass *masses [[buffer(4)]],
+    device const Joint *joints [[buffer(16)]], device const Adjacency *incoming [[buffer(17)]],
+    device const uint *incoming_slots [[buffer(18)]], device const uint *quiet [[buffer(21)]],
+    device const uint *joint_incidence [[buffer(20)]],
+    device ColorWork &color_work [[buffer(26)]],
+    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    if (p.BodyCount > SolveLanes && !color_work.ColoringActive) return;
+    UpdateColorsBody(colors, next, contacts, masses, joints, incoming, incoming_slots, quiet, joint_incidence, p, body);
+    // One store per changed SIMD group avoids a contended atomic from every body.
+    const bool changed = simd_any(body < p.BodyCount && next[body] != colors[body]);
+    if (p.BodyCount > SolveLanes && changed && lane == 0)
+        atomic_store_explicit((device atomic_uint *)&color_work.ColoringChanged, 1u, memory_order_relaxed);
+}
+
+static void PublishColorsBody(
+    device uint *colors, device const uint *next,
+    constant StepParams &p, uint body
 ) {
     if (body >= p.BodyCount) return;
     colors[body] = next[body];
+}
+
+kernel void PublishColors(
+    device uint *colors [[buffer(12)]], device const uint *next [[buffer(13)]],
+    device ColorWork &color_work [[buffer(26)]],
+    constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
+) {
+    PublishColorsBody(colors, next, p, body);
+    if (p.BodyCount > SolveLanes && body == 0) {
+        color_work.ColoringActive = color_work.ColoringChanged;
+        color_work.ColoringChanged = 0;
+    }
 }
 
 struct BodyContactRows {
@@ -3667,26 +3945,24 @@ struct BodyJointRows {
     bool Valid, Shared, MineIsA, Active[2];
 };
 
-kernel void SolveBodies(
-    device const Pose *poses [[buffer(0)]], device BodyIterate *iterates [[buffer(11)]], device const Pose *initial [[buffer(1)]],
-    device const Pose *inertial [[buffer(2)]], device const BodyMass *masses [[buffer(4)]],
-    device const Displacement *displacements [[buffer(10)]],
-    device const Contact *contacts [[buffer(5)]], device const uint *colors [[buffer(12)]],
-    device const uint *cursor [[buffer(14)]], device const Joint *joints [[buffer(16)]],
-    device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
-    device const uint *joint_incidence [[buffer(20)]],
-    device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+static bool SolveBody(
+    device const Pose *poses, device BodyIterate *iterates, device const Pose *initial,
+    device const Pose *inertial, device const BodyMass *masses,
+    device const Displacement *displacements,
+    device const Contact *contacts, device const uint *colors,
+    uint color, device const Joint *joints,
+    device const Adjacency *incoming, device const uint *incoming_slots,
+    device const uint *joint_incidence,
+    device const uint *quiet, constant StepParams &p,
+    uint body, uint lane
 ) {
     constexpr uint WorkLanes = SOLVE_BODIES_PER_GROUP == 1 ? 32 : Dof;
     constexpr uint JointsPerBatch = WorkLanes / Dof;
-    if (lane >= WorkLanes * SOLVE_BODIES_PER_GROUP) return;
+    if (lane >= WorkLanes * SOLVE_BODIES_PER_GROUP) return false;
     const uint worker = lane % WorkLanes;
-    const uint body = group * SOLVE_BODIES_PER_GROUP + lane / WorkLanes;
-    if (body >= p.BodyCount) return;
+    if (body >= p.BodyCount) return false;
     const BodyMass mass = masses[body];
-    // The color this pass runs is the slot the cursor was pointed at, modulo the color count.
-    if (!Solved(mass, quiet[body], p) || ColorOf(colors[body]) % p.MaxColors != cursor[0]) return;
+    if (!Solved(mass, quiet[body], p) || ColorOf(colors[body]) % p.MaxColors != color) return false;
 
     const uint block_row = worker % Dof, base = lane - worker;
     Pose pose = poses[body];
@@ -3738,7 +4014,7 @@ kernel void SolveBodies(
             const Contact contact = contacts[slot];
             const bool mine_is_a = contact.BodyA == body;
             const Index other = ContactPartner(contact, body);
-            rows.Shared = Solved(masses[other], quiet[other], p) && ColorOf(colors[other]) % p.MaxColors == cursor[0];
+            rows.Shared = Solved(masses[other], quiet[other], p) && ColorOf(colors[other]) % p.MaxColors == color;
 
             // C is always A minus B.
             const Pose start_a = mine_is_a ? start : initial[contact.BodyA];
@@ -3791,12 +4067,12 @@ kernel void SolveBodies(
         const uint at = first_joint + worker / Dof;
         const uint index = at < joint_count ? joint_incidence[joint_start + at] : NoIndex;
         if (worker < JointsPerBatch * Dof && index < p.JointCount) {
-            const Joint joint = joints[index];
+            device const Joint &joint = joints[index];
             rows.Valid = joint.Active && (joint.BodyA == body || joint.BodyB == body);
             if (rows.Valid) {
                 const bool mine_is_a = joint.BodyA == body;
                 const Index other_body = mine_is_a ? joint.BodyB : joint.BodyA;
-                rows.Shared = Solved(masses[other_body], quiet[other_body], p) && ColorOf(colors[other_body]) % p.MaxColors == cursor[0];
+                rows.Shared = Solved(masses[other_body], quiet[other_body], p) && ColorOf(colors[other_body]) % p.MaxColors == color;
                 const Pose other = rows.Shared ? poses[other_body] : iterates[other_body].Current;
                 const Pose a = mine_is_a ? pose : other, b = mine_is_a ? other : pose;
                 const float side = mine_is_a ? 1 : -1;
@@ -3812,7 +4088,7 @@ kernel void SolveBodies(
                 const float linear_floor = Stabilizing * PairStiffness(mass.InvMass + other_mass.InvMass, p.DeltaTime);
 
                 // Base and drive rows share one rule. A soft row applies Eq. 7 on its extension, with no dual.
-                const JointMeasure measured = MeasureJoint(joint, a, b, initial);
+                const JointMeasure measured = MeasureJoint(&joint, a, b, initial);
                 // Rotation of B changes the measurement axes and the torque arm to A's anchor.
                 if (!mine_is_a) arm += measured.Reach;
                 const float3x3 inverse_inertia = WorldInverseInertia(a.Orientation, masses[joint.BodyA].InvInertiaLocal) +
@@ -3824,7 +4100,7 @@ kernel void SolveBodies(
                 for (uint family = 0; family < 2; ++family) {
                     const uint row = family * Dof + block_row;
                     const bool is_linear = row % 6 < 3;
-                    const AxisSetup setup = JointRowAt(joint, measured, row);
+                    const AxisSetup setup = JointRowAt(&joint, measured, row);
                     float c, damped, low, high;
                     const bool active = setup.Mode != AxisFree && JointRow(setup, p.DeltaTime, c, damped, low, high);
                     float force = 0, stiffness = 0;
@@ -3876,7 +4152,7 @@ kernel void SolveBodies(
                 if (block_row == 3 + i) H[3 + i] = WideAdd(H[3 + i], float2(length(geometric[i]), 0));
         }
     }
-    if (worker >= Dof) return;
+    if (worker >= Dof) return false;
 
     // And the degrees of freedom this body does not have, now that every row is gathered.
     // An infinite inertia about a body axis locks turning about wherever that axis now points, and KHR's pinned wheel authors (0, 1, 0).
@@ -3890,12 +4166,58 @@ kernel void SolveBodies(
     const float step = SolveBlock(H, g, block_row, base);
     const float3 linear{simd_shuffle(step, base + 0), simd_shuffle(step, base + 1), simd_shuffle(step, base + 2)};
     const float3 angular{simd_shuffle(step, base + 3), simd_shuffle(step, base + 4), simd_shuffle(step, base + 5)};
-    if (block_row != 0) return;
-    if (!isfinite(linear.x + linear.y + linear.z + angular.x + angular.y + angular.z)) return;
+    if (block_row != 0) return false;
+    if (!isfinite(linear.x + linear.y + linear.z + angular.x + angular.y + angular.z)) return false;
     const float relaxation = shared_color ? 0.5f : 1.f;
     pose.Position += relaxation * linear;
     pose.Orientation = normalize(QuatMul(QuatFromRotationVector(relaxation * angular), pose.Orientation));
-    iterates[body] = {pose, Since(pose, start)};
+    const BodyIterate before = iterates[body];
+    const Displacement moved = Since(pose, start);
+    const bool changed = any(as_type<uint3>(pose.Position) != as_type<uint3>(before.Current.Position)) ||
+        any(as_type<uint4>(pose.Orientation) != as_type<uint4>(before.Current.Orientation)) ||
+        any(as_type<uint3>(moved.Linear) != as_type<uint3>(before.Moved.Linear)) ||
+        any(as_type<uint3>(moved.Angular) != as_type<uint3>(before.Moved.Angular));
+    iterates[body] = {pose, moved};
+    return changed;
+}
+
+kernel void SolveBodies(
+    device const Pose *poses [[buffer(0)]], device BodyIterate *iterates [[buffer(11)]], device const Pose *initial [[buffer(1)]],
+    device const Pose *inertial [[buffer(2)]], device const BodyMass *masses [[buffer(4)]],
+    device const Displacement *displacements [[buffer(10)]],
+    device const Contact *contacts [[buffer(5)]], device const uint *colors [[buffer(12)]],
+    device const uint *cursor [[buffer(14)]], device const Joint *joints [[buffer(16)]],
+    device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
+    device const uint *joint_incidence [[buffer(20)]],
+#if SOLVE_BODIES_PER_GROUP > 1
+    device const uint *body_ids [[buffer(13)]], device const ColorWork &color_work [[buffer(26)]],
+#endif
+    device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint WorkLanes = SOLVE_BODIES_PER_GROUP == 1 ? 32 : Dof;
+    if (lane >= WorkLanes * SOLVE_BODIES_PER_GROUP) return;
+    const uint work = group * SOLVE_BODIES_PER_GROUP + lane / WorkLanes;
+#if SOLVE_BODIES_PER_GROUP > 1
+    const uint first = color_work.Offsets[cursor[0]], end = color_work.Offsets[cursor[0] + 1];
+    if (work >= end - first) return;
+    const uint body = body_ids[first + work];
+#else
+    const uint body = work;
+    if (body >= p.BodyCount) return;
+#endif
+    SolveBody(poses, iterates, initial, inertial, masses, displacements, contacts, colors, cursor[0], joints, incoming, incoming_slots, joint_incidence, quiet, p, body, lane);
+}
+
+static void PublishBody(
+    device Pose *poses, device const BodyIterate *iterates,
+    device Displacement *displacements,
+    device const BodyMass *masses, device const uint *quiet,
+    constant StepParams &p, uint body
+) {
+    if (body >= p.BodyCount || !Solved(masses[body], quiet[body], p)) return;
+    poses[body] = iterates[body].Current;
+    displacements[body] = iterates[body].Moved;
 }
 
 kernel void PublishPoses(
@@ -3904,30 +4226,22 @@ kernel void PublishPoses(
     device const BodyMass *masses [[buffer(4)]], device const uint *quiet [[buffer(21)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
-    if (body >= p.BodyCount || !Solved(masses[body], quiet[body], p)) return;
-    poses[body] = iterates[body].Current;
-    displacements[body] = iterates[body].Moved;
+    PublishBody(poses, iterates, displacements, masses, quiet, p, body);
 }
 
 // Eqs. 11 and 16: the dual absorbs the sweep's violation and the penalty ramps, unless at a limit.
-kernel void UpdateDuals(
-    device Contact *contacts [[buffer(5)]], device const Displacement *displacements [[buffer(10)]],
-    device const Pose *initial [[buffer(1)]], device const BodyMass *masses [[buffer(4)]],
-    device const uint *quiet [[buffer(21)]], device const Adjacency *incoming [[buffer(17)]],
-    device const uint *incoming_slots [[buffer(18)]], constant StepParams &p [[buffer(7)]],
-    uint id [[thread_position_in_grid]]
+static bool UpdateContactDualAtSlot(
+    device Contact *contacts, device const Displacement *displacements,
+    device const Pose *initial, device const BodyMass *masses,
+    device const uint *quiet, constant StepParams &p, uint slot
 ) {
-    const Adjacency last = incoming[p.BodyCount - 1];
-    if (id >= last.Start + last.Count) return;
-    const uint slot = incoming_slots[id];
     device Contact &contact = contacts[slot];
 
     const Index body = contact.BodyA, other_body = contact.BodyB;
-    // A row neither side solved has no violation to absorb.
-    // The sweeps skip a sleeping body and a body with no mass.
-    // Eq. 11 against a displacement one side had while the other went unsolved ramps a dual on an error nothing corrected.
-    // A sleeping ball then leaves a kinematic paddle faster than the paddle was going.
-    if (!Solved(masses[body], quiet[body], p) && !Solved(masses[other_body], quiet[other_body], p)) return;
+    // Rows with no solved endpoint retain their dual; unchanged displacement carries no new violation.
+    if (!Solved(masses[body], quiet[body], p) && !Solved(masses[other_body], quiet[other_body], p)) return false;
+    const uint3 old_lambda = as_type<uint3>(contact.Lambda), old_penalty = as_type<uint3>(contact.Penalty);
+    const uint old_stick = contact.Stick;
     const Pose start = initial[body], other_start = initial[other_body];
     const Displacement own = displacements[body], other = displacements[other_body];
     const float3 arm = Rotate(start.Orientation, contact.AnchorA);
@@ -3935,9 +4249,7 @@ kernel void UpdateDuals(
     const ContactBasis basis = MakeContactBasis(contact.Normal);
     const float3 c = ContactConstraint(contact, p, basis, arm, other_arm, own, other);
 
-    // The force the rows requested before the cone clamped it.
-    // Eq. 16 ramps only while strictly inside the bounds, and the clamp puts a sliding contact exactly on the cone.
-    // Testing the clamped force would therefore pass for ever.
+    // Measure penalty saturation before clamping force to the friction cone.
     const float3 requested = contact.Penalty * c + contact.Lambda;
     const float3 force = ContactForce(requested, contact.Friction);
     contact.Lambda = force;
@@ -3953,6 +4265,30 @@ kernel void UpdateDuals(
         contact.Penalty[2] = min(contact.Penalty[2] + beta * abs(c[2]), p.PenaltyMax);
         contact.Stick = length(float2(c[1], c[2])) < p.ContactMargin;
     }
+    return any(old_lambda != as_type<uint3>(contact.Lambda)) || any(old_penalty != as_type<uint3>(contact.Penalty)) || old_stick != contact.Stick;
+}
+
+static bool UpdateContactDual(
+    device Contact *contacts, device const Displacement *displacements,
+    device const Pose *initial, device const BodyMass *masses,
+    device const uint *quiet, device const Adjacency *incoming,
+    device const uint *incoming_slots, constant StepParams &p,
+    uint id
+) {
+    const Adjacency last = incoming[p.BodyCount - 1];
+    if (id >= last.Start + last.Count) return false;
+    const uint slot = incoming_slots[id];
+    return UpdateContactDualAtSlot(contacts, displacements, initial, masses, quiet, p, slot);
+}
+
+kernel void UpdateDuals(
+    device Contact *contacts [[buffer(5)]], device const Displacement *displacements [[buffer(10)]],
+    device const Pose *initial [[buffer(1)]], device const BodyMass *masses [[buffer(4)]],
+    device const uint *quiet [[buffer(21)]], device const Adjacency *incoming [[buffer(17)]],
+    device const uint *incoming_slots [[buffer(18)]], constant StepParams &p [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    UpdateContactDual(contacts, displacements, initial, masses, quiet, incoming, incoming_slots, p, id);
 }
 
 // Velocity is read from the sweeps' motion, before post-stabilization, so error correction adds no energy.
@@ -4175,4 +4511,318 @@ kernel void CaptureStep(
         }
     }
     out_counts[body] = count;
+}
+
+kernel void CountColorWork(
+    device const BodyMass *masses [[buffer(4)]], device const uint *colors [[buffer(12)]],
+    device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
+    device ColorWork &work [[buffer(26)]], uint body [[thread_position_in_grid]]
+) {
+    if (body < p.BodyCount && Solved(masses[body], quiet[body], p))
+        atomic_fetch_add_explicit((device atomic_uint *)&work.Counts[ColorOf(colors[body]) % p.MaxColors], 1u, memory_order_relaxed);
+}
+
+kernel void PrefixColorWork(
+    device ColorWork &work [[buffer(26)]], device uint *groups [[buffer(14)]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint count = work.Counts[lane], first = simd_prefix_exclusive_sum(count);
+    work.Offsets[lane] = work.Cursors[lane] = first;
+    if (lane == MaxSupportedColors - 1) work.Offsets[MaxSupportedColors] = first + count;
+    groups[lane * 3] = (count + SolveBodiesPerGroup - 1) / SolveBodiesPerGroup;
+    groups[lane * 3 + 1] = groups[lane * 3 + 2] = 1;
+}
+
+kernel void FillColorWork(
+    device const BodyMass *masses [[buffer(4)]], device const uint *colors [[buffer(12)]],
+    device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
+    device ColorWork &work [[buffer(26)]], device uint *body_ids [[buffer(13)]],
+    uint body [[thread_position_in_grid]]
+) {
+    if (body < p.BodyCount && Solved(masses[body], quiet[body], p)) {
+        const uint at = atomic_fetch_add_explicit((device atomic_uint *)&work.Cursors[ColorOf(colors[body]) % p.MaxColors], 1u, memory_order_relaxed);
+        body_ids[at] = body;
+    }
+}
+
+// Only solved endpoints connect components.
+static void FindSmallIslandsBody(
+    device const BodyMass *masses, device const Contact *contacts,
+    constant StepParams &p, device const Joint *joints,
+    device const Adjacency *incoming, device const uint *incoming_slots,
+    device const uint *joint_incidence, device const uint *quiet,
+    device uint *members, uint lane
+) {
+    const bool solved = lane < p.BodyCount && Solved(masses[lane], quiet[lane], p);
+    const uint movable = uint(ulong(simd_ballot(solved)));
+    uint reached = 1u << lane;
+    if (solved) {
+        const Adjacency neighbours = incoming[lane];
+        for (uint i = 0; i < ContactsPerBody + neighbours.Count; ++i) {
+            const uint slot = ContactSlot(i, lane * ContactsPerBody, neighbours.Start, incoming_slots, contacts);
+            if (slot != NoIndex) reached |= (1u << ContactPartner(contacts[slot], lane)) & movable;
+        }
+        for (uint at = joint_incidence[lane]; at < joint_incidence[lane + 1]; ++at) {
+            device const Joint &joint = joints[joint_incidence[at]];
+            if (joint.Active) reached |= (1u << (joint.BodyA == lane ? joint.BodyB : joint.BodyA)) & movable;
+        }
+    }
+    // Each round doubles the reachable path length; five cover all 32 bodies.
+    for (uint round = 0; round < 5; ++round) {
+        uint next = reached;
+        for (uint other = 0; other < 32; ++other) {
+            const uint linked = simd_shuffle(reached, other);
+            if (reached & (1u << other)) next |= linked;
+        }
+        reached = next;
+    }
+    members[lane] = reached;
+}
+
+kernel void FindSmallIslands(
+    device const BodyMass *masses [[buffer(4)]], device const Contact *contacts [[buffer(5)]],
+    constant StepParams &p [[buffer(7)]], device const Joint *joints [[buffer(16)]],
+    device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
+    device const uint *joint_incidence [[buffer(20)]], device const uint *quiet [[buffer(21)]],
+    device uint *members [[buffer(26)]], uint lane [[thread_index_in_simdgroup]]
+) {
+    FindSmallIslandsBody(masses, contacts, p, joints, incoming, incoming_slots, joint_incidence, quiet, members, lane);
+}
+
+#if FUSED_SMALL_SOLVE
+kernel void SolveSmallWorld(
+    device Pose *poses [[buffer(0)]], device BodyIterate *iterates [[buffer(11)]], device const Pose *initial [[buffer(1)]],
+    device const Pose *inertial [[buffer(2)]], device const BodyMass *masses [[buffer(4)]],
+    device Displacement *displacements [[buffer(10)]], device Contact *contacts [[buffer(5)]],
+    device const uint *colors [[buffer(12)]], device const uint *iterations [[buffer(14)]],
+    device Joint *joints [[buffer(16)]], device const Adjacency *incoming [[buffer(17)]],
+    device const uint *incoming_slots [[buffer(18)]], device const uint *joint_incidence [[buffer(20)]],
+    device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
+    device const uint *islands [[buffer(26)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint wave [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+#if FUSED_GENERAL_SOLVE
+    if (islands[IslandHeaderWords + group] != group) return;
+    const uint count = islands[IslandHeaderWords + p.BodyCount + group];
+    if (count > IslandBodyLimit) return;
+    device const uint *members = islands + IslandHeaderWords + 2 * p.BodyCount + group * IslandBodyLimit;
+    const uint waves = SmallSolveWaves;
+#else
+    const uint members = islands[group];
+    if (ctz(members) != group) return;
+    const uint waves = min(p.BodyCount, SmallSolveWaves);
+#endif
+    const uint threads = waves * SolveLanes;
+    threadgroup uint body_ids[MaxSupportedColors], offsets[MaxSupportedColors + 1];
+    if (wave == 0) {
+#if FUSED_GENERAL_SOLVE
+        const uint body = lane < count ? members[lane] : NoIndex;
+        const bool solved = body != NoIndex && Solved(masses[body], quiet[body], p);
+        const uint mine = solved ? ColorOf(colors[body]) % p.MaxColors : NoIndex;
+#else
+        const bool solved = lane < p.BodyCount && (members & (1u << lane)) && Solved(masses[lane], quiet[lane], p);
+        const uint mine = solved ? ColorOf(colors[lane]) % p.MaxColors : NoIndex;
+#endif
+        uint first = 0;
+        for (uint color = 0; color < p.MaxColors; ++color) {
+            const uint kept = uint(mine == color), at = simd_prefix_exclusive_sum(kept);
+            const uint count = simd_sum(kept);
+#if FUSED_GENERAL_SOLVE
+            if (kept) body_ids[first + at] = body;
+#else
+            if (kept) body_ids[first + at] = lane;
+#endif
+            if (lane == 0) offsets[color] = first;
+            first += count;
+        }
+        if (lane == 0) offsets[p.MaxColors] = first;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float2 updated[SmallSolveWaves * 12];
+    threadgroup uint changed_waves[SmallSolveWaves];
+    for (uint iteration = 0; iteration < iterations[0]; ++iteration) {
+        bool changed = false;
+        for (uint color = 0; color < p.MaxColors; ++color) {
+            const uint first = offsets[color];
+            for (uint at = wave; at < offsets[color + 1] - first; at += waves) {
+                const uint body = body_ids[first + at];
+                changed |= SolveBody(poses, iterates, initial, inertial, masses, displacements, contacts, colors, color, joints, incoming, incoming_slots, joint_incidence, quiet, p, body, lane);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+#if FUSED_GENERAL_SOLVE
+        if (tid < count) PublishBody(poses, iterates, displacements, masses, quiet, p, members[tid]);
+#else
+        if (tid < p.BodyCount && (members & (1u << tid))) PublishBody(poses, iterates, displacements, masses, quiet, p, tid);
+#endif
+        threadgroup_barrier(mem_flags::mem_device);
+#if FUSED_GENERAL_SOLVE
+        for (uint at = wave; at < count; at += waves) {
+            const uint body = members[at];
+            if (Solved(masses[body], quiet[body], p)) {
+                const Adjacency neighbours = incoming[body];
+                for (uint i = lane; i < ContactsPerBody + neighbours.Count; i += SolveLanes) {
+                    // ContactSlot skips a serial iterator to the end of the owned run.
+                    // SIMD lanes must keep their stride to cover every incoming contact once.
+                    const uint slot = i < ContactsPerBody ? body * ContactsPerBody + i : incoming_slots[neighbours.Start + i - ContactsPerBody];
+                    if (!contacts[slot].Active) continue;
+                    device const Contact &contact = contacts[slot];
+                    const uint owner = Solved(masses[contact.BodyA], quiet[contact.BodyA], p) ? contact.BodyA : contact.BodyB;
+                    if (owner == body)
+                        changed |= UpdateContactDualAtSlot(contacts, displacements, initial, masses, quiet, p, slot);
+                }
+            }
+            for (uint incidence = joint_incidence[body]; incidence < joint_incidence[body + 1]; ++incidence) {
+                const uint index = joint_incidence[incidence];
+                device const Joint &joint = joints[index];
+                if (!joint.Active) continue;
+                const uint owner = Solved(masses[joint.BodyA], quiet[joint.BodyA], p) ? joint.BodyA :
+                    Solved(masses[joint.BodyB], quiet[joint.BodyB], p)                ? joint.BodyB :
+                                                                                        joint.BodyA;
+                if (owner == body)
+                    changed |= UpdateJointDual(joints, poses, initial, p, updated + wave * 12, index, lane);
+            }
+#else
+        const Adjacency last = incoming[p.BodyCount - 1];
+        for (uint id = tid; id < last.Start + last.Count; id += threads) {
+            device const Contact &contact = contacts[incoming_slots[id]];
+            const uint owner = Solved(masses[contact.BodyA], quiet[contact.BodyA], p) ? contact.BodyA : contact.BodyB;
+            if (ctz(islands[owner]) == group)
+                changed |= UpdateContactDual(contacts, displacements, initial, masses, quiet, incoming, incoming_slots, p, id);
+        }
+        for (uint index = wave; index < p.JointCount; index += waves) {
+            device const Joint &joint = joints[index];
+            if (!joint.Active) continue;
+            const uint owner = Solved(masses[joint.BodyA], quiet[joint.BodyA], p) ? joint.BodyA :
+                Solved(masses[joint.BodyB], quiet[joint.BodyB], p)                ? joint.BodyB :
+                                                                                    joint.BodyA;
+            if (ctz(islands[owner]) == group)
+                changed |= UpdateJointDual(joints, poses, initial, p, updated + wave * 12, index, lane);
+#endif
+        }
+        const bool wave_changed = simd_any(changed);
+        if (lane == 0) changed_waves[wave] = wave_changed;
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        bool any_changed = false;
+        for (uint at = 0; at < waves; ++at) any_changed |= changed_waves[at] != 0;
+        if (!any_changed) break;
+    }
+}
+#endif
+
+static uint IslandRoot(device atomic_uint *roots, uint body) {
+    uint parent = atomic_load_explicit(roots + body, memory_order_relaxed);
+    while (parent != body) {
+        const uint next = atomic_load_explicit(roots + parent, memory_order_relaxed);
+        atomic_store_explicit(roots + body, next, memory_order_relaxed);
+        body = parent;
+        parent = next;
+    }
+    return body;
+}
+static void JoinIsland(device atomic_uint *roots, uint a, uint b) {
+    for (;;) {
+        a = IslandRoot(roots, a);
+        b = IslandRoot(roots, b);
+        if (a == b) return;
+        const uint low = min(a, b), high = max(a, b);
+        uint expected = high;
+        if (atomic_compare_exchange_weak_explicit(roots + high, &expected, low, memory_order_relaxed, memory_order_relaxed)) return;
+    }
+}
+kernel void InitializeIslands(device uint *pool [[buffer(26)]], constant StepParams &p [[buffer(7)]], uint id [[thread_position_in_grid]]) {
+    if (id >= p.BodyCount) return;
+    pool[IslandHeaderWords + id] = id;
+    pool[IslandHeaderWords + p.BodyCount + id] = 0;
+    if (id == 0) pool[IslandLargeAt] = 0;
+}
+kernel void UnionIslands(
+    device uint *pool [[buffer(26)]], constant StepParams &p [[buffer(7)]],
+    device const BodyMass *masses [[buffer(4)]], device const Contact *contacts [[buffer(5)]],
+    device const Joint *joints [[buffer(16)]], device const uint *quiet [[buffer(21)]],
+    uint id [[thread_position_in_grid]]
+) {
+    device atomic_uint *roots = (device atomic_uint *)(pool + IslandHeaderWords);
+    if (id < p.BodyCount) {
+        Index previous = NoIndex;
+        for (uint i = 0; i < ContactsPerBody; ++i) {
+            device const Contact &contact = contacts[id * ContactsPerBody + i];
+            if (!contact.Active) break;
+            const Index other = contact.BodyB;
+            if (other != previous && Solved(masses[contact.BodyA], quiet[contact.BodyA], p) && Solved(masses[other], quiet[other], p))
+                JoinIsland(roots, contact.BodyA, other);
+            previous = other;
+        }
+    }
+    if (id < p.JointCount) {
+        device const Joint &joint = joints[id];
+        if (joint.Active && Solved(masses[joint.BodyA], quiet[joint.BodyA], p) && Solved(masses[joint.BodyB], quiet[joint.BodyB], p))
+            JoinIsland(roots, joint.BodyA, joint.BodyB);
+    }
+}
+kernel void PackIslands(device uint *pool [[buffer(26)]], constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]) {
+    if (body >= p.BodyCount) return;
+    device atomic_uint *roots = (device atomic_uint *)(pool + IslandHeaderWords);
+    const uint root = IslandRoot(roots, body);
+    const uint at = atomic_fetch_add_explicit((device atomic_uint *)(pool + IslandHeaderWords + p.BodyCount + root), 1u, memory_order_relaxed);
+    if (at < IslandBodyLimit) pool[IslandHeaderWords + 2 * p.BodyCount + root * IslandBodyLimit + at] = body;
+    else atomic_store_explicit((device atomic_uint *)(pool + IslandLargeAt), 1u, memory_order_relaxed);
+}
+kernel void FinishIslands(device uint *pool [[buffer(26)]], device const uint *groups [[buffer(14)]], constant StepParams &p [[buffer(7)]], uint id [[thread_position_in_grid]]) {
+    const uint large = pool[IslandLargeAt];
+    if (id == 0) {
+        pool[0] = large ? 0 : p.BodyCount;
+        pool[1] = pool[2] = 1;
+        pool[3] = large ? (p.BodyCount + 127) / 128 : 0;
+        pool[4] = pool[5] = 1;
+        pool[6] = large ? (p.BodyCount * ContactsPerBody + 63) / 64 : 0;
+        pool[7] = pool[8] = 1;
+        pool[9] = large ? p.JointCount : 0;
+        pool[10] = pool[11] = 1;
+    }
+    if (id < MaxSupportedColors) {
+        pool[IslandColorsAt + 3 * id] = large ? groups[3 * id] : 0;
+        pool[IslandColorsAt + 3 * id + 1] = pool[IslandColorsAt + 3 * id + 2] = 1;
+    }
+}
+
+// Device barriers synchronize the dependency graph within one SIMD group.
+kernel void PrepareSmallWorld(
+    device Pose *poses [[buffer(0)]], device const Pose *initial [[buffer(1)]],
+    device const Velocity *velocities [[buffer(3)]], device const BodyMass *masses [[buffer(4)]],
+    device const Contact *contacts [[buffer(5)]], constant StepParams &p [[buffer(7)]],
+    device Velocity *previous [[buffer(9)]], device Displacement *displacements [[buffer(10)]],
+    device BodyIterate *iterates [[buffer(11)]], device uint *colors [[buffer(12)]], device uint *next [[buffer(13)]],
+    device const uint *budgets [[buffer(14)]], device Joint *joints [[buffer(16)]],
+    device Adjacency *incoming [[buffer(17)]], device uint *slots [[buffer(18)]],
+    device const uint *joint_incidence [[buffer(20)]], device const uint *quiet [[buffer(21)]],
+    device uint *islands [[buffer(26)]], uint body [[thread_index_in_simdgroup]]
+) {
+    const uint count = body < p.BodyCount ? incoming[body].Count : 0;
+    const uint start = simd_prefix_exclusive_sum(count);
+    if (body < p.BodyCount) {
+        incoming[body].Start = start;
+        incoming[body].Cursor = start;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    FillIncomingBody(incoming, slots, contacts, p, body);
+    threadgroup_barrier(mem_flags::mem_device);
+    SortIncomingBody(incoming, slots, masses, p, body);
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint joint = body; joint < p.JointCount; joint += SolveLanes)
+        PrepareJointsBody(joints, poses, p, joint);
+    threadgroup_barrier(mem_flags::mem_device);
+    WarmStartBody(poses, initial, velocities, previous, masses, displacements, iterates, p, body);
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint pass = 0; pass < budgets[1]; ++pass) {
+        UpdateColorsBody(colors, next, contacts, masses, joints, incoming, slots, quiet, joint_incidence, p, body);
+        threadgroup_barrier(mem_flags::mem_device);
+        // Degree participates in priority, so the entire color word must be fixed.
+        const bool changed = simd_any(body < p.BodyCount && next[body] != colors[body]);
+        PublishColorsBody(colors, next, p, body);
+        threadgroup_barrier(mem_flags::mem_device);
+        if (!changed) break;
+    }
+    if (budgets[0]) FindSmallIslandsBody(masses, contacts, p, joints, incoming, slots, joint_incidence, quiet, islands, body);
 }

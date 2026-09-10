@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <exception>
 #include <numeric>
 #include <string>
@@ -114,6 +115,20 @@ constexpr struct {
     {"ResetQueries"},
     {"EvaluateQueries", "#define COLLECT_LANES 64"},
     {"EvaluateQueries", "#define COLLECT_LANES 64\n#define SENSOR_PASS 1"},
+    {"CountColorWork"},
+    {"PrefixColorWork"},
+    {"FillColorWork"},
+    {"SolveSmallWorld", "#define FUSED_SMALL_SOLVE 1"},
+    {"ResetQueryReuse"},
+    {"CheckQueryInputs"},
+    {"CheckQueryGeometry"},
+    {"BuildBodyBounds", "#define CACHE_BOUNDS_HINT 1"},
+    {"InitializeIslands"},
+    {"UnionIslands"},
+    {"PackIslands"},
+    {"FinishIslands"},
+    {"SolveIslands", "#define FUSED_SMALL_SOLVE 1\n#define FUSED_GENERAL_SOLVE 1\n#define SolveSmallWorld SolveIslands"},
+    {"PrepareSmallWorld"},
 };
 } // namespace
 
@@ -136,14 +151,18 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
 
     Params = {context.Device.get(), BatchSteps};
     ColorGroups = {context.Device.get(), BatchSteps * MaxSupportedColors * 3};
+    SmallIslands = {context.Device.get(), SolveLanes};
+    ColorScratch = {context.Device.get(), 1};
     OutputFlags = {context.Device.get(), 1};
     // One slot per color, holding its own index, so a color pass is selected by the slot the cursor binding points at.
     // No counting kernel is dispatched between colors.
-    ColorCursor = {context.Device.get(), MaxSupportedColors};
+    ColorCursor = {context.Device.get(), MaxSupportedColors + 2};
     for (uint32_t color = 0; color < MaxSupportedColors; ++color) ColorCursor[color] = color;
     Residency = NS::TransferPtr(context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
     Residency->addAllocation(Params.Handle.get());
     Residency->addAllocation(ColorGroups.Handle.get());
+    Residency->addAllocation(SmallIslands.Handle.get());
+    Residency->addAllocation(ColorScratch.Handle.get());
     Residency->addAllocation(OutputFlags.Handle.get());
     Residency->addAllocation(ColorCursor.Handle.get());
     Residency->commit();
@@ -159,7 +178,7 @@ Solver::~Solver() {
 void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads, uint32_t lanes, uint64_t indirect, CollectionMode mode) {
     const bool collector = pass == CollectPass || pass == SensorPass || (pass >= BoundedCollectPass && pass <= FullSensorPass);
     const bool primal = pass == SolvePass || pass == StabilizePass;
-    const bool bounds = pass == BoundsPass || pass == SensorBoundsPass;
+    const bool bounds = pass == BoundsPass || pass == SensorBoundsPass || pass == CacheBoundsPass;
     const uint32_t variant = collector ? uint32_t(threads > RadixSimdWidth) + 2 * uint32_t(lanes > 1) :
         bounds                         ? uint32_t(lanes > 1) :
                                          uint32_t(primal && threads > SolveLanes);
@@ -185,22 +204,36 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
     const bool radix = pass == RadixHistogramPass || pass == RadixOffsetsPass || pass == ReduceBoundsPass || pass == ReduceScenePass;
     const bool scan = pass == ScanIncomingPass || pass == ScanIncomingBlocksPass;
     const bool contact = pass == DualPass || pass == RestitutionPass;
-    if ((radix || scan || pass == SmallBroadPhasePass || ((collector || bounds) && lanes > 1)) && pipeline->threadExecutionWidth() != RadixSimdWidth)
+    if ((radix || scan || pass == PrefixColorWorkPass || pass == PrepareSmallWorldPass || pass == SmallBroadPhasePass || ((collector || bounds) && lanes > 1)) && pipeline->threadExecutionWidth() != RadixSimdWidth)
         throw std::runtime_error("GPU scans require 32-lane SIMD groups");
     const uint32_t limit = scan ? RadixBlockSize : per_body ? 8u :
         contact                                             ? 64u :
                                                               pipeline->maxTotalThreadsPerThreadgroup();
     const auto group = pass == SmallBroadPhasePass ? threads : radix ? RadixBlockSize :
                                                                        std::min(threads, limit);
-    if (mode == Queued) encoder->dispatchThreadgroups({threads, 1, 1}, {1, 1, 1});
-    else if (pass == QueryPass || pass == SensorQueryPass) encoder->dispatchThreadgroups(QueryScratch.Address(), {32, 1, 1});
+    if (pass == SolveIslandsPass) {
+        if (pipeline->threadExecutionWidth() != SolveLanes || SmallSolveWaves * SolveLanes > pipeline->maxTotalThreadsPerThreadgroup())
+            throw std::runtime_error("The island solve requires eight 32-lane SIMD groups");
+        encoder->dispatchThreadgroups(indirect, {SmallSolveWaves * SolveLanes, 1, 1});
+    } else if (indirect && (pass == PublishPass || pass == DualPass || pass == JointDualPass)) {
+        encoder->dispatchThreadgroups(indirect, {pass == PublishPass ? 128u : pass == DualPass ? 64u :
+                                                                                                 32u,
+                                                 1, 1});
+    } else if (pass == SolveSmallWorldPass) {
+        const uint32_t width = std::min(threads, SmallSolveWaves) * SolveLanes;
+        if (pipeline->threadExecutionWidth() != SolveLanes || width > pipeline->maxTotalThreadsPerThreadgroup())
+            throw std::runtime_error("The small-world solve requires up to eight 32-lane SIMD groups");
+        encoder->dispatchThreadgroups({threads, 1, 1}, {width, 1, 1});
+    } else if (mode == Queued) encoder->dispatchThreadgroups({threads, 1, 1}, {1, 1, 1});
+    else if (pass == CheckQueryGeometryPass || pass == CheckQueryInputsPass) encoder->dispatchThreadgroups(indirect, {128, 1, 1});
+    else if (pass == QueryPass || pass == SensorQueryPass) encoder->dispatchThreadgroups(indirect ? indirect : QueryScratch.Address(), {32, 1, 1});
     else if (primal) {
         if (pipeline->threadExecutionWidth() != SolveLanes) throw std::runtime_error("The body solve requires 32-lane SIMD groups");
         const uint32_t bodies_per_group = variant ? SolveBodiesPerGroup : 1;
         if (indirect) encoder->dispatchThreadgroups(indirect, {SolveLanes, 1, 1});
         else encoder->dispatchThreadgroups({(threads + bodies_per_group - 1) / bodies_per_group, 1, 1}, {SolveLanes, 1, 1});
     } else if (pass == JointDualPass) encoder->dispatchThreadgroups({threads, 1, 1}, {32, 1, 1});
-    else if ((collector || bounds) && lanes > 1) encoder->dispatchThreadgroups({threads, 1, 1}, {lanes, 1, 1});
+    else if ((collector || bounds) && lanes > 1) encoder->dispatchThreadgroups({threads * (mode == Prepare ? QueryPartitions(threads) : 1u), 1, 1}, {lanes, 1, 1});
     else encoder->dispatchThreads({threads, 1, 1}, {group, 1, 1});
 }
 
@@ -304,16 +337,58 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
         ~Scope() { Active = false; }
     } scope{Advancing};
     Advancing = true;
+    ColorCursor[MaxSupportedColors] = settings.Iterations;
+    ColorCursor[MaxSupportedColors + 1] = settings.ColoringPasses;
+    const uint64_t island_words = IslandHeaderWords + uint64_t(world.BodyCount()) * IslandWordsPerBody;
+    if (world.BodyCount() > SolveLanes && island_words > GeneralIslands.Capacity) {
+        if (island_words > UINT32_MAX) throw std::length_error("island storage is too large");
+        if (GeneralIslands.Handle) Residency->removeAllocation(GeneralIslands.Handle.get());
+        GeneralIslands = {Context.Device.get(), uint32_t(island_words)};
+        Residency->addAllocation(GeneralIslands.Handle.get());
+        Residency->commit();
+    }
     world.RefreshFilters();
     PrepareFollowers(world, followers);
     const uint32_t joints = world.JointCount();
     const uint32_t collider_features = ColliderFeatures(world);
-    if ((collider_features & MeshQueries) && !QueryScratch.Handle) {
-        QueryScratch = {Context.Device.get(), QueryScratchBytes / sizeof(uint32_t)};
-        Residency->addAllocation(QueryScratch.Handle.get());
-        Residency->commit();
+    if (collider_features & MeshQueries) {
+        bool residency_changed = false;
+        if (!QueryScratch.Handle) {
+            residency_changed = true;
+            QueryScratch = {Context.Device.get(), QueryScratchBytes / sizeof(uint32_t)};
+            QueryInputs = {Context.Device.get(), 1};
+            QueryInputs[0] = {};
+            auto &solid = *reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data());
+            solid = {};
+            solid.Bytes = QueryScratchBytes;
+            Residency->addAllocation(QueryScratch.Handle.get());
+            Residency->addAllocation(QueryInputs.Handle.get());
+        }
+        QueryInputSpec spec{};
+        const uint32_t bodies = world.BodyCount();
+        const uint64_t bytes[]{uint64_t(bodies) * sizeof(Pose), uint64_t(bodies) * sizeof(Velocity), uint64_t(bodies) * sizeof(BodyMass), uint64_t(bodies) * sizeof(Index), uint64_t(world.ShapeCount()) * sizeof(Shape), uint64_t(bodies) * sizeof(Material), uint64_t(bodies) * sizeof(Filter), uint64_t(world.Jointed.Capacity) * sizeof(Index), uint64_t(world.ShapeVertices.Capacity) * sizeof(float3), uint64_t(world.HullFaces.Capacity) * sizeof(HullFace), uint64_t(world.Triangles.Capacity) * sizeof(Triangle), uint64_t(world.BvhNodes.Capacity) * sizeof(BvhNode), uint64_t(world.CompoundChildren.Capacity) * sizeof(Index), sizeof(StepParams), uint64_t(bodies) * sizeof(uint32_t), uint64_t(bodies) * ContactsPerBody * 8 * sizeof(uint32_t)};
+        uint64_t words = 0;
+        for (uint32_t at = 0; at < 16; ++at) {
+            if (bytes[at] / 4 > UINT32_MAX - words) throw std::length_error("query input snapshot is too large");
+            spec.Offsets[at] = uint32_t(words);
+            words += bytes[at] / 4;
+        }
+        spec.Words = uint32_t(words);
+        if (spec.Words > QueryInputSnapshot.Capacity) {
+            residency_changed = true;
+            if (QueryInputSnapshot.Handle) Residency->removeAllocation(QueryInputSnapshot.Handle.get());
+            QueryInputSnapshot = {Context.Device.get(), spec.Words};
+            std::fill_n(QueryInputSnapshot.Data(), spec.Words, 0u);
+            Residency->addAllocation(QueryInputSnapshot.Handle.get());
+            reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
+        }
+        if (std::memcmp(&QueryInputs[0], &spec, sizeof(QueryInputSpec)) != 0)
+            reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
+        QueryInputs[0] = spec;
+        // Geometry is immutable until this Advance returns, including across submissions.
+        reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->GeometryChecked = 0;
+        if (residency_changed) Residency->commit();
     }
-    if (QueryScratch.Handle) reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Bytes = QueryScratchBytes;
     AdvanceResult result;
     while (result.Steps < substeps && world.BodyCount() != 0) {
         const uint32_t first_bodies = world.BodyCount();
@@ -322,6 +397,14 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
         bool sensors = !world.Overlaps().empty();
         for (uint32_t body = 0; body < first_bodies && !sensors; ++body) sensors = world.Alive(body) && world.Filters[body].Sensor;
         if (sensors) world.EnsureSensorBuffers();
+        if (sensors && (collider_features & MeshQueries) && !SensorQueries.Handle) {
+            SensorQueries = {Context.Device.get(), QueryScratchBytes / sizeof(uint32_t)};
+            auto &header = *reinterpret_cast<QueryArenaHeader *>(SensorQueries.Data());
+            header = {};
+            header.Bytes = QueryScratchBytes;
+            Residency->addAllocation(SensorQueries.Handle.get());
+            Residency->commit();
+        }
         const bool poses = bool(observer) || world.TrackContacts;
         OutputFlags[0] = {uint32_t(poses), uint32_t(sensors)};
         Layout = {};
@@ -389,6 +472,7 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
         Context.Queue->commit(list, 1);
         Context.Queue->signalEvent(Done.get(), ++Signal);
         while (!Done->waitUntilSignaledValue(Signal, 1000)) {}
+
         std::exception_ptr observer_error;
         for (uint32_t index = 0; index < count; ++index) {
             const uint32_t bodies = index == 0 ? first_bodies : later_bodies;
@@ -446,6 +530,8 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
 
 void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
     const uint32_t bodies = recording.Bodies, joints = recording.Joints;
+    const bool compact = bodies > SolveLanes;
+    const bool general_islands = compact && recording.Iterations;
     const uint32_t slots = bodies * ContactsPerBody;
     for (const auto range : FollowerRanges) {
         Table->setAddress(Followers.Address() + range.First * sizeof(SensorFollower), 26);
@@ -462,13 +548,26 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     const auto sweep = [&](Pass primal) {
         for (uint32_t color = 0; color < recording.Colors; ++color) {
             Table->setAddress(ColorCursor.Address() + color * sizeof(uint32_t), BroadPhaseOrCursorAt);
-            Dispatch(encoder, primal, bodies, 1, recording.GpuColors ? groups + color * 3 * sizeof(uint32_t) : 0);
+            const uint64_t work_groups = general_islands && primal == SolvePass ? GeneralIslands.Address() + (IslandColorsAt + color * 3) * sizeof(uint32_t) :
+                (compact || recording.GpuColors)                                ? groups + color * 3 * sizeof(uint32_t) :
+                                                                                  0;
+            Dispatch(encoder, primal, bodies, 1, work_groups);
         }
-        Dispatch(encoder, PublishPass, bodies);
+        Dispatch(encoder, PublishPass, bodies, 1, general_islands && primal == SolvePass ? GeneralIslands.Address() + IslandPublishAt * sizeof(uint32_t) : 0);
     };
 
     const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
-    Dispatch(encoder, BoundsPass, bodies, bounds_lanes);
+    const bool queued_queries = (recording.ColliderFeatures & MeshQueries) && uint64_t(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 < QueryScratchBytes;
+    if (queued_queries) {
+        Table->setAddress(QueryScratch.Address(), 11);
+        Table->setAddress(QueryInputs.Address(), 9);
+        Table->setAddress(QueryInputSnapshot.Address(), 18);
+        Dispatch(encoder, ResetQueryReusePass, 1);
+        Dispatch(encoder, CacheBoundsPass, bodies, bounds_lanes);
+        Table->setAddress(world.Iterates.Address(), 11);
+        Table->setAddress(world.PreviousVelocities.Address(), 9);
+        Table->setAddress(world.IncomingSlots.Address(), 18);
+    } else Dispatch(encoder, BoundsPass, bodies, bounds_lanes);
     if (bodies <= RadixBlockSize) {
         Table->setAddress(world.BroadPhaseKeys.Address(), 11);
         Table->setAddress(world.BroadPhaseNodes.Address(), 13);
@@ -511,41 +610,85 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     // Shared lanes increase parallelism for mesh queries and small worlds.
     const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : 1;
     const auto collect = [&](Pass pass, bool sensor) {
-        if (!(recording.ColliderFeatures & MeshQueries) || uint64_t(bodies) * 2 * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 >= QueryScratchBytes) {
+        if (!(recording.ColliderFeatures & MeshQueries) || uint64_t(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 >= QueryScratchBytes) {
             Dispatch(encoder, pass, bodies, collision_lanes);
             return;
         }
-        Table->setAddress(QueryScratch.Address(), 11);
+        // Retain solid geometry while sensors use separate scratch storage.
+        const uint64_t query_address = sensor ? SensorQueries.Address() : QueryScratch.Address();
+        Table->setAddress(query_address, 11);
+        if (!sensor) {
+            Table->setAddress(QueryInputSnapshot.Address(), 18);
+            Table->setAddress(QueryInputs.Address(), 9);
+            Dispatch(encoder, CheckQueryInputsPass, 1, 1, query_address + offsetof(QueryArenaHeader, InputX));
+            Dispatch(encoder, CheckQueryGeometryPass, 1, 1, query_address + offsetof(QueryArenaHeader, GeometryX));
+            Table->setAddress(world.IncomingSlots.Address(), 18);
+            Table->setAddress(world.PreviousVelocities.Address(), 9);
+        }
         Dispatch(encoder, ResetQueryPass, bodies);
         Dispatch(encoder, pass, bodies, collision_lanes, 0, Prepare);
-        Dispatch(encoder, sensor ? SensorQueryPass : QueryPass, 1);
+        Dispatch(encoder, sensor ? SensorQueryPass : QueryPass, 1, 1, query_address);
         Dispatch(encoder, pass, bodies, 1, 0, Queued);
         // Recompute queries that exceed arena capacity.
         Dispatch(encoder, pass, bodies, collision_lanes, 0, Recompute);
         Table->setAddress(world.Iterates.Address(), 11);
     };
     collect(collectors[geometry_features], false);
-    // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
-    Table->setAddress(world.BroadPhaseScratch.Address(), BroadPhaseOrCursorAt);
-    Dispatch(encoder, ScanIncomingPass, bodies);
-    if (bodies > RadixBlockSize) {
-        Dispatch(encoder, ScanIncomingBlocksPass, RadixBlockSize);
-        Dispatch(encoder, OffsetIncomingPass, bodies);
+    if (bodies <= SolveLanes) {
+        Table->setAddress(world.JointIncidence.Address(), 20);
+        Table->setAddress(world.Displacements.Address(), 10);
+        Table->setAddress(SmallIslands.Address(), 26);
+        Table->setAddress(ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t), BroadPhaseOrCursorAt);
+        Dispatch(encoder, PrepareSmallWorldPass, SolveLanes);
+    } else {
+        // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
+        Table->setAddress(world.BroadPhaseScratch.Address(), BroadPhaseOrCursorAt);
+        Dispatch(encoder, ScanIncomingPass, bodies);
+        if (bodies > RadixBlockSize) {
+            Dispatch(encoder, ScanIncomingBlocksPass, RadixBlockSize);
+            Dispatch(encoder, OffsetIncomingPass, bodies);
+        }
+        Dispatch(encoder, FillIncomingPass, bodies);
+        Dispatch(encoder, SortIncomingPass, bodies);
+        Table->setAddress(world.JointIncidence.Address(), 20);
+        if (joints > 0) Dispatch(encoder, PrepareJointsPass, joints);
+        Table->setAddress(world.Displacements.Address(), 10);
+        Table->setAddress(ColorScratch.Address(), 26);
+        Dispatch(encoder, WarmStartPass, bodies);
+        for (uint32_t pass = 0; pass < recording.ColoringPasses; ++pass) {
+            Dispatch(encoder, ColorPass, bodies);
+            Dispatch(encoder, PublishColorPass, bodies);
+        }
     }
-    Dispatch(encoder, FillIncomingPass, bodies);
-    Dispatch(encoder, SortIncomingPass, bodies);
-    Table->setAddress(world.JointIncidence.Address(), 20);
-    if (joints > 0) Dispatch(encoder, PrepareJointsPass, joints);
-    Table->setAddress(world.Displacements.Address(), 10);
-    Dispatch(encoder, WarmStartPass, bodies);
-    for (uint32_t pass = 0; pass < recording.ColoringPasses; ++pass) {
-        Dispatch(encoder, ColorPass, bodies);
-        Dispatch(encoder, PublishColorPass, bodies);
+    if (compact) {
+        Table->setAddress(groups, BroadPhaseOrCursorAt);
+        Dispatch(encoder, CountColorWorkPass, bodies);
+        Dispatch(encoder, PrefixColorWorkPass, MaxSupportedColors);
+        Dispatch(encoder, FillColorWorkPass, bodies);
     }
-    for (uint32_t iteration = 0; iteration < recording.Iterations; ++iteration) {
-        sweep(SolvePass);
-        Dispatch(encoder, DualPass, slots);
-        if (joints > 0) Dispatch(encoder, JointDualPass, joints);
+    if (general_islands) {
+        Table->setAddress(GeneralIslands.Address(), 26);
+        Dispatch(encoder, InitializeIslandsPass, bodies);
+        Dispatch(encoder, UnionIslandsPass, std::max(bodies, joints));
+        Dispatch(encoder, PackIslandsPass, bodies);
+        Dispatch(encoder, FinishIslandsPass, MaxSupportedColors);
+        Table->setAddress(ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t), BroadPhaseOrCursorAt);
+        Dispatch(encoder, SolveIslandsPass, bodies, 1, GeneralIslands.Address());
+        Table->setAddress(ColorScratch.Address(), 26);
+    }
+    if (bodies <= SolveLanes) {
+        if (recording.Iterations) {
+            Table->setAddress(ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t), BroadPhaseOrCursorAt);
+            Table->setAddress(SmallIslands.Address(), 26);
+            Dispatch(encoder, SolveSmallWorldPass, bodies);
+            Table->setAddress(groups, 26);
+        }
+    } else {
+        for (uint32_t iteration = 0; iteration < recording.Iterations; ++iteration) {
+            sweep(SolvePass);
+            Dispatch(encoder, DualPass, slots, 1, GeneralIslands.Address() + IslandContactDualAt * sizeof(uint32_t));
+            if (joints > 0) Dispatch(encoder, JointDualPass, joints, 1, GeneralIslands.Address() + IslandJointDualAt * sizeof(uint32_t));
+        }
     }
     // Velocity is taken from the motion the iterations above produced, before the stabilization sweep, so removing leftover penetration adds no velocity.
     Dispatch(encoder, FinalizePass, bodies);

@@ -41,10 +41,6 @@ struct StepSettings {
     uint32_t ColoringPasses = 4; // incremental coloring converges in a few passes
 };
 
-// The size of the encoder's color cursor table, and so the most colors a step may be dispatched with.
-// StepSettings::MaxColors is clamped to this.
-inline constexpr uint32_t MaxSupportedColors = 32;
-
 struct StepResult {
     uint64_t Step, ContactRefusals, SensorRefusals;
     std::span<const Pose> Poses;
@@ -125,6 +121,20 @@ private:
         ResetQueryPass,
         QueryPass,
         SensorQueryPass,
+        CountColorWorkPass,
+        PrefixColorWorkPass,
+        FillColorWorkPass,
+        SolveSmallWorldPass,
+        ResetQueryReusePass,
+        CheckQueryInputsPass,
+        CheckQueryGeometryPass,
+        CacheBoundsPass,
+        InitializeIslandsPass,
+        UnionIslandsPass,
+        PackIslandsPass,
+        FinishIslandsPass,
+        SolveIslandsPass,
+        PrepareSmallWorldPass,
         PassCount,
     };
 
@@ -148,7 +158,8 @@ private:
 
     const mtl::Context &Context;
     NS::SharedPtr<MTL::ComputePipelineState> Pipelines[CollectionModeCount][PassCount][4];
-    mtl::Buffer<uint32_t> QueryScratch;
+    mtl::Buffer<uint32_t> SensorQueries, QueryScratch, QueryInputSnapshot;
+    mtl::Buffer<QueryInputSpec> QueryInputs;
     NS::SharedPtr<MTL4::ArgumentTable> Table;
     NS::SharedPtr<MTL4::CommandAllocator> Allocator;
     NS::SharedPtr<MTL4::CommandBuffer> Commands;
@@ -158,7 +169,8 @@ private:
     mtl::Buffer<uint32_t> ColorCursor;
     mtl::Buffer<SensorFollower> Followers;
     std::vector<FollowerRange> FollowerRanges;
-    mtl::Buffer<uint32_t> ColorGroups;
+    mtl::Buffer<uint32_t> ColorGroups, SmallIslands, GeneralIslands;
+    mtl::Buffer<ColorWork> ColorScratch;
     mtl::Buffer<StepOutputFlags> OutputFlags;
     mtl::Buffer<uint8_t> Outputs;
     OutputLayout Layout;

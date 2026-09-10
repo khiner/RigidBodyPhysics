@@ -21,7 +21,7 @@ kernel void CheckDerivatives(device float *out [[buffer(0)]], uint index [[threa
     Joint joint{};
     for (uint i=0;i<3;++i) joint.AngularModes |= uint(i == twist ? AxisFree : AxisLocked) << (3*i);
     const JointMeasure measured{float4(0,0,0,1), float3(0), MeasuredAngles(q,twist), float3(0), q};
-    const AxisSetup setup = JointRowAt(joint, measured, 3 + row);
+    const AxisSetup setup = JointRowAt(&joint, measured, 3 + row);
     const float epsilon = 0.001f;
     const float3 delta = epsilon * UnitAxis(direction);
     const float plus = MeasuredAngles(QuatMul(QuatFromRotationVector(delta),q),twist)[row];

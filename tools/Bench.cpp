@@ -1,14 +1,11 @@
 // Times the solver's step, per scene, in a form two runs can be diffed.
 //
 //   RbpBench [scene ...]      no names runs every scene, names run just those
-//   STEPS=n WARMUP=n          timed steps per scene and the steps discarded before them
 //   ITERATIONS=n COLORS=n     override the solver's iteration count and colour cap, to separate
 //                             sweep-count cost from per-sweep cost
 //
 // A COLORS clamp below the colours a scene needs degrades its physics deliberately, so it prices dispatches rather than the solve.
 // Sleeping is off, so every timed step does the whole solve rather than measuring the sleep gate.
-// Steps are timed one at a time around Solver::Step, which blocks until the GPU signals.
-// Reported are min, median, p90 and max in ms over the timed window.
 // Compare two runs on the median.
 // The min is the machine's noise floor.
 //
@@ -101,6 +98,7 @@ struct BenchSettings {
     bool Sleeping = false;
     uint32_t Capacity = WorldLimits{}.Bodies;
     uint32_t ColumnHeight = 0;
+    std::array<float, 3> BoxHalf{0.5f, 0.5f, 0.5f};
 };
 
 double Percentile(std::span<const double> sorted, double q) {
@@ -117,12 +115,13 @@ int main(int argc, char **argv) try {
         return false;
     };
     const uint32_t timed = Env("STEPS", 300), warmup = Env("WARMUP", 120);
-    if (timed == 0) throw std::runtime_error("STEPS must be positive");
+    const int requested_substeps = getenv("SUBSTEPS") ? std::atoi(getenv("SUBSTEPS")) : 1;
+    if (timed == 0 || requested_substeps <= 0) throw std::runtime_error("STEPS and SUBSTEPS must be positive");
+    const uint32_t substeps = uint32_t(requested_substeps);
 
     const std::string power = FirstLine("pmset -g batt");
     const bool on_ac = power.contains("AC Power");
-    std::println("RbpBench: {}, {}, {} timed steps after {} warmup, sleeping off", FirstLine("sysctl -n machdep.cpu.brand_string"), on_ac ? "AC power" : "ON BATTERY", timed, warmup);
-    if (!on_ac) std::println("!! on battery - these timings are noise, plug in and run again");
+    std::println("RbpBench: {}, {}, {} timed updates after {} warmup, {} substeps/update, ms/substep, sleeping off", FirstLine("sysctl -n machdep.cpu.brand_string"), on_ac ? "AC power" : "ON BATTERY", timed, warmup, substeps);
     // Another Rbp process with a Metal queue open costs the heavy scenes 2-3x.
     // The light scenes read clean either way, so a spot check misses it.
     const std::string siblings = "pgrep -l Rbp | grep -v '^" + std::to_string(getpid()) + " ' | head -1";
@@ -154,14 +153,18 @@ int main(int argc, char **argv) try {
         for (Index body = 0; body < world.BodyCount(); ++body) origins[body] = {world.Poses[body].Position.x, world.Poses[body].Position.z};
         const auto observe = [&] {
             for (Index body = 0; body < world.BodyCount(); ++body)
-                quality.Observe(replay::StateOf(world, body), origins[body], options.ColumnHeight && body > 0 ? int((body - 1) % options.ColumnHeight) : -1);
-            refusals += replay::Refusals(world);
+                quality.Observe(replay::StateOf(world, body), origins[body], options.ColumnHeight && body > 0 ? int((body - 1) % options.ColumnHeight) : -1, options.BoxHalf);
         };
         // A sleeping scene prices the idle step, so timing starts only once every body is asleep rather than averaging two regimes.
         StepSettings scene_settings = settings;
         if (options.Sleeping) scene_settings.SleepSteps = StepSettings{}.SleepSteps;
+        const auto advance = [&] {
+            const auto result = solver.Advance(world, scene_settings, substeps);
+            if (result.Steps != substeps) throw std::runtime_error(name + ": incomplete update");
+            refusals += result.ContactRefusals + result.SensorRefusals;
+        };
         for (uint32_t step = 0; step < warmup; ++step) {
-            solver.Step(world, scene_settings);
+            advance();
             observe();
         }
         if (options.Sleeping) {
@@ -172,7 +175,7 @@ int main(int argc, char **argv) try {
             };
             uint32_t patience = 3600;
             while (!all_asleep() && patience-- > 0) {
-                solver.Step(world, scene_settings);
+                advance();
                 observe();
             }
             if (!all_asleep()) throw std::runtime_error(name + ": never fell asleep, nothing to time");
@@ -180,8 +183,8 @@ int main(int argc, char **argv) try {
         std::vector<double> ms(timed);
         for (auto &sample : ms) {
             const auto begin = std::chrono::steady_clock::now();
-            solver.Step(world, scene_settings);
-            sample = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            advance();
+            sample = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() / substeps;
             observe();
         }
         std::ranges::sort(ms);
@@ -204,10 +207,11 @@ int main(int argc, char **argv) try {
     bench("raft", [](World &world) { return BuildRaft(world, 5, 3), true; });
     bench("coins", [](World &world) { return !BuildCoins(world, 16, 10, 0.5f).empty(); });
     bench("chain", [](World &world) { return Chain(world, 10), true; });
+    bench("chain64", [](World &world) { return Chain(world, 64), true; });
     // Three widths, so the cost per triangle reached and any fixed cost under it read off the slope.
-    bench("slab", [](World &world) { return Slab(world, 2); });
-    bench("slab2m", [](World &world) { return Slab(world, 1); });
-    bench("slab1m", [](World &world) { return Slab(world, 0.5f); });
+    bench("slab", [](World &world) { return Slab(world, 2); }, {.ColumnHeight = 1, .BoxHalf = {2, 0.25f, 2}});
+    bench("slab2m", [](World &world) { return Slab(world, 1); }, {.ColumnHeight = 1, .BoxHalf = {1, 0.25f, 1}});
+    bench("slab1m", [](World &world) { return Slab(world, 0.5f); }, {.ColumnHeight = 1, .BoxHalf = {0.5f, 0.25f, 0.5f}});
     // 25 bodies at slab1m's triangle load, so occupancy is the only difference.
     // One wide body is a single latency-bound thread at ~13 us a triangle and 25 bodies pay ~1.2 us.
     // The ratio of this line to slab1m's is the standing check on that amortization.
@@ -218,7 +222,8 @@ int main(int argc, char **argv) try {
             for (uint32_t z = 0; z < 5; ++z)
                 Place(world, shape, float3{3.0f * float(x) - 6, 0.25f, 3.0f * float(z) - 6});
         return true;
-    });
+    },
+          {.ColumnHeight = 1, .BoxHalf = {0.5f, 0.25f, 0.5f}});
     bench("lattice125", [](World &world) { return Lattice(world, 5, 5, 5), true; }, {.ColumnHeight = 5});
     bench("lattice294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, {.ColumnHeight = 6});
     // The same 294 bodies fully asleep.
