@@ -337,10 +337,16 @@ struct World {
 
     // Solver state, per body and per contact slot, named for the algorithm.
     // Kept with everything else the GPU addresses, being indexed the same way and living exactly as long.
+    mtl::Buffer<BodyBounds> Bounds;
+    mtl::Buffer<BodyBounds> BoundsReductions;
+    mtl::Buffer<BroadPhaseNode> BroadPhaseNodes;
+    mtl::Buffer<MortonKey> BroadPhaseKeys;
+    mtl::Buffer<uint32_t> BroadPhaseScratch;
     mtl::Buffer<Pose> InitialPoses; // the pose the step began at, which velocity is measured against
+    mtl::Buffer<Displacement> Displacements;
     mtl::Buffer<Pose> InertialPoses; // where free flight would have ended it
     mtl::Buffer<Velocity> PreviousVelocities; // last step's, for the adaptive warm start
-    mtl::Buffer<Pose> SolvedPoses; // a sweep writes here and is published, so bodies read one snapshot
+    mtl::Buffer<BodyIterate> Iterates;
     mtl::Buffer<Pose> RestPoses; // where a body was when it last moved, for the sleep drift test
     mtl::Buffer<uint32_t> Quiet, NextQuiet; // consecutive steps a body has been slower than SleepSpeed
     mtl::Buffer<uint32_t> Colors, NextColors; // kept across steps, since the coloring is incremental

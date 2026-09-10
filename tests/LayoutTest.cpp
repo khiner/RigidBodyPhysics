@@ -23,7 +23,12 @@ struct Layout {
 constexpr Layout HostLayouts[]{
     {"Pose", sizeof(Pose), alignof(Pose)},
     {"Velocity", sizeof(Velocity), alignof(Velocity)},
+    {"Displacement", sizeof(Displacement), alignof(Displacement)},
+    {"BodyIterate", sizeof(BodyIterate), alignof(BodyIterate)},
     {"BodyMass", sizeof(BodyMass), alignof(BodyMass)},
+    {"BodyBounds", sizeof(BodyBounds), alignof(BodyBounds)},
+    {"BroadPhaseNode", sizeof(BroadPhaseNode), alignof(BroadPhaseNode)},
+    {"MortonKey", sizeof(MortonKey), alignof(MortonKey)},
     {"Shape", sizeof(Shape), alignof(Shape)},
     {"Triangle", sizeof(Triangle), alignof(Triangle)},
     {"Material", sizeof(Material), alignof(Material)},

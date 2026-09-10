@@ -6,7 +6,12 @@ kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_positio
 #define REPORT(T) out[k++] = sizeof(T); out[k++] = alignof(T);
     REPORT(Pose)
     REPORT(Velocity)
+    REPORT(Displacement)
+    REPORT(BodyIterate)
     REPORT(BodyMass)
+    REPORT(BodyBounds)
+    REPORT(BroadPhaseNode)
+    REPORT(MortonKey)
     REPORT(Shape)
     REPORT(Triangle)
     REPORT(Material)
@@ -19,4 +24,13 @@ kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_positio
     REPORT(ContactEvent)
     REPORT(StepParams)
 #undef REPORT
+}
+
+kernel void ReportBroadPhasePairs(
+    device BroadPhaseNode *nodes [[buffer(13)]], device uint *pairs [[buffer(0)]],
+    constant uint &bodies [[buffer(7)]], uint body [[thread_position_in_grid]]
+) {
+    if (body >= bodies) return;
+    for (uint other = NextBodyCandidate(nodes, bodies, body, 0); other != NoIndex; other = NextBodyCandidate(nodes, bodies, body, other + 1))
+        pairs[body * bodies + other] = 1;
 }

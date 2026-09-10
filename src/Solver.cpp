@@ -3,14 +3,15 @@
 #include "GpuSource.h"
 
 #include <algorithm>
+#include <bit>
+#include <string>
 #include <string_view>
 
 namespace rbp {
 
 namespace {
-// The one argument-table slot a step rebinds, and the total slot count.
-// Every other slot is bound once from the list in Step, the only place the slot numbers appear outside Solve.metal's [[buffer(n)]] indices.
-constexpr uint32_t CursorAt = 14;
+// Collision and primal passes use this binding at separate times.
+constexpr uint32_t BroadPhaseOrCursorAt = 14;
 constexpr uint32_t BindingCount = 31;
 
 // Sweeps of the restitution pass over its contacts.
@@ -29,7 +30,7 @@ uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
     return std::clamp(used + 1, 1u, std::min(settings.MaxColors, MaxSupportedColors));
 }
 
-constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2;
+constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2, MeshQueries = 4, RestitutionMaterials = 8;
 
 uint32_t ColliderFeatures(const World &world) {
     uint32_t features = 0;
@@ -38,17 +39,20 @@ uint32_t ColliderFeatures(const World &world) {
         const Index root = world.BodyShapes[body];
         if (root == NoIndex) continue;
         const Shape &shape = world.Shapes[root];
+        if (world.Materials[body].Restitution != 0 || (shape.HasMaterial && shape.Surface.Restitution != 0)) features |= RestitutionMaterials;
         bool mesh = shape.Kind == ShapeMesh;
         features |= IsBoundedPlane(shape) ? BoundedPlanes : 0u;
         if (shape.Kind == ShapeCompound)
             for (uint32_t leaf = 0; leaf < shape.VertexCount; ++leaf) {
                 const Shape &child = world.Shapes[world.Child(root, leaf)];
+                if (child.HasMaterial && child.Surface.Restitution != 0) features |= RestitutionMaterials;
                 features |= IsBoundedPlane(child) ? BoundedPlanes : 0u;
                 mesh |= child.Kind == ShapeMesh;
             }
         if (mesh && mesh_seen) features |= MeshPairs;
+        if (mesh) features |= MeshQueries;
         mesh_seen |= mesh;
-        if (features == (BoundedPlanes | MeshPairs)) break;
+        if (features == (BoundedPlanes | MeshPairs | MeshQueries | RestitutionMaterials)) break;
     }
     return features;
 }
@@ -59,10 +63,23 @@ constexpr struct {
     const char *Name;
     std::string_view Prefix;
 } Kernels[]{
+    {"ReduceBodyBounds"},
+    {"ReduceSceneBounds"},
+    {"MakeMortonKeys"},
+    {"RadixHistogram"},
+    {"RadixOffsets"},
+    {"RadixScatter"},
+    {"BuildRadixTree"},
+    {"RefitRadixTree"},
+    {"RefreshRadixLeaves"},
+    {"BuildSmallBroadPhase"},
+    {"BuildBodyBounds"},
+    {"BuildBodyBounds", "#define SENSOR_PASS 1"},
     {"Integrate"},
     {"CollectContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0"},
-    {"CountIncoming"},
     {"ScanIncoming"},
+    {"ScanIncomingBlocks"},
+    {"OffsetIncoming"},
     {"FillIncoming"},
     {"SortIncoming"},
     {"PrepareJoints"},
@@ -93,8 +110,11 @@ constexpr struct {
 Solver::Solver(const mtl::Context &context) : Context(context) {
     static_assert(std::size(Kernels) == PassCount, "one kernel per pass, in the enum's order");
     // Additional collider specializations compile lazily when a world first uses them.
-    for (uint32_t pass = 0; pass < BoundedCollectPass; ++pass)
-        Pipelines[pass] = context.Pipeline(gpu::SolveSource, Kernels[pass].Name, Kernels[pass].Prefix);
+    for (uint32_t pass = 0; pass < BoundedCollectPass; ++pass) {
+        std::string prefix{Kernels[pass].Prefix};
+        if (pass == CollectPass || pass == SensorPass) prefix += "\n#define BROAD_PHASE_MODE 1";
+        Pipelines[pass][0] = context.Pipeline(pass < BoundsPass ? gpu::BroadPhaseSource : gpu::SolveSource, Kernels[pass].Name, prefix);
+    }
 
     NS::Error *error{};
     auto descriptor = mtl::Make<MTL4::ArgumentTableDescriptor>();
@@ -122,15 +142,45 @@ Solver::~Solver() {
     mtl::Drain(Context.Queue.get()); // see mtl::Drain
 }
 
-void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads) {
-    if (!Pipelines[pass]) Pipelines[pass] = Context.Pipeline(gpu::SolveSource, Kernels[pass].Name, Kernels[pass].Prefix);
-    MTL::ComputePipelineState *pipeline = Pipelines[pass].get();
+void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads, uint32_t lanes) {
+    const bool collector = pass == CollectPass || pass == SensorPass || pass >= BoundedCollectPass;
+    const bool primal = pass == SolvePass || pass == StabilizePass;
+    const bool bounds = pass == BoundsPass || pass == SensorBoundsPass;
+    const uint32_t variant = collector ? uint32_t(threads > RadixSimdWidth) + 2 * uint32_t(lanes > 1) :
+        bounds                         ? uint32_t(lanes > 1) :
+                                         uint32_t(primal && threads > SolveLanes);
+    if (!Pipelines[pass][variant]) {
+        std::string prefix{Kernels[pass].Prefix};
+        if (collector) {
+            prefix += (variant & 1) ? "\n#define BROAD_PHASE_MODE 2" : "\n#define BROAD_PHASE_MODE 1";
+            prefix += "\n#define COLLECT_LANES " + std::to_string(lanes);
+        }
+        if (primal) prefix += "\n#define SOLVE_BODIES_PER_GROUP " + std::to_string(variant ? SolveBodiesPerGroup : 1);
+        if (bounds) prefix += "\n#define BOUNDS_LANES " + std::to_string(lanes);
+        Pipelines[pass][variant] = Context.Pipeline(pass < BoundsPass ? gpu::BroadPhaseSource : gpu::SolveSource, Kernels[pass].Name, prefix);
+    }
+    MTL::ComputePipelineState *pipeline = Pipelines[pass][variant].get();
     // Every pass reads the previous pass's writes, so every dispatch takes a barrier.
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     encoder->setComputePipelineState(pipeline);
-    const bool per_body = pass == CollectPass || pass == SensorPass || pass >= BoundedCollectPass || pass == SolvePass || pass == StabilizePass;
-    const auto group = std::min<uint32_t>(threads, per_body ? 8u : pipeline->maxTotalThreadsPerThreadgroup());
-    encoder->dispatchThreads({threads, 1, 1}, {group, 1, 1});
+    const bool per_body = collector || pass == SolvePass || pass == StabilizePass;
+    const bool radix = pass == RadixHistogramPass || pass == RadixOffsetsPass || pass == ReduceBoundsPass || pass == ReduceScenePass;
+    const bool scan = pass == ScanIncomingPass || pass == ScanIncomingBlocksPass;
+    const bool contact = pass == DualPass || pass == RestitutionPass;
+    if ((radix || scan || pass == SmallBroadPhasePass || ((collector || bounds) && lanes > 1)) && pipeline->threadExecutionWidth() != RadixSimdWidth)
+        throw std::runtime_error("GPU scans require 32-lane SIMD groups");
+    const uint32_t limit = scan ? RadixBlockSize : per_body ? 8u :
+        contact                                             ? 64u :
+                                                              pipeline->maxTotalThreadsPerThreadgroup();
+    const auto group = pass == SmallBroadPhasePass ? threads : radix ? RadixBlockSize :
+                                                                       std::min(threads, limit);
+    if (primal) {
+        if (pipeline->threadExecutionWidth() != SolveLanes) throw std::runtime_error("The body solve requires 32-lane SIMD groups");
+        const uint32_t bodies_per_group = variant ? SolveBodiesPerGroup : 1;
+        encoder->dispatchThreadgroups({(threads + bodies_per_group - 1) / bodies_per_group, 1, 1}, {SolveLanes, 1, 1});
+    } else if (pass == JointDualPass) encoder->dispatchThreadgroups({threads, 1, 1}, {32, 1, 1});
+    else if ((collector || bounds) && lanes > 1) encoder->dispatchThreadgroups({threads, 1, 1}, {lanes, 1, 1});
+    else encoder->dispatchThreads({threads, 1, 1}, {group, 1, 1});
 }
 
 void Solver::Step(World &world, const StepSettings &settings) {
@@ -176,10 +226,10 @@ void Solver::Step(World &world, const StepSettings &settings) {
         world.Shapes.Address(), // 8
         world.PreviousVelocities.Address(), // 9
         world.Materials.Address(), // 10
-        world.SolvedPoses.Address(), // 11
+        world.Iterates.Address(), // 11
         world.Colors.Address(), // 12
         world.NextColors.Address(), // 13
-        ColorCursor.Address(), // 14
+        world.Bounds.Address(), // 14
         world.CompoundChildren.Address(), // 15
         world.Joints.Address(), // 16
         world.Incoming.Address(), // 17
@@ -208,6 +258,8 @@ void Solver::Step(World &world, const StepSettings &settings) {
     Context.Queue->signalEvent(Done.get(), ++Signal);
     while (!Done->waitUntilSignaledValue(Signal, 1000)) {}
     // The GPU is done with the world, so a removal deferred during the step applies now. See World::OnStepped.
+    const auto root = world.BroadPhaseNodes[BroadPhaseRoot(bodies)];
+    if (root.Ready != (bodies <= RadixSimdWidth ? 0u : 2u) || root.Errors != 0) throw std::runtime_error("GPU broad phase did not complete");
     world.OnStepped(settings.DeltaTime);
 }
 
@@ -220,26 +272,70 @@ void Solver::Encode(const Recording &recording, World &world) {
     auto *encoder = Commands->computeCommandEncoder();
     encoder->setArgumentTable(Table.get());
 
-    // One pass per color, so the cursor returns to color zero at the end of every sweep with no reset.
+    // Each color reads one immutable cursor slot.
     const auto sweep = [&](Pass primal) {
         for (uint32_t color = 0; color < recording.Colors; ++color) {
-            Table->setAddress(ColorCursor.Address() + color * sizeof(uint32_t), CursorAt);
+            Table->setAddress(ColorCursor.Address() + color * sizeof(uint32_t), BroadPhaseOrCursorAt);
             Dispatch(encoder, primal, bodies);
-            Dispatch(encoder, PublishPass, bodies);
         }
+        Dispatch(encoder, PublishPass, bodies);
     };
 
+    const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
+    Dispatch(encoder, BoundsPass, bodies, bounds_lanes);
+    if (bodies <= RadixBlockSize) {
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, SmallBroadPhasePass, std::bit_ceil(std::max(RadixSimdWidth, bodies)));
+    } else {
+        const uint32_t blocks = RadixBlocks(bodies);
+        Table->setAddress(world.BoundsReductions.Address(), 13);
+        Dispatch(encoder, ReduceBoundsPass, blocks * RadixBlockSize);
+        Dispatch(encoder, ReduceScenePass, RadixBlockSize);
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 10);
+        Dispatch(encoder, MortonPass, bodies);
+        Table->setAddress(world.BroadPhaseScratch.Address(), 9);
+        for (uint32_t digit = 0; digit < 4; ++digit) {
+            const uint64_t input = world.BroadPhaseKeys.Address() + (digit % 2) * bodies * sizeof(MortonKey);
+            const uint64_t output = world.BroadPhaseKeys.Address() + ((digit + 1) % 2) * bodies * sizeof(MortonKey);
+            Table->setAddress(input, 11);
+            Table->setAddress(output, 13);
+            Table->setAddress(ColorCursor.Address() + digit * sizeof(uint32_t), 25);
+            Dispatch(encoder, RadixHistogramPass, blocks * RadixBlockSize);
+            Dispatch(encoder, RadixOffsetsPass, RadixBlockSize);
+            Dispatch(encoder, RadixScatterPass, bodies);
+        }
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, BuildTreePass, bodies);
+        Dispatch(encoder, RefitTreePass, bodies);
+    }
+    Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
+    Table->setAddress(world.PreviousVelocities.Address(), 9);
+    Table->setAddress(world.Materials.Address(), 10);
+    Table->setAddress(world.Iterates.Address(), 11);
+    Table->setAddress(world.NextColors.Address(), 13);
+    Table->setAddress(world.ContactEventCounts.Address(), 25);
     Dispatch(encoder, IntegratePass, bodies);
     // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from, before WarmStart moves the body to its starting guess.
     // This is the reference's order, and the only one that expands the Taylor series about the pose the constraint was measured at.
     constexpr Pass collectors[]{CollectPass, BoundedCollectPass, MeshCollectPass, FullCollectPass};
-    Dispatch(encoder, collectors[recording.ColliderFeatures], bodies);
+    const uint32_t geometry_features = recording.ColliderFeatures & (BoundedPlanes | MeshPairs);
+    // Shared lanes increase parallelism for mesh queries and small worlds.
+    const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : 1;
+    Dispatch(encoder, collectors[geometry_features], bodies, collision_lanes);
     // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
-    Dispatch(encoder, CountIncomingPass, slots);
-    Dispatch(encoder, ScanIncomingPass, 1);
-    Dispatch(encoder, FillIncomingPass, slots);
+    Table->setAddress(world.BroadPhaseScratch.Address(), BroadPhaseOrCursorAt);
+    Dispatch(encoder, ScanIncomingPass, bodies);
+    if (bodies > RadixBlockSize) {
+        Dispatch(encoder, ScanIncomingBlocksPass, RadixBlockSize);
+        Dispatch(encoder, OffsetIncomingPass, bodies);
+    }
+    Dispatch(encoder, FillIncomingPass, bodies);
     Dispatch(encoder, SortIncomingPass, bodies);
     if (joints > 0) Dispatch(encoder, PrepareJointsPass, joints);
+    Table->setAddress(world.Displacements.Address(), 10);
     Dispatch(encoder, WarmStartPass, bodies);
     for (uint32_t pass = 0; pass < recording.ColoringPasses; ++pass) {
         Dispatch(encoder, ColorPass, bodies);
@@ -254,10 +350,11 @@ void Solver::Encode(const Recording &recording, World &world) {
     Dispatch(encoder, FinalizePass, bodies);
     // Restitution runs as a velocity pass rather than as a row inside the solve. See Restitution for the gapped-contact case that requires it.
     // It runs before quiet counting, because a body given a rebound this step is not at rest.
-    for (uint32_t pass = 0; pass < RestitutionPasses; ++pass) {
-        Dispatch(encoder, RestitutionPass, slots);
-        Dispatch(encoder, ApplyRestitutionPass, bodies);
-    }
+    if (recording.ColliderFeatures & RestitutionMaterials)
+        for (uint32_t pass = 0; pass < RestitutionPasses; ++pass) {
+            Dispatch(encoder, RestitutionPass, slots);
+            Dispatch(encoder, ApplyRestitutionPass, bodies);
+        }
     sweep(StabilizePass);
     // Sleep state is settled at the very end of a step, after the stabilization sweep, so every kernel of a step sees one sleep state per body.
     // Published before the sweep, a body woken by the spread would run a stabilization pass for a step it slept through.
@@ -273,8 +370,17 @@ void Solver::Encode(const Recording &recording, World &world) {
         world.EnsureSensorBuffers();
         Table->setAddress(world.SensorContacts.Address(), 5);
         Table->setAddress(world.SensorRefusals.Address(), 26);
+        Table->setAddress(world.Materials.Address(), 10);
         constexpr Pass sensor_collectors[]{SensorPass, BoundedSensorPass, MeshSensorPass, FullSensorPass};
-        Dispatch(encoder, sensor_collectors[recording.ColliderFeatures], bodies);
+        Table->setAddress(world.Bounds.Address(), BroadPhaseOrCursorAt);
+        // Sensors query the final poses, after solving and stabilization.
+        Dispatch(encoder, SensorBoundsPass, bodies, bounds_lanes);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, RefreshTreePass, bodies);
+        if (bodies > RadixSimdWidth) Dispatch(encoder, RefitTreePass, bodies);
+        Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
+        Table->setAddress(world.NextColors.Address(), 13);
+        Dispatch(encoder, sensor_collectors[geometry_features], bodies, collision_lanes);
     }
 
     encoder->endEncoding();

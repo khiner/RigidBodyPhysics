@@ -171,7 +171,6 @@ inline void Drive(World &world, Index body, float3 to, float3 velocity) {
     world.Velocities[body] = {.Linear = velocity};
 }
 
-// A cube as a triangle mesh wound outward, the same solid as a box shape and the mesh DynamicMesh uses.
 inline Index BoxMesh(World &world, float half) {
     std::vector<float3> points;
     std::vector<uint32_t> indices;

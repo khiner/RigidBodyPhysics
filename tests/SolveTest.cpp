@@ -87,6 +87,30 @@ std::span<const Contact> Slots(const World &world, Index body) {
     return world.Contacts.All().subspan(body * ContactsPerBody, ContactsPerBody);
 }
 
+void CheckIncoming(const World &world) {
+    std::vector<std::vector<uint32_t>> expected(world.BodyCount());
+    for (uint32_t slot = 0; slot < world.BodyCount() * ContactsPerBody; ++slot) {
+        const Contact &contact = world.Contacts[slot];
+        if (!contact.Active) continue;
+        REQUIRE(contact.BodyB < world.BodyCount());
+        expected[contact.BodyB].push_back(slot);
+    }
+    uint32_t prefix = 0;
+    for (Index body = 0; body < world.BodyCount(); ++body) {
+        CAPTURE(body);
+        const Adjacency list = world.Incoming[body];
+        REQUIRE(list.Start == prefix);
+        REQUIRE(list.Count == expected[body].size());
+        REQUIRE(list.Cursor == prefix + list.Count);
+        const auto span = world.IncomingSlots.All().subspan(list.Start, list.Count);
+        std::vector<uint32_t> actual(span.begin(), span.end());
+        if (Moves(world.Masses[body])) CHECK(std::ranges::is_sorted(actual));
+        std::ranges::sort(actual);
+        CHECK(actual == expected[body]);
+        prefix += list.Count;
+    }
+}
+
 // The world position of one end of a contact, with `side` true for body A's anchor and false for body B's.
 float3 ContactPoint(const World &world, const Contact &contact, bool side) {
     return WorldPoint(world.Poses[side ? contact.BodyA : contact.BodyB], side ? contact.AnchorA : contact.AnchorB);
@@ -460,8 +484,7 @@ constexpr float SlideFrom = -Half - 0.05f;
 
 // The slider, resting on a floor whose top is at FloorTop and already moving toward the join.
 Index AddSlider(World &world) {
-    return world.AddBody({.Pose = At(float3{SlideFrom, FloorTop + Half, 0}), .Velocity = {.Linear = {SlideSpeed, 0, 0}},
-                          .Shape = world.AddShape(UnitBox), .Friction = SlideMu});
+    return world.AddBody({.Pose = At(float3{SlideFrom, FloorTop + Half, 0}), .Velocity = {.Linear = {SlideSpeed, 0, 0}}, .Shape = world.AddShape(UnitBox), .Friction = SlideMu});
 }
 } // namespace
 
@@ -471,8 +494,7 @@ TEST_CASE_FIXTURE(OneWorld, "a box slid at a step proud of the resting depth is 
     // Here it stands proud by twice the margin.
     const float step = 2 * StepSettings{}.ContactMargin;
     for (const float side : {-1.f, 1.f})
-        world.AddBody({.Pose = At(float3{side * FloorHalf, side > 0 ? step : 0, 0}),
-                       .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
+        world.AddBody({.Pose = At(float3{side * FloorHalf, side > 0 ? step : 0, 0}), .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
     const Index slider = AddSlider(world);
 
     Run(solver, world, 240);
@@ -497,8 +519,7 @@ TEST_CASE_FIXTURE(OneWorld, "a welded join between two static boxes is not a wal
     // The same two boxes with their tops in one plane, welded.
     // Both are static, so the face they share is interior to the combined solid and the narrowphase drops any manifold whose normal lies on it.
     for (const float side : {-1.f, 1.f})
-        world.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}),
-                       .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
+        world.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}), .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
     CHECK(world.WeldStatic() == 2); // one face of each box, the face the other covers
     const Index slider = AddSlider(world);
 
@@ -520,8 +541,7 @@ TEST_CASE_FIXTURE(OneWorld, "a box resting on a welded join sits level on it and
     // Straddling the join rather than crossing it.
     // The weld drops only the manifolds on the faces the boxes bury in each other, so both tops still support the box over the crack between them.
     for (const float side : {-1.f, 1.f})
-        world.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}),
-                       .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
+        world.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}), .Shape = world.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
     REQUIRE(world.WeldStatic() == 2);
     const Index box = world.AddBody({.Pose = At(float3{0, FloorTop + Half + 1e-3f, 0}), .Shape = world.AddShape(UnitBox), .Friction = SlideMu});
     REQUIRE(box != NoIndex);
@@ -536,10 +556,8 @@ TEST_CASE_FIXTURE(OneWorld, "a box resting on a welded join sits level on it and
 TEST_CASE_FIXTURE(OneWorld, "a face the weld buried is a face again once what buried it goes") {
     // The wholly-covered rule: the leg's top is inside the slab, and most of the slab's bottom is open air.
     constexpr float LegHalf = 0.75f, LegTop = 1;
-    const Index leg = world.AddBody({.Pose = At(float3{0, LegTop - LegHalf, 0}),
-                                     .Shape = world.AddShape({.HalfExtents = {LegHalf, LegHalf, LegHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
-    const Index slab = world.AddBody({.Pose = At(float3{0, LegTop + 0.25f, 0}),
-                                      .Shape = world.AddShape({.HalfExtents = {2, 0.25f, 2}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
+    const Index leg = world.AddBody({.Pose = At(float3{0, LegTop - LegHalf, 0}), .Shape = world.AddShape({.HalfExtents = {LegHalf, LegHalf, LegHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
+    const Index slab = world.AddBody({.Pose = At(float3{0, LegTop + 0.25f, 0}), .Shape = world.AddShape({.HalfExtents = {2, 0.25f, 2}, .Kind = ShapeBox}), .Density = 0, .Friction = SlideMu});
     REQUIRE(slab != NoIndex);
     CHECK(world.WeldStatic() == 1); // the leg's top alone
     CHECK(InternalFaces(world.Shapes[world.BodyShapes[leg]]) == 1u << BoxFaceIndex(1, true));
@@ -1265,11 +1283,7 @@ TEST_CASE_FIXTURE(OnDevice, "a driven hinge turns twenty revolutions on a tilted
     const float speed = wanted / (float(Steps) * settings.DeltaTime);
 
     World world{context};
-    const auto wheel = SpinOnAxle(world, {.Frame = frame,
-                                          .Angular = {AxisLocked, AxisLocked, AxisDriven},
-                                          .MotorSpeed = {0, 0, speed},
-                                          .MotorMaxTorque = {0, 0, 1e6f}},
-                                  float3{0, 0, 0});
+    const auto wheel = SpinOnAxle(world, {.Frame = frame, .Angular = {AxisLocked, AxisLocked, AxisDriven}, .MotorSpeed = {0, 0, speed}, .MotorMaxTorque = {0, 0, 1e6f}}, float3{0, 0, 0});
     REQUIRE(wheel.Joint != NoIndex);
     const float3 axle = Rotate(frame, float3{0, 0, 1});
     float off_the_axle = 0;
@@ -1294,11 +1308,7 @@ TEST_CASE_FIXTURE(OnDevice, "a twist limit past the half turn stops the axis whe
     const StepSettings settings{.Gravity = {0, 0, 0}};
 
     World world{context};
-    const auto wheel = SpinOnAxle(world, {.Frame = frame,
-                                          .Angular = {AxisLocked, AxisLocked, AxisLimited},
-                                          .LimitLow = {0, 0, -0.5f},
-                                          .LimitHigh = {0, 0, Stop}},
-                                  Rotate(frame, float3{0, 0, 4}));
+    const auto wheel = SpinOnAxle(world, {.Frame = frame, .Angular = {AxisLocked, AxisLocked, AxisLimited}, .LimitLow = {0, 0, -0.5f}, .LimitHigh = {0, 0, Stop}}, Rotate(frame, float3{0, 0, 4}));
     REQUIRE(wheel.Joint != NoIndex);
     for (uint32_t step = 0; step < 600; ++step) solver.Step(world, settings);
 
@@ -1393,10 +1403,7 @@ Slider MakeSlider(World &world, JointDesc joint, float3 at = {0, 0, 0}) {
 TEST_CASE_FIXTURE(OneWorld, "a slider dropped down its axis comes to rest on its stop") {
     // The linear form of the angular limit: outside the stops, a row that pushes only back inside.
     constexpr float Low = -0.5f, High = 0.5f;
-    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked},
-                                           .Linear = {AxisLocked, AxisLimited, AxisLocked},
-                                           .LinearLimitLow = {0, Low, 0},
-                                           .LinearLimitHigh = {0, High, 0}});
+    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked}, .Linear = {AxisLocked, AxisLimited, AxisLocked}, .LinearLimitLow = {0, Low, 0}, .LinearLimitHigh = {0, High, 0}});
 
     float lowest = 1e9f;
     for (uint32_t step = 0; step < 600; ++step) {
@@ -1417,10 +1424,7 @@ TEST_CASE_FIXTURE(OneWorld, "a body free in a box settles in the corner gravity 
     // Gravity pulls along every axis, so resting in the corner means every axis reached a stop.
     constexpr float Reach = 0.25f;
     const StepSettings settings{.Gravity = {-5, -8, -3}};
-    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked},
-                                           .Linear = {AxisLimited, AxisLimited, AxisLimited},
-                                           .LinearLimitLow = {-Reach, -Reach, -Reach},
-                                           .LinearLimitHigh = {Reach, Reach, Reach}});
+    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked}, .Linear = {AxisLimited, AxisLimited, AxisLimited}, .LinearLimitLow = {-Reach, -Reach, -Reach}, .LinearLimitHigh = {Reach, Reach, Reach}});
 
     Run(solver, world, 600, settings);
     const float3 at = world.Poses[slider.Box].Position;
@@ -1438,9 +1442,7 @@ TEST_CASE_FIXTURE(OnDevice, "a linear drive reaches its speed, and climbs to it 
 
     SUBCASE("with force to spare it reaches the speed") {
         World world{context};
-        const auto slider = MakeSlider(world, {.Linear = {AxisDriven, AxisLocked, AxisLocked},
-                                               .LinearMotorSpeed = {Speed, 0, 0},
-                                               .LinearMotorMaxForce = {1e7f, 0, 0}});
+        const auto slider = MakeSlider(world, {.Linear = {AxisDriven, AxisLocked, AxisLocked}, .LinearMotorSpeed = {Speed, 0, 0}, .LinearMotorMaxForce = {1e7f, 0, 0}});
         Run(solver, world, 300, settings);
         CHECK(world.Velocities[slider.Box].Linear.x == doctest::Approx(Speed).epsilon(0.01));
         CHECK(std::abs(world.Poses[slider.Box].Position.y) < 1e-3f);
@@ -1450,9 +1452,7 @@ TEST_CASE_FIXTURE(OnDevice, "a linear drive reaches its speed, and climbs to it 
     SUBCASE("held to a force it climbs at exactly that force over that mass") {
         constexpr float Force = 3000, Fast = 100; // a speed it cannot reach, so the bound sets the rate
         World world{context};
-        const auto slider = MakeSlider(world, {.Linear = {AxisDriven, AxisLocked, AxisLocked},
-                                               .LinearMotorSpeed = {Fast, 0, 0},
-                                               .LinearMotorMaxForce = {Force, 0, 0}});
+        const auto slider = MakeSlider(world, {.Linear = {AxisDriven, AxisLocked, AxisLocked}, .LinearMotorSpeed = {Fast, 0, 0}, .LinearMotorMaxForce = {Force, 0, 0}});
         constexpr uint32_t Steps = 200;
         Run(solver, world, Steps, settings);
         const float elapsed = Steps * settings.DeltaTime;
@@ -1467,10 +1467,7 @@ TEST_CASE_FIXTURE(OneWorld, "a linear position drive arrives at the offset it is
     // It holds its offset against gravity and arrives without ever gaining velocity, since the stabilization pass moves the error after velocity is read.
     // The bound sizes that correction, so a far target closes at Force h^2 / m per step.
     constexpr float Target = 0.8f, Force = 3e4f; // three times the box's own weight
-    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked},
-                                           .Linear = {AxisLocked, AxisPositioned, AxisLocked},
-                                           .LinearMotorTarget = {0, Target, 0},
-                                           .LinearMotorMaxForce = {0, Force, 0}});
+    const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked}, .Linear = {AxisLocked, AxisPositioned, AxisLocked}, .LinearMotorTarget = {0, Target, 0}, .LinearMotorMaxForce = {0, Force, 0}});
 
     float highest = -1e9f;
     const auto approach = [&](uint32_t steps) {
@@ -1520,10 +1517,7 @@ TEST_CASE_FIXTURE(OnDevice, "a hard drive to a far target arrives without report
     SUBCASE("and a linear one most of a metre away") {
         constexpr float Target = 0.9f;
         World world{context};
-        const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked},
-                                               .Linear = {AxisLocked, AxisPositioned, AxisLocked},
-                                               .LinearMotorTarget = {0, Target, 0},
-                                               .LinearMotorMaxForce = {0, INFINITY, 0}});
+        const auto slider = MakeSlider(world, {.Angular = {AxisLocked, AxisLocked, AxisLocked}, .Linear = {AxisLocked, AxisPositioned, AxisLocked}, .LinearMotorTarget = {0, Target, 0}, .LinearMotorMaxForce = {0, INFINITY, 0}});
         float peak = 0;
         for (uint32_t step = 0; step < 300; ++step) {
             solver.Step(world, settings);
@@ -1540,13 +1534,12 @@ TEST_CASE_FIXTURE(OnDevice, "an axis locked at an offset holds the two ends that
     constexpr float Offset = 1;
     const auto held = [&](float target) {
         World world{context};
-        const auto slider = MakeSlider(world,
-                                       {.At = {Offset, 0, 0}, // the box's end, at the box's centre
-                                        .AtB = float3{0, 0, 0}, // the fixed point's end, a metre away
-                                        .Angular = {AxisLocked, AxisLocked, AxisLocked},
-                                        .Linear = {AxisPositioned, AxisLocked, AxisLocked},
-                                        .LinearMotorTarget = {target, 0, 0},
-                                        .LinearMotorMaxForce = {INFINITY, 0, 0}},
+        const auto slider = MakeSlider(world, {.At = {Offset, 0, 0}, // the box's end, at the box's centre
+                                               .AtB = float3{0, 0, 0}, // the fixed point's end, a metre away
+                                               .Angular = {AxisLocked, AxisLocked, AxisLocked},
+                                               .Linear = {AxisPositioned, AxisLocked, AxisLocked},
+                                               .LinearMotorTarget = {target, 0, 0},
+                                               .LinearMotorMaxForce = {INFINITY, 0, 0}},
                                        float3{Offset, 0, 0});
         Run(solver, world, 600);
         return world.Poses[slider.Box].Position.x;
@@ -1561,11 +1554,7 @@ TEST_CASE_FIXTURE(OneWorld, "a braked wheel decays at the rate its damping and i
     // Backwards Euler integrates the geometric w0 (1 + c h / I)^-n, checked tightly since any slack there belongs to the solve, and the exponential loosely.
     constexpr float Spin = 10, Damping = 166.667f; // one second of time constant on a unit box
     const StepSettings settings{.Gravity = {0, 0, 0}}; // nothing but the brake acting
-    const auto wheel = SpinOnAxle(world, {.Angular = {AxisLocked, AxisLocked, AxisDriven},
-                                          .MotorMaxTorque = {0, 0, INFINITY},
-                                          .AngularStiffness = {INFINITY, INFINITY, 0},
-                                          .AngularDamping = {0, 0, Damping}},
-                                  float3{0, 0, Spin});
+    const auto wheel = SpinOnAxle(world, {.Angular = {AxisLocked, AxisLocked, AxisDriven}, .MotorMaxTorque = {0, 0, INFINITY}, .AngularStiffness = {INFINITY, INFINITY, 0}, .AngularDamping = {0, 0, Damping}}, float3{0, 0, Spin});
     const float per_step = 1 + Damping * settings.DeltaTime / wheel.Inertia;
 
     for (uint32_t step = 0; step < 120; ++step) {
@@ -1589,12 +1578,7 @@ TEST_CASE_FIXTURE(OneWorld, "a drive with damping and no stiffness approaches it
     // The other half of the row: I dw/dt = -c (w - wT), so it arrives as wT (1 - exp(-c t / I)).
     constexpr float Target = 5, Damping = 166.667f;
     const StepSettings settings{.Gravity = {0, 0, 0}};
-    const auto wheel = SpinOnAxle(world, {.Angular = {AxisLocked, AxisLocked, AxisDriven},
-                                          .MotorSpeed = {0, 0, Target},
-                                          .MotorMaxTorque = {0, 0, INFINITY},
-                                          .AngularStiffness = {INFINITY, INFINITY, 0},
-                                          .AngularDamping = {0, 0, Damping}},
-                                  float3{0, 0, 0});
+    const auto wheel = SpinOnAxle(world, {.Angular = {AxisLocked, AxisLocked, AxisDriven}, .MotorSpeed = {0, 0, Target}, .MotorMaxTorque = {0, 0, INFINITY}, .AngularStiffness = {INFINITY, INFINITY, 0}, .AngularDamping = {0, 0, Damping}}, float3{0, 0, 0});
     const float per_step = 1 + Damping * settings.DeltaTime / wheel.Inertia;
     const auto approached = [&](uint32_t taken) { return Target * (1 - 1 / std::pow(per_step, float(taken))); };
 
@@ -1624,9 +1608,7 @@ TEST_CASE_FIXTURE(OnDevice, "a spring with a damper across it settles without ov
         const auto shape = world.AddShape(UnitBox);
         const auto anchor = world.AddBody({}); // no shape, so no mass: a fixed point to hang from
         const auto box = world.AddBody({.Shape = shape});
-        world.AddJoint({.BodyA = box, .BodyB = anchor, .At = {0, 0, 0},
-                        .LinearStiffness = {INFINITY, Stiffness, INFINITY},
-                        .LinearDamping = {0, damping, 0}});
+        world.AddJoint({.BodyA = box, .BodyB = anchor, .At = {0, 0, 0}, .LinearStiffness = {INFINITY, Stiffness, INFINITY}, .LinearDamping = {0, damping, 0}});
         const float mass = 1 / world.Masses[box].InvMass;
         float lowest = 0;
         for (uint32_t step = 0; step < 300; ++step) {
@@ -2681,6 +2663,7 @@ TEST_CASE_FIXTURE(OneWorld, "a full run gives its shallowest place to a deeper c
     };
 
     Run(solver, world, 1);
+    CheckIncoming(world);
     CHECK(world.ContactRefusals[subject] == 2 * ManifoldPoints);
     CHECK(against(support) == ManifoldPoints);
     CHECK(against(late) == 0); // the tie goes to the contact already held
@@ -2692,9 +2675,44 @@ TEST_CASE_FIXTURE(OneWorld, "a full run gives its shallowest place to a deeper c
 
     // It stays that way rather than creeping through the support.
     Run(solver, world, 180);
+    CheckIncoming(world);
     CHECK(against(support) == ManifoldPoints);
     CheckResting(world.Poses[subject].Position.y + Half); // its underside on the support's top face
     CHECK(simd::length(world.Velocities[subject].Linear) < 1e-3f);
+}
+
+TEST_CASE_FIXTURE(OnDevice, "incoming lists match retained solid contacts through sensors and body reuse") {
+    for (uint32_t count : {3u, 35u, 300u}) {
+        CAPTURE(count);
+        World world{context};
+        const auto ground = AddGround(world);
+        const auto shape = world.AddShape(UnitBox);
+        const BodyDesc desc{.Pose = At(float3{0, Half - 1e-3f, 0}), .Shape = shape};
+        Index box = world.AddBody(desc);
+        world.AddBody({.Pose = desc.Pose, .Shape = shape, .Density = 0, .Sensor = true});
+        while (world.BodyCount() < count) REQUIRE(world.AddBody({.Density = 0}) != NoIndex);
+        const StepSettings settings{.Gravity = {0, 0, 0}};
+        for (uint32_t step = 0; step < 7; ++step) {
+            CAPTURE(step);
+            if (step == 1) world.Quiet[box] = settings.SleepSteps;
+            if (step == 2) {
+                world.Wake(box);
+                world.Poses[box].Position.y = 100;
+            }
+            if (step == 3) world.Poses[box] = desc.Pose;
+            if (step == 4) REQUIRE(world.RemoveBody(box));
+            if (step == 5) {
+                const Index reused = world.AddBody(desc);
+                REQUIRE(reused == box);
+            }
+            if (step == 6) world.Poses[ground].Position.y = -100;
+            solver.Step(world, settings);
+            CheckIncoming(world);
+            const bool touching = step == 0 || step == 1 || step == 3 || step == 5;
+            CHECK(world.Incoming[ground].Count == (touching ? ManifoldPoints : 0));
+            if (touching) CHECK_FALSE(world.Overlaps().empty());
+        }
+    }
 }
 
 // Hulls, each checked against a shape the engine already has.
@@ -3947,6 +3965,33 @@ TEST_CASE_FIXTURE(OneWorld, "two moving meshes settle on a bounded plane") {
     CHECK(support == doctest::Approx(Gravity * mass.Mass).epsilon(0.01));
 }
 
+TEST_CASE_FIXTURE(OneWorld, "sensor overlaps use the completed step's poses") {
+    bool sensor_moves = false;
+    SUBCASE("a body enters a sensor") {}
+    SUBCASE("a sensor enters a body") { sensor_moves = true; }
+    const auto shape = world.AddShape({.Radius = 0.25f, .Kind = ShapeSphere});
+    const auto moving = world.AddBody({.Velocity = {.Linear = {100, 0, 0}}, .Shape = shape, .Sensor = sensor_moves});
+    const auto stationary = world.AddBody({.Pose = At(float3{10, 0, 0}), .Shape = shape, .Density = 0, .Sensor = !sensor_moves});
+    world.TrackSensors = true;
+    StepSettings settings;
+    settings.Gravity = {0, 0, 0};
+    settings.DeltaTime = 0.1f;
+    solver.Step(world, settings);
+    CHECK(world.Poses[moving].Position.x == doctest::Approx(10));
+    REQUIRE(world.Overlaps().size() == 1);
+    CHECK(world.Overlaps()[0].A == world.IdOf(moving));
+    CHECK(world.Overlaps()[0].B == world.IdOf(stationary));
+    const auto entered = world.TakeSensorChanges();
+    REQUIRE(entered.size() == 1);
+    CHECK(entered[0].Entered);
+    solver.Step(world, settings);
+    CHECK(world.Poses[moving].Position.x == doctest::Approx(20));
+    CHECK(world.Overlaps().empty());
+    const auto exited = world.TakeSensorChanges();
+    REQUIRE(exited.size() == 1);
+    CHECK_FALSE(exited[0].Entered);
+}
+
 TEST_CASE_FIXTURE(OneWorld, "transformed mesh sensors preserve compound overlap lifetimes") {
     bool sensor_first = true;
     SUBCASE("sensor first") {}
@@ -4160,9 +4205,7 @@ TEST_CASE_FIXTURE(OneWorld, "the convex side owns a pair against a mesh whatever
     bool moving = true;
     SUBCASE("a mesh the host gave a mass") { moving = true; }
     SUBCASE("against the same mesh left as scenery") { moving = false; }
-    const auto mesh = moving
-        ? world.AddBody({.Pose = At(float3{0, 0.4f, 0}), .Shape = shape, .Mass = {{.Mass = MeshMass, .Inertia = {MeshInertia, MeshInertia, MeshInertia}}}})
-        : world.AddBody({.Pose = At(float3{0, 0.4f, 0}), .Shape = shape});
+    const auto mesh = moving ? world.AddBody({.Pose = At(float3{0, 0.4f, 0}), .Shape = shape, .Mass = {{.Mass = MeshMass, .Inertia = {MeshInertia, MeshInertia, MeshInertia}}}}) : world.AddBody({.Pose = At(float3{0, 0.4f, 0}), .Shape = shape});
     const auto box = world.AddBody({.Pose = At(float3{0, 1.05f, 0}), .Shape = world.AddShape({.HalfExtents = {TopHalf, TopHalf, TopHalf}, .Kind = ShapeBox})});
     REQUIRE(mesh < box);
 
@@ -4204,14 +4247,13 @@ TEST_CASE_FIXTURE(OneWorld, "a mesh cube's bottom face is held on all four of it
     // It changes the alignment with the world axes, which nothing here depends on.
     float yaw = 0;
     bool square_on = true;
-    SUBCASE("set down square on") { }
+    SUBCASE("set down square on") {}
     SUBCASE("with both sides of the mesh enabled") { world.Shapes[shape].DoubleSided = true; }
     SUBCASE("and turned ten degrees about the upright") {
         yaw = 10 * std::numbers::pi_v<float> / 180;
         square_on = false;
     }
-    const auto mesh = world.AddBody({.Pose = At(float3{0, MeshHalf, 0}, QuatFromRotationVector(float3{0, yaw, 0})), .Shape = shape,
-                                     .Mass = {{.Mass = MeshMass, .Inertia = {MeshInertia, MeshInertia, MeshInertia}}}});
+    const auto mesh = world.AddBody({.Pose = At(float3{0, MeshHalf, 0}, QuatFromRotationVector(float3{0, yaw, 0})), .Shape = shape, .Mass = {{.Mass = MeshMass, .Inertia = {MeshInertia, MeshInertia, MeshInertia}}}});
 
     Run(solver, world, 600);
     CheckManifolds(world);
@@ -4716,23 +4758,17 @@ TEST_CASE_FIXTURE(OnDevice, "a ball striking a pinned body off centre spins it a
     // Struck as a body of infinite mass, and again as scenery for the control, since a body with no inertia has no rotational block.
     const auto strike = [&](bool turns, float friction) {
         World world{context};
-        const auto pinned = world.AddBody({.Shape = world.AddShape(UnitBox),
-                                           .Mass = {{.Mass = 0, .Inertia = turns ? float3{Inertia, Inertia, Inertia} : float3{0, 0, 0}}},
-                                           .Friction = friction});
+        const auto pinned = world.AddBody({.Shape = world.AddShape(UnitBox), .Mass = {{.Mass = 0, .Inertia = turns ? float3{Inertia, Inertia, Inertia} : float3{0, 0, 0}}}, .Friction = friction});
         REQUIRE(pinned != NoIndex);
         REQUIRE(world.Masses[pinned].InvMass == 0);
         // Started close so it arrives before anything sleeps, and read soon after, so the measurement is of the collision rather than the motion that follows.
-        const auto ball = world.AddBody({.Pose = At(float3{-Half - BallRadius - 0.3f, Offset, 0}),
-                                         .Velocity = {.Linear = {Speed, 0, 0}},
-                                         .Shape = world.AddShape({.Radius = BallRadius, .Kind = ShapeSphere}),
-                                         .Mass = {{.Mass = BallMass, .Inertia = {1, 1, 1}}}, .Friction = friction});
+        const auto ball = world.AddBody({.Pose = At(float3{-Half - BallRadius - 0.3f, Offset, 0}), .Velocity = {.Linear = {Speed, 0, 0}}, .Shape = world.AddShape({.Radius = BallRadius, .Kind = ShapeSphere}), .Mass = {{.Mass = BallMass, .Inertia = {1, 1, 1}}}, .Friction = friction});
         REQUIRE(ball != NoIndex);
         const Pose was = world.Poses[pinned];
         Run(solver, world, 24, free_space);
         // The momentum the ball loses along x is the impulse on the pinned body, nothing else acting.
         const float impulse = BallMass * (Speed - float(world.Velocities[ball].Linear.x));
-        return std::tuple{impulse, float(world.Velocities[pinned].Angular.z),
-                          float(simd::distance(world.Poses[pinned].Position, was.Position))};
+        return std::tuple{impulse, float(world.Velocities[pinned].Angular.z), float(simd::distance(world.Poses[pinned].Position, was.Position))};
     };
 
     SUBCASE("frictionless, against the closed form") {
@@ -4767,8 +4803,7 @@ TEST_CASE_FIXTURE(OneWorld, "a wheel pinned by an infinite mass turns on no join
     const Index shape = WheelMesh(world, 16, 8);
     REQUIRE(shape != NoIndex);
     AddGround(world, {.Pose = At(float3{0, -2, 0})});
-    const auto wheel = world.AddBody({.Shape = shape, .Mass = {{.Mass = 0, .Inertia = {0, 0, 20 * WheelRadius * WheelRadius / 2}}},
-                                      .Friction = 0.5f, .AngularDamping = 0.6f});
+    const auto wheel = world.AddBody({.Shape = shape, .Mass = {{.Mass = 0, .Inertia = {0, 0, 20 * WheelRadius * WheelRadius / 2}}}, .Friction = 0.5f, .AngularDamping = 0.6f});
     REQUIRE(wheel != NoIndex);
     REQUIRE(world.Masses[wheel].InvMass == 0);
     REQUIRE(world.Masses[wheel].InvInertiaLocal.x == 0);
@@ -4804,11 +4839,8 @@ TEST_CASE_FIXTURE(OneWorld, "a box rests on a pinned body, held up by a mass tha
     // A slab nothing can translate supports a box exactly as static geometry would, and the pair's reduced mass is the box's alone.
     // The penalty floor is that box's own m/h^2, since the sum of inverses drops an infinite mass rather than dividing by zero.
     constexpr float BoxMass = 1000;
-    const auto slab = world.AddBody({.Pose = At(float3{0, -0.25f, 0}),
-                                     .Shape = world.AddShape({.HalfExtents = {3, 0.25f, 3}, .Kind = ShapeBox}),
-                                     .Mass = {{.Mass = 0, .Inertia = {200, 200, 200}}}, .Friction = 0.5f});
-    const auto box = world.AddBody({.Pose = At(float3{0, Half + 0.2f, 0}), .Shape = world.AddShape(UnitBox),
-                                    .Mass = {CubeMass(BoxMass, 1)}, .Friction = 0.5f});
+    const auto slab = world.AddBody({.Pose = At(float3{0, -0.25f, 0}), .Shape = world.AddShape({.HalfExtents = {3, 0.25f, 3}, .Kind = ShapeBox}), .Mass = {{.Mass = 0, .Inertia = {200, 200, 200}}}, .Friction = 0.5f});
+    const auto box = world.AddBody({.Pose = At(float3{0, Half + 0.2f, 0}), .Shape = world.AddShape(UnitBox), .Mass = {CubeMass(BoxMass, 1)}, .Friction = 0.5f});
     REQUIRE(slab != NoIndex);
     REQUIRE(box != NoIndex);
     const Pose was = world.Poses[slab];
@@ -4839,17 +4871,14 @@ TEST_CASE_FIXTURE(OneWorld, "a box rests on a pinned body, held up by a mass tha
 TEST_CASE_FIXTURE(OneWorld, "a pinned body sleeps when it stops turning, and a strike wakes it") {
     // It has a quiet count like any other body the solve moves, where testing on inverse mass alone would leave it unable to come to rest or to be woken.
     const StepSettings free_space{.Gravity = {0, 0, 0}};
-    const auto pinned = world.AddBody({.Velocity = {.Angular = {0, 0, 2}}, .Shape = world.AddShape(UnitBox),
-                                       .Mass = {PinnedCubeMass(40, 1)}, .Friction = 0, .AngularDamping = 4});
+    const auto pinned = world.AddBody({.Velocity = {.Angular = {0, 0, 2}}, .Shape = world.AddShape(UnitBox), .Mass = {PinnedCubeMass(40, 1)}, .Friction = 0, .AngularDamping = 4});
     REQUIRE(pinned != NoIndex);
     Run(solver, world, 300, free_space);
     CHECK(world.Quiet[pinned] >= free_space.SleepSteps);
     const float4 settled = world.Poses[pinned].Orientation;
 
     // A ball into its face off centre wakes it and turns it.
-    const auto ball = world.AddBody({.Pose = At(float3{-1.2f, 0.25f, 0}), .Velocity = {.Linear = {4, 0, 0}},
-                                     .Shape = world.AddShape({.Radius = 0.25f, .Kind = ShapeSphere}),
-                                     .Mass = {{.Mass = 30, .Inertia = {1, 1, 1}}}, .Friction = 0});
+    const auto ball = world.AddBody({.Pose = At(float3{-1.2f, 0.25f, 0}), .Velocity = {.Linear = {4, 0, 0}}, .Shape = world.AddShape({.Radius = 0.25f, .Kind = ShapeSphere}), .Mass = {{.Mass = 30, .Inertia = {1, 1, 1}}}, .Friction = 0});
     REQUIRE(ball != NoIndex);
     Run(solver, world, 30, free_space);
     CHECK(world.Quiet[pinned] < free_space.SleepSteps);
@@ -4860,12 +4889,9 @@ TEST_CASE_FIXTURE(OnDevice, "a scene holding a pinned body steps to bit-identica
     CheckReplay(context, [&](World &world) {
         AddGround(world);
         const Index box = world.AddShape(UnitBox);
-        REQUIRE(world.AddBody({.Pose = At(float3{0, 1.5f, 0}),
-                               .Shape = world.AddShape({.HalfExtents = {1.5f, 0.2f, 1.5f}, .Kind = ShapeBox}),
-                               .Mass = {{.Mass = 0, .Inertia = {0, 40, 0}}}, .Friction = 0.5f}) != NoIndex);
+        REQUIRE(world.AddBody({.Pose = At(float3{0, 1.5f, 0}), .Shape = world.AddShape({.HalfExtents = {1.5f, 0.2f, 1.5f}, .Kind = ShapeBox}), .Mass = {{.Mass = 0, .Inertia = {0, 40, 0}}}, .Friction = 0.5f}) != NoIndex);
         for (uint32_t i = 0; i < 3; ++i)
-            REQUIRE(world.AddBody({.Pose = At(float3{0.2f * float(i) - 0.2f, 2.4f + 1.2f * float(i), 0.13f}), .Shape = box,
-                                   .Mass = {CubeMass(200, 1)}, .Friction = 0.5f}) != NoIndex);
+            REQUIRE(world.AddBody({.Pose = At(float3{0.2f * float(i) - 0.2f, 2.4f + 1.2f * float(i), 0.13f}), .Shape = box, .Mass = {CubeMass(200, 1)}, .Friction = 0.5f}) != NoIndex);
         Run(solver, world, 200);
     });
 }
@@ -5026,8 +5052,7 @@ TEST_CASE_FIXTURE(OneWorld, "a dumbbell rolls on the axis its geometry gives it"
     // A push along z turns it about x alone.
     constexpr float Radius = 0.25f, Reach = 0.5f;
     AddGround(world, {.Friction = 0.5f});
-    std::vector<Index> parts{world.AddShape({.HalfExtents = {Reach, 0, 0}, .Radius = 0.06f, .Kind = ShapeCapsule,
-                                             .Local = At(float3{0, 0, 0}, QuatFromRotationVector(float3{0, 0, std::numbers::pi_v<float> / 2}))})};
+    std::vector<Index> parts{world.AddShape({.HalfExtents = {Reach, 0, 0}, .Radius = 0.06f, .Kind = ShapeCapsule, .Local = At(float3{0, 0, 0}, QuatFromRotationVector(float3{0, 0, std::numbers::pi_v<float> / 2}))})};
     for (const float side : {-1.f, 1.f})
         parts.push_back(world.AddShape({.Radius = Radius, .Kind = ShapeSphere, .Local = At(float3{side * Reach, 0, 0})}));
     Pose frame{};
@@ -5081,8 +5106,7 @@ TEST_CASE_FIXTURE(OnDevice, "the join two coplanar siblings share is not a wall"
     // AddCompound marks that face buried and the narrowphase drops any manifold on it, with two separate bodies as the control.
     constexpr float FloorHalf = 2.5f, FloorTop = 0.25f, Speed = 2, Resting = FloorTop + Half;
     const auto slide = [&](World &world) {
-        const Index box = world.AddBody({.Pose = At(float3{-Half - 0.05f, Resting, 0}), .Velocity = {.Linear = {Speed, 0, 0}},
-                                         .Shape = world.AddShape(UnitBox), .Density = 1000, .Friction = 0.5f});
+        const Index box = world.AddBody({.Pose = At(float3{-Half - 0.05f, Resting, 0}), .Velocity = {.Linear = {Speed, 0, 0}}, .Shape = world.AddShape(UnitBox), .Density = 1000, .Friction = 0.5f});
         REQUIRE(box != NoIndex);
         return box;
     };
@@ -5099,9 +5123,7 @@ TEST_CASE_FIXTURE(OnDevice, "the join two coplanar siblings share is not a wall"
     CHECK(InternalFaces(jointed.Shapes[jointed.Child(floor, 1)]) == 1u << BoxFaceIndex(0, false));
     jointed.AddBody({.Pose = At(frame.Position), .Shape = floor, .Density = 0, .Friction = 0.5f});
     for (const float side : {-1.f, 1.f})
-        separate.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}),
-                          .Shape = separate.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}),
-                          .Density = 0, .Friction = 0.5f});
+        separate.AddBody({.Pose = At(float3{side * FloorHalf, 0, 0}), .Shape = separate.AddShape({.HalfExtents = {FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = 0.5f});
     seamless.AddBody({.Shape = seamless.AddShape({.HalfExtents = {2 * FloorHalf, FloorTop, FloorHalf}, .Kind = ShapeBox}), .Density = 0, .Friction = 0.5f});
 
     const Index over_join = slide(jointed), over_two = slide(separate), over_none = slide(seamless);
@@ -5135,9 +5157,7 @@ TEST_CASE_FIXTURE(OnDevice, "a scene holding a compound steps to bit-identical s
         REQUIRE(world.AddBody({.Pose = At(frame.Position + float3{0, 1e-3f, 0}, frame.Orientation), .Shape = table, .Friction = 0.5f}) != NoIndex);
         const Index box = world.AddShape(UnitBox);
         for (uint32_t i = 0; i < 3; ++i)
-            REQUIRE(world.AddBody({.Pose = At(float3{0.13f * float(i), TableTop + TableHalf + Half + 1.1f * float(i), 0.07f},
-                                              QuatFromRotationVector(float3{0.05f, 0.3f * float(i), 0})),
-                                   .Shape = box, .Friction = 0.5f}) != NoIndex);
+            REQUIRE(world.AddBody({.Pose = At(float3{0.13f * float(i), TableTop + TableHalf + Half + 1.1f * float(i), 0.07f}, QuatFromRotationVector(float3{0.05f, 0.3f * float(i), 0})), .Shape = box, .Friction = 0.5f}) != NoIndex);
         Run(solver, world, 200);
     });
 }
@@ -5437,8 +5457,7 @@ TEST_CASE_FIXTURE(OneWorld, "collider filters: an excluded sibling cannot hide a
     REQUIRE(compound != NoIndex);
     REQUIRE(InternalFaces(world.Shapes[world.Child(compound, 0)]) != 0);
     const auto wall = world.AddBody({.Shape = compound, .Density = 0});
-    const auto ball = world.AddBody({.Pose = At(float3{0.05f, 0, 0}), .Shape = world.AddShape({.Radius = 0.1f, .Kind = ShapeSphere}),
-                                     .Density = 1, .Layer = 2, .CollidesWith = 1});
+    const auto ball = world.AddBody({.Pose = At(float3{0.05f, 0, 0}), .Shape = world.AddShape({.Radius = 0.1f, .Kind = ShapeSphere}), .Density = 1, .Layer = 2, .CollidesWith = 1});
     for (int i = 0; i < 30; ++i) solver.Step(world, {.Gravity = {0, 0, 0}});
     CHECK(world.Filters[wall].Mixed == 1);
     CHECK(world.Poses[ball].Position.x > 0.095f);
@@ -5551,4 +5570,239 @@ TEST_CASE_FIXTURE(OneWorld, "glancing sphere impacts conserve isolated momentum 
     CHECK(world.Velocities[b].Linear.y < -0.1f * speed);
     CHECK(simd::length(world.Velocities[a].Angular) < 0.001f);
     CHECK(simd::length(world.Velocities[b].Angular) < 0.001f);
+}
+
+TEST_CASE_FIXTURE(OnDevice, "collision lane selection preserves contacts across live geometry changes") {
+    World reference{context, {.Bodies = 40}}, changing{context, {.Bodies = 40}};
+    Index box = NoIndex, mesh = NoIndex;
+    for (World *world : {&reference, &changing}) {
+        AddGround(*world);
+        box = world->AddShape(UnitBox);
+        AddStack(*world, box, 8);
+        while (world->BodyCount() < 33) {
+            const auto body = world->BodyCount();
+            world->AddBody({.Pose = At(float3{1000 + 3.f * body, 1000, 0}), .Shape = box, .Density = 0});
+        }
+        mesh = FloorMesh(*world, 2, 1);
+    }
+    for (uint32_t step = 0; step < 120; ++step) {
+        CAPTURE(step);
+        if (step == 40) REQUIRE(changing.SetBodyShape(32, mesh, 0));
+        if (step == 80) REQUIRE(changing.SetBodyShape(32, box, 0));
+        solver.Step(reference, {.SleepSpeed = 0});
+        solver.Step(changing, {.SleepSpeed = 0});
+        CheckIdentical(Snapshot(reference), Snapshot(changing));
+        CHECK(ContactKeys(reference) == ContactKeys(changing));
+        for (Index body = 0; body < reference.BodyCount(); ++body) {
+            CHECK(std::memcmp(&reference.Velocities[body].Linear, &changing.Velocities[body].Linear, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&reference.Velocities[body].Angular, &changing.Velocities[body].Angular, 3 * sizeof(float)) == 0);
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "SIMD body packing preserves mixed locked and inactive body solves") {
+    World reference{context, {.Bodies = 40}}, packed{context, {.Bodies = 40}};
+    Index box = NoIndex;
+    for (World *world : {&reference, &packed}) {
+        AddGround(*world);
+        box = world->AddShape(UnitBox);
+        for (uint32_t body = 1; body < 32; ++body) {
+            const bool fixed = body % 7 == 0, pinned = body % 5 == 0;
+            const float3 inertia = fixed ? float3{0, 0, 0} : pinned || body % 3 == 0 ? float3{0, 1, 0} :
+                body % 3 == 1                                                        ? float3{1, 0, 1} :
+                                                                                       float3{1, 1, 1};
+            Pose pose = At(float3{4.f * body, 1.1f + 0.02f * body, 0});
+            pose.Orientation = QuatFromRotationVector(float3{0.11f * body, 0.03f, 0.05f});
+            REQUIRE(world->AddBody({.Pose = pose, .Velocity = {.Linear = {fixed || pinned ? 0.f : 0.1f, 0, 0}, .Angular = fixed ? float3{0, 0, 0} : float3{0.01f, 0.03f, 0.02f}}, .Shape = box, .Mass = AuthoredMass{.Mass = fixed || pinned ? 0.f : 1.f, .Inertia = inertia}}) == body);
+        }
+    }
+    const auto add_remote = [&] {
+        while (packed.BodyCount() < 35)
+            REQUIRE(packed.AddBody({.Pose = At(float3{1000 + 3.f * packed.BodyCount(), 1000, 0}), .Shape = box, .Density = 0}) != NoIndex);
+    };
+    add_remote();
+    for (uint32_t step = 0; step < 120; ++step) {
+        CAPTURE(step);
+        if (step == 60)
+            for (Index body = 32; body < 35; ++body) REQUIRE(packed.RemoveBody(body));
+        if (step == 90) add_remote();
+        solver.Step(reference, {.SleepSpeed = 0});
+        solver.Step(packed, {.SleepSpeed = 0});
+        auto actual = Snapshot(packed);
+        actual.resize(reference.BodyCount());
+        CheckIdentical(Snapshot(reference), actual);
+        CHECK(ContactKeys(reference) == ContactKeys(packed));
+        for (Index body = 0; body < reference.BodyCount(); ++body) {
+            CHECK(std::memcmp(&reference.Velocities[body].Linear, &packed.Velocities[body].Linear, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&reference.Velocities[body].Angular, &packed.Velocities[body].Angular, 3 * sizeof(float)) == 0);
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "joint row batches preserve mixed constraints across SIMD body packings") {
+    World reference{context, {.Bodies = 40}}, packed{context, {.Bodies = 40}};
+    Index box = NoIndex;
+    constexpr JointAxisMode modes[]{AxisFree, AxisLocked, AxisDriven, AxisPositioned, AxisLimited};
+    for (World *world : {&reference, &packed}) {
+        box = world->AddShape(UnitBox);
+        for (uint32_t pair = 0; pair < 16; ++pair) {
+            for (uint32_t side = 0; side < 2; ++side) {
+                const bool fixed = side == 0 && pair % 3 == 0;
+                Pose pose = At(float3{6.f * pair + 1.2f * side, 3, 0});
+                pose.Orientation = QuatFromRotationVector(float3{0.02f * pair, 0.05f * side, 0.03f});
+                REQUIRE(world->AddBody({.Pose = pose, .Velocity = {.Angular = fixed ? float3{0, 0, 0} : float3{0.04f, 0.03f, 0.02f}}, .Shape = box, .Mass = AuthoredMass{.Mass = fixed ? 0.f : 1.f, .Inertia = fixed ? float3{0, 0, 0} : float3{1, 1, 1}}}) == 2 * pair + side);
+            }
+            JointDesc joint{.BodyA = 2 * pair + pair % 2, .BodyB = 2 * pair + 1 - pair % 2, .At = {6.f * pair + 0.6f, 3, 0}, .Frame = QuatFromRotationVector(float3{0.1f, 0.2f, 0.3f})};
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                joint.Linear[axis] = modes[(pair + axis) % 5];
+                joint.Angular[axis] = modes[(pair + axis + 2) % 5];
+                joint.LinearMotorSpeed[axis] = 0.03f;
+                joint.MotorSpeed[axis] = 0.05f;
+                joint.LinearMotorTarget[axis] = joint.MotorTarget[axis] = 0.04f;
+                joint.LinearMotorMaxForce[axis] = joint.MotorMaxTorque[axis] = 3;
+                joint.LinearLimitLow[axis] = joint.LimitLow[axis] = -0.05f;
+                joint.LinearLimitHigh[axis] = joint.LimitHigh[axis] = 0.05f;
+                if ((pair + axis) % 2) joint.LinearStiffness[axis] = joint.AngularStiffness[axis] = 100;
+                joint.LinearDamping[axis] = joint.AngularDamping[axis] = 0.2f;
+            }
+            for (uint32_t row = 0; row < 6; ++row)
+                joint.Drives[row] = {.Enabled = (pair + row) % 3 != 0, .Speed = 0.05f, .Target = 0.04f, .MaxForce = 3, .Stiffness = row % 2 ? 20.f : 0.f, .Damping = 1};
+            REQUIRE(world->AddJoint(joint) == pair);
+        }
+    }
+    const auto add_remote = [&] {
+        while (packed.BodyCount() < 35)
+            REQUIRE(packed.AddBody({.Pose = At(float3{1000 + 3.f * packed.BodyCount(), 1000, 0}), .Shape = box, .Density = 0}) != NoIndex);
+    };
+    add_remote();
+    for (uint32_t step = 0; step < 120; ++step) {
+        CAPTURE(step);
+        if (step == 40)
+            for (World *world : {&reference, &packed}) {
+                REQUIRE(world->RemoveJoint(3));
+                REQUIRE(world->RemoveBody(5));
+            }
+        if (step == 60)
+            for (Index body = 32; body < 35; ++body) REQUIRE(packed.RemoveBody(body));
+        if (step == 90) {
+            for (World *world : {&reference, &packed})
+                REQUIRE(world->AddBody({.Pose = At(float3{100, 100, 1}), .Shape = box, .Density = 0}) == 5);
+            add_remote();
+        }
+        solver.Step(reference, {.Gravity = {0, 0, 0}, .SleepSteps = ~0u});
+        solver.Step(packed, {.Gravity = {0, 0, 0}, .SleepSteps = ~0u});
+        auto actual = Snapshot(packed);
+        actual.resize(reference.BodyCount());
+        CheckIdentical(Snapshot(reference), actual);
+        CHECK(ContactKeys(reference) == ContactKeys(packed));
+        for (Index body = 0; body < reference.BodyCount(); ++body) {
+            CHECK(std::memcmp(&reference.Velocities[body].Linear, &packed.Velocities[body].Linear, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&reference.Velocities[body].Angular, &packed.Velocities[body].Angular, 3 * sizeof(float)) == 0);
+        }
+        for (Index joint = 0; joint < reference.JointCount(); ++joint) {
+            const Joint &a = reference.Joints[joint], &b = packed.Joints[joint];
+            CHECK(std::memcmp(&a.LambdaLinear, &b.LambdaLinear, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&a.PenaltyLinear, &b.PenaltyLinear, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&a.LambdaAngular, &b.LambdaAngular, 3 * sizeof(float)) == 0);
+            CHECK(std::memcmp(&a.PenaltyAngular, &b.PenaltyAngular, 3 * sizeof(float)) == 0);
+            for (uint32_t row = 0; row < 6; ++row) {
+                CHECK(a.Drives[row].Lambda == b.Drives[row].Lambda);
+                CHECK(a.Drives[row].Penalty == b.Drives[row].Penalty);
+            }
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "published displacements follow poses through sleeping teleports and body reuse") {
+    World world{context, {.Bodies = 8}}, other{context, {.Bodies = 8}};
+    const auto shape = world.AddShape(UnitBox);
+    const auto moving = world.AddBody({.Velocity = {.Linear = {0.3f, -0.2f, 0.1f}, .Angular = {3, -2, 1}}, .Shape = shape});
+    const auto sleeping = world.AddBody({.Pose = At(float3{10, 0, 0}), .Shape = shape});
+    world.Quiet[sleeping] = StepSettings{}.SleepSteps;
+    world.AddBody({.Pose = At(float3{20, 0, 0}), .Velocity = {.Linear = {0.4f, 0.1f, 0}, .Angular = {0, 2, 0}}, .Shape = shape, .Density = 0});
+    const auto sensor = world.AddBody({.Pose = At(float3{30, 0, 0}), .Shape = shape, .Density = 0, .Sensor = true});
+    other.AddBody({.Pose = At(float3{-10, 0, 0}), .Velocity = {.Angular = {-2, 1, 3}}, .Shape = other.AddShape(UnitBox)});
+    const auto check_cache = [](const World &w) {
+        for (Index body = 0; body < w.BodyCount(); ++body) {
+            if (!w.Alive(body)) continue;
+            CAPTURE(body);
+            const auto &delta = w.Displacements[body];
+            const Pose before = w.InitialPoses[body], after = w.Poses[body];
+            for (uint32_t axis = 0; axis < 3; ++axis) CHECK(delta.Linear[axis] == after.Position[axis] - before.Position[axis]);
+            const float4 reconstructed = simd::normalize(QuatMul(QuatFromRotationVector(delta.Angular), before.Orientation));
+            CHECK(std::min(simd::length(reconstructed - after.Orientation), simd::length(reconstructed + after.Orientation)) < 2e-6f);
+        }
+    };
+    for (uint32_t step = 0; step < 12; ++step) {
+        CAPTURE(step);
+        if (step == 3) world.Poses[sleeping] = At(float3{11, 2, 3}, QuatFromRotationVector(float3{0.2f, 0.3f, 0.4f}));
+        if (step == 5) REQUIRE(world.RemoveBody(moving));
+        if (step == 6) REQUIRE(world.AddBody({.Pose = At(float3{40, 0, 0}), .Velocity = {.Angular = {1, -3, 2}}, .Shape = shape}) == moving);
+        if (step == 8) REQUIRE(world.RemoveBody(sensor));
+        solver.Step(world, {.Gravity = {0, 0, 0}});
+        check_cache(world);
+        solver.Step(other, {.Gravity = {0, 0, 0}});
+        check_cache(other);
+        check_cache(world);
+    }
+}
+
+TEST_CASE_FIXTURE(OnDevice, "zero restitution matches executed passes through live material changes") {
+    for (uint32_t source = 0; source < 4; ++source) {
+        CAPTURE(source);
+        World skipped{context, {.Bodies = 8}}, executed{context, {.Bodies = 8}};
+        for (World *world : {&skipped, &executed}) {
+            world->TrackContacts = true;
+            AddGround(*world);
+            Index shape = world->AddShape(UnitBox);
+            if (source >= 2) shape = world->AddCompound(std::vector<Index>{shape});
+            REQUIRE(world->AddBody({.Pose = At(float3{0, Half + 0.01f, 0}), .Velocity = {.Linear = {0, -2, 0}}, .Shape = shape}) == 1);
+            REQUIRE(world->AddBody({.Pose = At(float3{1000, 1000, 1000}), .Shape = world->AddShape(UnitBox), .Density = 0, .Restitution = world == &executed ? 1.f : 0.f}) == 2);
+        }
+        const auto material = [source](World &world) -> Material & {
+            if (source == 0) return world.Materials[1];
+            const Index root = world.BodyShapes[1];
+            Shape &shape = world.Shapes[source == 3 ? world.Child(root, 0) : root];
+            shape.HasMaterial = true;
+            shape.Surface.RestitutionCombine = CombineMaximum;
+            return shape.Surface;
+        };
+        for (uint32_t impact = 0; impact < 3; ++impact) {
+            CAPTURE(impact);
+            const float restitution = impact == 1 ? 0.8f : 0.f;
+            for (World *world : {&skipped, &executed}) {
+                material(*world).Restitution = restitution;
+                world->Poses[1] = At(float3{0, Half + 0.01f, 0});
+                world->Velocities[1] = {.Linear = {0, -2, 0}};
+                world->Wake(1);
+            }
+            float rebound = 0;
+            uint32_t contacts = 0;
+            for (uint32_t step = 0; step < 12; ++step) {
+                CAPTURE(step);
+                for (World *world : {&skipped, &executed}) solver.Step(*world, {.Gravity = {0, 0, 0}, .SleepSteps = ~0u});
+                CheckIdentical(Snapshot(skipped), Snapshot(executed));
+                CHECK(ContactKeys(skipped) == ContactKeys(executed));
+                for (Index body = 0; body < skipped.BodyCount(); ++body) {
+                    CHECK(std::memcmp(&skipped.Velocities[body].Linear, &executed.Velocities[body].Linear, 3 * sizeof(float)) == 0);
+                    CHECK(std::memcmp(&skipped.Velocities[body].Angular, &executed.Velocities[body].Angular, 3 * sizeof(float)) == 0);
+                }
+                for (uint32_t slot = 0; slot < skipped.BodyCount() * ContactsPerBody; ++slot) {
+                    const Contact &a = skipped.Contacts[slot], &b = executed.Contacts[slot];
+                    REQUIRE(a.Active == b.Active);
+                    if (!a.Active) continue;
+                    ++contacts;
+                    CHECK(a.Restitution == restitution);
+                    CHECK(a.Restitution == b.Restitution);
+                    CHECK(a.BounceImpulse == b.BounceImpulse);
+                    CHECK(a.BounceDelta == b.BounceDelta);
+                    CHECK(std::memcmp(&a.Lambda, &b.Lambda, 3 * sizeof(float)) == 0);
+                }
+                rebound = std::max(rebound, skipped.Velocities[1].Linear.y);
+            }
+            CHECK(contacts > 0);
+            if (restitution != 0) CHECK(rebound > 1.f);
+            else CHECK(rebound < 0.1f);
+        }
+    }
 }

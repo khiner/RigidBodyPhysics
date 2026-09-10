@@ -20,8 +20,9 @@
 // The scenes: `floor` is the fixed overhead of a near-empty step and `stack20` a box-box chain at two colours.
 // `raft` is a pile under contact-budget pressure and `coins` the hull path with ConvexManifold and reduction live.
 // `chain` is ten jointed links swinging and `slab` a wide body over mesh quads, which runs the batched gather.
-// The `lattice` series measures the slope of the N^2 narrowphase.
 
+#include "BenchQuality.h"
+#include "Replay.h"
 #include "Scenery.h"
 #include "Solver.h"
 
@@ -91,6 +92,15 @@ struct Result {
     std::string Name;
     uint32_t Bodies, Rows, Colors;
     double Min, Median, P90, Max;
+    benchmark::Quality Quality;
+    uint64_t Refusals;
+    uint32_t ColumnHeight;
+};
+
+struct BenchSettings {
+    bool Sleeping = false;
+    uint32_t Capacity = WorldLimits{}.Bodies;
+    uint32_t ColumnHeight = 0;
 };
 
 double Percentile(std::span<const double> sorted, double q) {
@@ -107,6 +117,7 @@ int main(int argc, char **argv) try {
         return false;
     };
     const uint32_t timed = Env("STEPS", 300), warmup = Env("WARMUP", 120);
+    if (timed == 0) throw std::runtime_error("STEPS must be positive");
 
     const std::string power = FirstLine("pmset -g batt");
     const bool on_ac = power.contains("AC Power");
@@ -129,30 +140,49 @@ int main(int argc, char **argv) try {
     const mtl::Context context;
     std::vector<Result> results;
 
-    const auto bench = [&](const std::string &name, auto build, bool sleeping = false) {
+    const auto bench = [&](const std::string &name, auto build, BenchSettings options = {}) {
         if (!wanted(name)) return;
         Solver solver{context};
-        World world{context};
-        if (!build(world)) return (void)std::println(stderr, "{}: scene would not build", name);
+        World world{context, {.Bodies = options.Capacity}};
+        if (!build(world)) throw std::runtime_error(name + ": scene would not build");
+        const auto &overflow = world.Overflow;
+        if (overflow.Bodies || overflow.Shapes || overflow.Joints || overflow.ShapeVertices || overflow.HullFaces || overflow.Triangles || overflow.BvhNodes || overflow.CompoundChildren)
+            throw std::runtime_error(name + ": scene capacity exceeded");
+        benchmark::Quality quality;
+        uint64_t refusals = 0;
+        std::vector<std::array<float, 2>> origins(world.BodyCount());
+        for (Index body = 0; body < world.BodyCount(); ++body) origins[body] = {world.Poses[body].Position.x, world.Poses[body].Position.z};
+        const auto observe = [&] {
+            for (Index body = 0; body < world.BodyCount(); ++body)
+                quality.Observe(replay::StateOf(world, body), origins[body], options.ColumnHeight && body > 0 ? int((body - 1) % options.ColumnHeight) : -1);
+            refusals += replay::Refusals(world);
+        };
         // A sleeping scene prices the idle step, so timing starts only once every body is asleep rather than averaging two regimes.
         StepSettings scene_settings = settings;
-        if (sleeping) scene_settings.SleepSteps = StepSettings{}.SleepSteps;
-        for (uint32_t step = 0; step < warmup; ++step) solver.Step(world, scene_settings);
-        if (sleeping) {
+        if (options.Sleeping) scene_settings.SleepSteps = StepSettings{}.SleepSteps;
+        for (uint32_t step = 0; step < warmup; ++step) {
+            solver.Step(world, scene_settings);
+            observe();
+        }
+        if (options.Sleeping) {
             const auto all_asleep = [&] {
                 for (uint32_t body = 0; body < world.BodyCount(); ++body)
                     if (world.Masses[body].InvMass > 0 && world.Quiet[body] < scene_settings.SleepSteps) return false;
                 return true;
             };
             uint32_t patience = 3600;
-            while (!all_asleep() && patience-- > 0) solver.Step(world, scene_settings);
-            if (!all_asleep()) return (void)std::println(stderr, "{}: never fell asleep, nothing to time", name);
+            while (!all_asleep() && patience-- > 0) {
+                solver.Step(world, scene_settings);
+                observe();
+            }
+            if (!all_asleep()) throw std::runtime_error(name + ": never fell asleep, nothing to time");
         }
         std::vector<double> ms(timed);
         for (auto &sample : ms) {
             const auto begin = std::chrono::steady_clock::now();
             solver.Step(world, scene_settings);
             sample = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            observe();
         }
         std::ranges::sort(ms);
         uint32_t colors = 0;
@@ -166,11 +196,11 @@ int main(int argc, char **argv) try {
             for (uint32_t c = 0; c < colors; ++c) std::print("c{}={} ", c, spread[c]);
             std::println("");
         }
-        results.push_back({name, world.BodyCount(), ActiveContacts(world), colors, ms.front(), Percentile(ms, 0.5), Percentile(ms, 0.9), ms.back()});
+        results.push_back({name, world.BodyCount(), ActiveContacts(world), colors, ms.front(), Percentile(ms, 0.5), Percentile(ms, 0.9), ms.back(), quality, refusals, options.ColumnHeight});
     };
 
-    bench("floor", [](World &world) { return BuildStack(world, 1), true; });
-    bench("stack20", [](World &world) { return BuildStack(world, 20), true; });
+    bench("floor", [](World &world) { return BuildStack(world, 1), true; }, {.ColumnHeight = 1});
+    bench("stack20", [](World &world) { return BuildStack(world, 20), true; }, {.ColumnHeight = 20});
     bench("raft", [](World &world) { return BuildRaft(world, 5, 3), true; });
     bench("coins", [](World &world) { return !BuildCoins(world, 16, 10, 0.5f).empty(); });
     bench("chain", [](World &world) { return Chain(world, 10), true; });
@@ -189,18 +219,30 @@ int main(int argc, char **argv) try {
                 Place(world, shape, float3{3.0f * float(x) - 6, 0.25f, 3.0f * float(z) - 6});
         return true;
     });
-    bench("lattice125", [](World &world) { return Lattice(world, 5, 5, 5), true; });
-    bench("lattice294", [](World &world) { return Lattice(world, 7, 7, 6), true; });
+    bench("lattice125", [](World &world) { return Lattice(world, 5, 5, 5), true; }, {.ColumnHeight = 5});
+    bench("lattice294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, {.ColumnHeight = 6});
     // The same 294 bodies fully asleep.
     // Sleeping skips the solve and still runs the narrowphase, so this is the per-frame cost of a world of resting bodies.
-    bench("resting294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, true);
-    bench("lattice600", [](World &world) { return Lattice(world, 10, 10, 6), true; });
-    bench("lattice1176", [](World &world) { return Lattice(world, 14, 14, 6), true; });
+    bench("resting294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, {.Sleeping = true, .ColumnHeight = 6});
+    bench("lattice600", [](World &world) { return Lattice(world, 10, 10, 6), true; }, {.ColumnHeight = 6});
+    bench("lattice1176", [](World &world) { return Lattice(world, 14, 14, 6), true; }, {.ColumnHeight = 6});
+
+    bench("lattice6000", [](World &world) { return Lattice(world, 25, 40, 6), true; }, {.Capacity = 6001, .ColumnHeight = 6});
+    if (args.size() > 1) {
+        bench("lattice96000", [](World &world) { return Lattice(world, 100, 160, 6), true; }, {.Capacity = 96001, .ColumnHeight = 6});
+        bench("lattice192000", [](World &world) { return Lattice(world, 200, 160, 6), true; }, {.Capacity = 192001, .ColumnHeight = 6});
+    }
+    if (results.empty()) throw std::runtime_error("No matching scenes");
 
     std::println("{:<12} {:>6} {:>5} {:>6} {:>9} {:>9} {:>9} {:>9}", "scene", "bodies", "rows", "colors", "min", "p50", "p90", "max");
-    for (const auto &r : results)
+    bool passed = true;
+    for (const auto &r : results) {
         std::println("{:<12} {:>6} {:>5} {:>6} {:>9.3f} {:>9.3f} {:>9.3f} {:>9.3f}", r.Name, r.Bodies, r.Rows, r.Colors, r.Min, r.Median, r.P90, r.Max);
-    return 0;
+        std::println("  finite={} refusals={} quaternion_norm_error={:.8f}", r.Quality.Finite, r.Refusals, r.Quality.QuaternionError);
+        if (r.ColumnHeight) std::println("  floor_penetration={:.8f} vertical_overlap={:.8f} horizontal_drift={:.8f} m", r.Quality.FloorPenetration, r.Quality.VerticalOverlap, r.Quality.HorizontalDrift);
+        passed &= r.Quality.Finite && r.Refusals == 0;
+    }
+    return passed ? 0 : 2;
 } catch (const std::exception &error) {
     // See mtl::Buffer: a bad index is reported here and the process exits normally.
     std::println(stderr, "RbpBench: {}", error.what());

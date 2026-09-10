@@ -61,6 +61,15 @@ struct Velocity {
     float3 Angular;
 };
 
+struct Displacement {
+    float3 Linear, Angular;
+};
+
+struct BodyIterate {
+    Pose Current;
+    Displacement Moved;
+};
+
 // Inverse quantities, because the solve divides by them, and zero is exactly infinite: a locked axis, expressed with no branch and no flag.
 // The three motion properties share the mass buffer to keep the argument table compact.
 // They belong to the body rather than to its shape. See World::SetBodyShape.
@@ -92,6 +101,7 @@ enum ShapeKind : uint {
     ShapeHull,
     ShapeMesh,
     ShapeCompound,
+    ShapeCylinder,
 };
 
 // A collider belongs to Layer and accepts members of Collides. Both sides must accept.
@@ -141,6 +151,61 @@ struct HullFace {
     uint Count;
     uchar Corner[MaxFacePoints]; // into the shape's own run, which a byte holds at MaxHullVertices
 };
+
+struct BodyBounds {
+    float3 Low, High;
+};
+
+struct BroadPhaseNode {
+    BodyBounds Bounds;
+    uint Left, Right, Parent, MinBody, MaxBody, Ready, Errors, Candidates;
+};
+struct MortonKey {
+    uint Code, Body;
+};
+GPU_CONSTANT uint RadixBlockSize = 256;
+GPU_CONSTANT uint RadixBins = 256;
+GPU_CONSTANT uint RadixSimdWidth = 32;
+GPU_CONSTANT uint CollisionLanes = 64;
+GPU_CONSTANT uint SolveLanes = 32;
+GPU_CONSTANT uint SolveDof = 6;
+GPU_CONSTANT uint SolveBodiesPerGroup = SolveLanes / SolveDof;
+GPU_CONSTANT uint RadixWaves = RadixBlockSize / RadixSimdWidth;
+inline uint RadixBlocks(uint bodies) { return (bodies + RadixBlockSize - 1) / RadixBlockSize; }
+inline uint BroadPhaseRoot(uint bodies) { return bodies == 1 ? 0 : bodies; }
+
+#ifdef __METAL_VERSION__
+inline bool BoundsOverlap(BodyBounds a, BodyBounds b) {
+    return all(a.Low <= a.High) && all(b.Low <= b.High) && !any(a.Low > b.High) && !any(b.Low > a.High);
+}
+
+// Return the first candidate index at least first, or NoIndex.
+template<uint Mode = 0>
+inline uint NextBodyCandidate(device BroadPhaseNode *nodes, uint bodies, uint body, uint first) {
+    if (first >= bodies) return NoIndex;
+    if (Mode == 1 || (Mode == 0 && bodies <= RadixSimdWidth)) {
+        const uint candidates = nodes[body].Candidates & (~0u << first);
+        return candidates ? ctz(candidates) : NoIndex;
+    }
+    const uint root = BroadPhaseRoot(bodies);
+    const BodyBounds query = nodes[body].Bounds;
+    uint best = bodies, at = root, from = NoIndex;
+    for (uint visited = 0; at != NoIndex && visited < 4 * bodies; ++visited) {
+        const BroadPhaseNode node = nodes[at];
+        const bool possible = node.MinBody < best && node.MaxBody >= first && BoundsOverlap(query, node.Bounds);
+        uint next = node.Parent;
+        if (from == node.Parent && possible) {
+            if (node.Left == NoIndex) {
+                if (node.MinBody != body && node.MinBody >= first) best = node.MinBody;
+            } else next = node.Left;
+        } else if (from == node.Left && possible) next = node.Right;
+        from = at;
+        at = next;
+    }
+    if (at != NoIndex) atomic_fetch_or_explicit((device atomic_uint *)&nodes[root].Errors, 2u, memory_order_relaxed);
+    return best < bodies ? best : NoIndex;
+}
+#endif
 
 // A flat tagged union: each kind reads the fields that apply to it and leaves the rest zero.
 // Box uses HalfExtents.
@@ -207,7 +272,7 @@ inline Index ChildOf(Shape shape, uint i, const Index *children) {
 // Stored in FirstTriangle, and read through this function rather than by field name.
 GPU_CONSTANT uint MaxInternalFaces = 32;
 inline uint InternalFaces(Shape shape) {
-    return shape.Kind == ShapeBox || shape.Kind == ShapeHull ? shape.FirstTriangle : 0u;
+    return shape.Kind == ShapeBox || shape.Kind == ShapeHull || shape.Kind == ShapeCylinder ? shape.FirstTriangle : 0u;
 }
 
 // A box's six faces, indexed by axis and then by end, on host and device alike.

@@ -41,6 +41,7 @@ option(RBP_TOOLS "Build the engine's scene and bench tools and its tests" ${RBP_
 set(GpuSources
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Shared.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Layout.metal
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/BroadPhase.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Solve.metal
 )
 set(GeneratedGpuSource ${CMAKE_CURRENT_BINARY_DIR}/gen/GpuSource.h)
@@ -77,15 +78,12 @@ target_include_directories(rbp SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib/met
 target_link_libraries(rbp PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 
 if(RBP_TOOLS)
-    # The tools include tests/ for Shapes.h, shared between a scene and its test.
-    add_executable(RbpScenes tools/Scenes.cpp)
-    target_link_libraries(RbpScenes PRIVATE rbp)
-    target_compile_options(RbpScenes PRIVATE -O1)
+    foreach(Tool IN ITEMS Scenes Bench Replay)
+        add_executable(Rbp${Tool} tools/${Tool}.cpp)
+        target_link_libraries(Rbp${Tool} PRIVATE rbp)
+        target_compile_options(Rbp${Tool} PRIVATE -O1)
+    endforeach()
     target_include_directories(RbpScenes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-
-    add_executable(RbpBench tools/Bench.cpp)
-    target_link_libraries(RbpBench PRIVATE rbp)
-    target_compile_options(RbpBench PRIVATE -O1)
     target_include_directories(RbpBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
     enable_testing()

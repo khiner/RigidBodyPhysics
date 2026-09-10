@@ -64,10 +64,23 @@ private:
 
     // The kernels of a step, in the order of the pipeline table in Solver.cpp.
     enum Pass : uint32_t {
+        ReduceBoundsPass,
+        ReduceScenePass,
+        MortonPass,
+        RadixHistogramPass,
+        RadixOffsetsPass,
+        RadixScatterPass,
+        BuildTreePass,
+        RefitTreePass,
+        RefreshTreePass,
+        SmallBroadPhasePass,
+        BoundsPass,
+        SensorBoundsPass,
         IntegratePass,
         CollectPass,
-        CountIncomingPass,
         ScanIncomingPass,
+        ScanIncomingBlocksPass,
+        OffsetIncomingPass,
         FillIncomingPass,
         SortIncomingPass,
         PrepareJointsPass,
@@ -96,10 +109,10 @@ private:
     };
 
     void Encode(const Recording &, World &);
-    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads);
+    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads, uint32_t lanes = 1);
 
     const mtl::Context &Context;
-    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[PassCount];
+    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[PassCount][4];
     NS::SharedPtr<MTL4::ArgumentTable> Table;
     NS::SharedPtr<MTL4::CommandAllocator> Allocator;
     NS::SharedPtr<MTL4::CommandBuffer> Commands;

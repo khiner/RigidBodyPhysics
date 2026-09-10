@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <numbers>
+#include <utility>
 #include <vector>
 
 #include <doctest/doctest.h>
@@ -28,6 +29,43 @@ Index AddQuadMesh(World &world, Pose local = IdentityPose) {
     return world.AddMesh(points, indices, local);
 }
 } // namespace
+
+TEST_CASE_FIXTURE(Device, "buffer mappings follow allocation ownership through copy move and replacement") {
+    mtl::Buffer<uint32_t> source{context.Device.get(), 8};
+    source[7] = 123;
+    auto *original = source.Handle->contents();
+    CHECK(source.Data() == original);
+    auto copy = source;
+    source = mtl::Buffer<uint32_t>{context.Device.get(), 16};
+    CHECK(source.Data() == source.Handle->contents());
+    CHECK(source.Data() != original);
+    CHECK(copy.Data() == original);
+    CHECK(copy[7] == 123);
+
+    auto moved = std::move(copy);
+    CHECK_FALSE(copy.Handle);
+    CHECK(copy.Data() == nullptr);
+    CHECK(moved.Data() == original);
+    CHECK(moved[7] == 123);
+    mtl::Buffer<uint32_t> assigned;
+    CHECK(assigned.Data() == nullptr);
+    CHECK(assigned.All().empty());
+    assigned = moved;
+    moved = {};
+    CHECK(moved.Data() == nullptr);
+    CHECK(assigned.Data() == assigned.Handle->contents());
+    assigned[7] = 456;
+    CHECK(static_cast<uint32_t *>(original)[7] == 456);
+
+    std::swap(source, assigned);
+    CHECK(source.Data() == original);
+    CHECK(source.Capacity == 8);
+    CHECK(source[7] == 456);
+    CHECK(assigned.Data() == assigned.Handle->contents());
+    CHECK(assigned.Capacity == 16);
+    CHECK_THROWS_AS(source[8], std::out_of_range);
+    CHECK_THROWS_AS(source[NoIndex], std::out_of_range);
+}
 
 TEST_CASE("a solid box gets the mass and inertia its density implies") {
     // A 1 m cube of water masses 1000 kg, and its inertia is m * (e^2 + e^2) / 12 on every axis.

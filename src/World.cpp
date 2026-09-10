@@ -96,6 +96,7 @@ struct ShapeFace {
     float3 Normal;
     float Offset; // dot(Normal, a point on it), so two coplanar faces facing each other sum to zero
     std::vector<float3> Corner;
+    float Radius = 0;
 };
 
 // `local` is where this shape's geometry sits in the frame the faces are wanted in.
@@ -119,6 +120,12 @@ std::vector<ShapeFace> ShapeFaces(const Shape &shape, Pose local, std::span<cons
                 out.push_back(std::move(face));
             }
         }
+    } else if (shape.Kind == ShapeCylinder) {
+        for (uint32_t end = 0; end < 2; ++end) {
+            const float3 normal = Rotate(local.Orientation, float3{0, end ? 1.f : -1.f, 0});
+            const float3 center = local.Position + shape.HalfExtents.y * normal;
+            out.push_back({.Index = end, .Normal = normal, .Offset = dot(normal, center), .Corner = {center}, .Radius = shape.HalfExtents.x});
+        }
     } else if (shape.Kind == ShapeHull) {
         for (uint32_t f = 0; f < shape.FaceCount && f < MaxInternalFaces; ++f) {
             const HullFace &held = faces[shape.FirstFace + f];
@@ -129,13 +136,18 @@ std::vector<ShapeFace> ShapeFaces(const Shape &shape, Pose local, std::span<cons
             out.push_back(std::move(face));
         }
     }
-    // A sphere and a capsule have no faces, so nothing of theirs is ever buried.
+
     return out;
 }
 
 // Whether every corner of `inner` lies within `outer`, both convex and in the same plane.
 // The inside of an edge is taken from the centroid rather than from a winding, because a box's faces and a hull cook's are wound by different rules.
 bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
+    if (outer.Radius > 0) {
+        for (const float3 corner : inner.Corner)
+            if (simd::length(corner - outer.Corner[0]) + inner.Radius > outer.Radius + tolerance) return false;
+        return true;
+    }
     float3 centre{0, 0, 0};
     for (const float3 corner : outer.Corner) centre += corner;
     centre /= float(outer.Corner.size());
@@ -143,10 +155,10 @@ bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
         const float3 from = outer.Corner[e], to = outer.Corner[(e + 1) % outer.Corner.size()];
         const float3 inward = cross(outer.Normal, to - from);
         const float span = simd::length(inward);
-        if (span < 1e-12f) continue; // an edge too short to give an inward direction
+        if (span < 1e-12f) continue;
         const float sign = dot(inward, centre - from) >= 0 ? 1.f : -1.f;
         for (const float3 corner : inner.Corner)
-            if (sign * dot(inward, corner - from) / span < -tolerance) return false;
+            if (sign * dot(inward, corner - from) / span < inner.Radius - tolerance) return false;
     }
     return true;
 }
@@ -158,7 +170,7 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
     float scale = 1e-6f;
     for (const auto &piece : pieces)
         for (const ShapeFace &face : piece)
-            for (const float3 corner : face.Corner) scale = std::max(scale, simd::length(corner));
+            for (const float3 corner : face.Corner) scale = std::max(scale, simd::length(corner) + face.Radius);
     // Relative to where the pieces are, because the rounding in a dot product scales with its inputs, as the hull cook's coplanarity epsilon does.
     const float tolerance = 1e-5f * scale;
     std::vector<uint32_t> masks(pieces.size(), 0);
@@ -178,11 +190,10 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
 
 BodyMass MassProperties(const Shape &shape, float density, std::span<const float3> shape_vertices, std::span<const Shape> shapes, std::span<const Index> children) {
     constexpr float Pi = std::numbers::pi_v<float>;
-    // A plane is unbounded, a mesh is a surface with no interior, and a zero density is static by request. See StaticMass.
+
     if (shape.Kind == ShapePlane || shape.Kind == ShapeMesh || density <= 0) return StaticMass;
 
     if (shape.Kind == ShapeCompound) {
-        // AddCompound left the children in the frame this diagonalizes to, so the moments come out in the order of the body frame's own axes.
         const Aggregate whole = WeighChildren(shape, shape_vertices, shapes, children);
         if (whole.Volume <= 0) return StaticMass;
         if (shape.VertexCount == 1) {
@@ -195,16 +206,20 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
     }
 
     if (shape.Kind == ShapeHull) {
-        // The vertices are already in the cook's frame, so this is the tetrahedra integral and no more.
         const CookedHull cooked = CookHull(shape_vertices.subspan(shape.FirstVertex, shape.VertexCount));
         if (cooked.Vertices.empty()) return StaticMass;
         return {.InvInertiaLocal = 1 / (cooked.Inertia * density), .InvMass = 1 / (cooked.Volume * density)};
     }
 
+    if (shape.Kind == ShapeCylinder) {
+        const float radius = shape.HalfExtents.x, half = shape.HalfExtents.y;
+        const float mass = density * Pi * radius * radius * 2 * half;
+        const float along = mass * radius * radius / 2;
+        const float across = mass * (radius * radius / 4 + half * half / 3);
+        return {.InvInertiaLocal = 1 / float3{across, along, across}, .InvMass = 1 / mass};
+    }
+
     if (shape.Kind == ShapeCapsule) {
-        // A cylinder with a hemisphere on each end, the two caps making one sphere.
-        // About the long axis each part contributes the inertia it would have alone.
-        // Across it the caps shift out to the ends, and their second moment plus the parallel axis carry comes to h^2 + 3hr/4.
         const float radius = shape.Radius, half = shape.HalfExtents.y;
         const float cylinder = density * Pi * radius * radius * 2 * half;
         const float caps = density * 4.f / 3 * Pi * radius * radius * radius;
@@ -215,7 +230,6 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
     }
 
     if (shape.Kind == ShapeSphere) {
-        // Solid sphere about its center: m = rho 4/3 pi r^3, and I = 2/5 m r^2 about every axis.
         const float radius = shape.Radius;
         const float mass = density * 4.f / 3 * Pi * radius * radius * radius;
         const float inertia = 2.f / 5 * mass * radius * radius;
@@ -224,7 +238,7 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
 
     const float3 extents = 2 * shape.HalfExtents;
     const float mass = density * extents.x * extents.y * extents.z;
-    // Solid box about its center: I_x = m (e_y^2 + e_z^2) / 12, and cyclically.
+
     const float3 squared = extents * extents;
     const float3 inertia = mass / 12 * float3{squared.y + squared.z, squared.x + squared.z, squared.x + squared.y};
     return {.InvInertiaLocal = 1 / inertia, .InvMass = 1 / mass};
@@ -276,10 +290,16 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     MakeBuffer(CompoundChildren, limits.CompoundChildren);
     MakeBuffer(Filters, limits.Bodies);
     MakeBuffer(Jointed, limits.Bodies + 1 + 2 * limits.Joints);
+    MakeBuffer(Bounds, limits.Bodies);
+    MakeBuffer(BoundsReductions, RadixBlocks(limits.Bodies) + 1);
+    MakeBuffer(BroadPhaseNodes, 2 * limits.Bodies);
+    MakeBuffer(BroadPhaseKeys, 2 * limits.Bodies);
+    MakeBuffer(BroadPhaseScratch, limits.Bodies + RadixBlocks(limits.Bodies) * RadixBins);
     MakeBuffer(InitialPoses, limits.Bodies);
+    MakeBuffer(Displacements, limits.Bodies);
     MakeBuffer(InertialPoses, limits.Bodies);
     MakeBuffer(PreviousVelocities, limits.Bodies);
-    MakeBuffer(SolvedPoses, limits.Bodies);
+    MakeBuffer(Iterates, limits.Bodies);
     MakeBuffer(RestPoses, limits.Bodies);
     MakeBuffer(Quiet, limits.Bodies);
     MakeBuffer(NextQuiet, limits.Bodies);
@@ -712,13 +732,13 @@ Index World::AddCompound(std::span<const Index> children, Pose *frame) {
     for (uint32_t i = 0; i < count; ++i) {
         Shape &child = Shapes[CompoundChildren[first + i]];
         child.Local = single ? IdentityPose : ComposePose(inverse, child.Local);
-        if (child.Kind == ShapeBox || child.Kind == ShapeHull) SetInternalFaces(child, 0);
+        if (child.Kind == ShapeBox || child.Kind == ShapeHull || child.Kind == ShapeCylinder) SetInternalFaces(child, 0);
         faces.push_back(ShapeFaces(child, child.Local, ShapeVertices.All(), HullFaces.All()));
     }
     const auto masks = BuriedFaces(faces);
     for (uint32_t i = 0; i < count; ++i) {
         Shape &child = Shapes[CompoundChildren[first + i]];
-        if (child.Kind == ShapeBox || child.Kind == ShapeHull) SetInternalFaces(child, masks[i]);
+        if (child.Kind == ShapeBox || child.Kind == ShapeHull || child.Kind == ShapeCylinder) SetInternalFaces(child, masks[i]);
     }
     const Index result = AddShape(compound);
     if (result == NoIndex) {
@@ -730,39 +750,35 @@ Index World::AddCompound(std::span<const Index> children, Pose *frame) {
 }
 
 uint32_t World::WeldStatic() {
-    // The bodies the weld covers. See the header for each exclusion.
     std::vector<Index> resting;
     std::vector<std::vector<ShapeFace>> faces;
     std::vector<CollisionMask> filters;
     for (Index body = 0; body < NumBodies; ++body) {
         if (!LiveBodies[body] || Moves(Masses[body]) || Filters[body].Sensor) continue;
         const Velocity motion = Velocities[body];
-        // Kinematic is a velocity and nothing more anywhere in this engine.
-        // A driven slab may leave, and the face it was covering has to be a face again the moment it does.
         if (simd::length(motion.Linear) > 0 || simd::length(motion.Angular) > 0) continue;
         const Index shape = BodyShapes[body];
         if (shape == NoIndex) continue;
         const Shape &held = Shapes[shape];
-        if (held.Kind != ShapeBox && held.Kind != ShapeHull) continue;
+        if (held.Kind != ShapeBox && held.Kind != ShapeHull && held.Kind != ShapeCylinder) continue;
         resting.push_back(body);
         filters.push_back(ResolveFilter(held, {Filters[body].Layer, Filters[body].Collides}));
-        // In world space, the one frame two separate bodies share.
+
         faces.push_back(ShapeFaces(held, ComposePose(Poses[body], held.Local), ShapeVertices.All(), HullFaces.All()));
     }
     std::vector<uint32_t> wanted(NumBodies, 0);
     const std::vector<uint32_t> masks = BuriedFaces(faces, filters);
     for (uint32_t i = 0; i < resting.size(); ++i) wanted[resting[i]] = masks[i];
 
-    // Every live body rather than only the ones above.
-    // A body given a mass or a velocity since the last call has left that list and is exactly the one needing its faces back.
+    // Revisit all live bodies so previous welds can be undone after edits.
     uint32_t buried = 0;
     for (Index body = 0; body < NumBodies; ++body) {
         if (!LiveBodies[body]) continue;
         const uint32_t mask = wanted[body];
         Index copy = WeldedShapes[body];
         if (copy == NoIndex) {
-            if (mask == 0) continue; // nothing buried, and no earlier call's mark to clear
-            // A shape is shared, so the mark goes on a copy this body owns. Refused, it stays unwelded.
+            if (mask == 0) continue;
+
             copy = CopyShape(Shapes[BodyShapes[body]]);
             if (copy == NoIndex) continue;
             WeldedShapes[body] = copy;
@@ -770,7 +786,7 @@ uint32_t World::WeldStatic() {
         }
         if (InternalFaces(Shapes[copy]) != mask) {
             SetInternalFaces(Shapes[copy], mask);
-            // A body standing on a face just buried, or on one just restored, holds contacts about to be dropped or made.
+
             Wake(body);
         }
         buried += uint32_t(std::popcount(mask));
