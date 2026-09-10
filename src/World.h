@@ -151,7 +151,7 @@ struct ContactChange {
         return A.Slot < B.Slot ? ContactManifold{A, B, OwnChild(Children), OtherChild(Children), SubShapeA, SubShape} : ContactManifold{B, A, OtherChild(Children), OwnChild(Children), SubShape, SubShapeA};
     }
     // Return the constraint force on A in newtons, including support.
-// B receives the opposite force.
+    // B receives the opposite force.
     float3 ForceOnA() const {
         const auto basis = MakeContactBasis(Normal);
         return -(Lambda.x * basis.Axis[0] + Lambda.y * basis.Axis[1] + Lambda.z * basis.Axis[2]);
@@ -211,6 +211,8 @@ struct World {
     // Raw indices do not carry generations; callers must track their lifetime.
     bool RemoveBody(Index);
     bool RemoveJoint(Index);
+    // Replace an active joint's configuration and reset its solver history.
+    bool SetJoint(Index, const JointDesc &);
 
     bool RemoveShape(Index);
     // Replace geometry while preserving identity, pose and motion properties.
@@ -226,6 +228,11 @@ struct World {
 
     // Wake the body and its connected contacts after host edits, including teleports.
     void Wake(Index body);
+
+    // Restart at the current poses and velocities after a completed advance.
+    // Preserve bodies, geometry, joint configuration and identities; discard solver history and queued reports.
+    // Completed step numbering restarts at zero.
+    void ResetDynamics();
 
     void OnStepped(float delta_time, const StepSnapshot & = {});
 
@@ -336,6 +343,7 @@ private:
 
     void RebuildJointed();
     bool RetireJoint(Index joint);
+    void ReclaimBodies();
 
     uint32_t NumBodies{}, NumShapes{}, NumJoints{};
     RunPool VertexPool, FacePool, TrianglePool, NodePool, ChildPool;

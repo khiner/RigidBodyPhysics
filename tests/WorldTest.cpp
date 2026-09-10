@@ -51,6 +51,13 @@ TEST_CASE_FIXTURE(OneWorld, "world: retirement preserves joint topology and reus
     CHECK(world.AddJoint({.BodyA = a, .BodyB = b}) == gap);
     CHECK(world.AddJoint({.BodyA = a, .BodyB = b, .Collide = true}) == first);
     CHECK(world.AddJoint({.BodyA = a, .BodyB = b}) == last_survivor + 1);
+    REQUIRE(world.SetJoint(survivor, {.BodyA = b, .BodyB = a, .Collide = true, .Drives = {{.Enabled = 1, .Target = 2, .Lambda = 9, .Penalty = 7, .Began = 5}}}));
+    CHECK(world.JointCount() == last_survivor + 2);
+    const auto &drive = world.Joints[survivor].Drives[0];
+    CHECK(drive.Target == 2);
+    CHECK(drive.Lambda == 0);
+    CHECK(drive.Penalty == 1);
+    CHECK(drive.Began == 0);
 
     for (Index body = 0; body < world.BodyCount(); ++body) {
         std::vector<Index> incident, suppressed;
@@ -67,6 +74,10 @@ TEST_CASE_FIXTURE(OneWorld, "world: retirement preserves joint topology and reus
         CHECK(std::ranges::equal(run(world.JointIncidence), incident));
         CHECK(std::ranges::equal(run(world.Jointed), suppressed));
     }
+    const auto retired = world.IdOf(hub);
+    world.ResetDynamics();
+    REQUIRE(world.AddBody({}) == hub);
+    CHECK(world.IdOf(hub) != retired);
 }
 
 TEST_CASE_FIXTURE(OneWorld, "world: geometry edits preserve body properties and release owned storage") {

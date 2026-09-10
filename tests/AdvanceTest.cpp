@@ -410,3 +410,36 @@ TEST_CASE("advance: joint topology and waking survive batched execution") {
     check(19);
     CHECK(pair.serial.BodyCount() == 32);
 }
+
+TEST_CASE("advance: resetting dynamics matches a fresh world without replacing storage") {
+    Comparison pair;
+    bool mesh = false;
+    SUBCASE("joints and sensor history") {}
+    SUBCASE("cached mesh queries") { mesh = true; }
+    for (auto *world : {&pair.serial, &pair.batched}) {
+        Scene(*world);
+        if (mesh) {
+            const float3 vertices[]{{-3, 0, -3}, {-3, 0, 3}, {3, 0, 3}, {3, 0, -3}};
+            const uint32_t indices[]{0, 1, 2, 0, 2, 3};
+            REQUIRE(world->SetBodyShape(0, world->AddMesh(vertices, indices), 0));
+        }
+    }
+    const std::vector poses(std::from_range, pair.batched.Poses.All().first(pair.batched.BodyCount()));
+    const std::vector velocities(std::from_range, pair.batched.Velocities.All().first(pair.batched.BodyCount()));
+    const auto pose_storage = pair.batched.Poses.Address(), geometry_storage = pair.batched.ShapeVertices.Address();
+    const auto id = pair.batched.IdOf(1);
+    pair.solver.Advance(pair.batched, {}, 80);
+    CHECK_FALSE(pair.batched.TakeContactChanges().empty());
+    std::ranges::copy(poses, pair.batched.Poses.Data());
+    std::ranges::copy(velocities, pair.batched.Velocities.Data());
+    pair.batched.ResetDynamics();
+    CHECK(pair.batched.IdOf(1) == id);
+    CHECK(pair.batched.Poses.Address() == pose_storage);
+    CHECK(pair.batched.ShapeVertices.Address() == geometry_storage);
+    CHECK(pair.batched.TakeContactChanges().empty());
+    CHECK(pair.batched.TakeSensorChanges().empty());
+    CHECK(pair.batched.Overlaps().empty());
+    const JointDesc edited{.BodyA = 4, .BodyB = 3, .At = {2, 2, 0}, .MotorSpeed = {0, 0, 1}};
+    for (auto *world : {&pair.serial, &pair.batched}) REQUIRE(world->SetJoint(0, edited));
+    pair.Check(35);
+}

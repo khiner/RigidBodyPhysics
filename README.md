@@ -21,6 +21,7 @@ Add shapes and bodies to the world before advancing it.
 `Solver::Advance` batches equal substeps and optionally delivers each completed step's states and reports through an observer.
 Both calls block until their GPU work and reporting complete.
 Finish an advance before editing the world.
+Use `World::ResetDynamics` after restoring poses and velocities to restart a simulation while retaining bodies, geometry, and GPU buffers.
 Copy observer data that must remain valid after the callback returns.
 
 For embedding, add this directory with CMake's `add_subdirectory` and link the `rbp` target.

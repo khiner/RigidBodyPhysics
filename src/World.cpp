@@ -29,6 +29,16 @@ void TrimTail(uint32_t &used, std::vector<Index> &free, const auto &live) {
     while (used > 0 && !live(used - 1) && std::erase(free, used - 1) != 0) --used;
 }
 
+void ResetJoint(Joint &joint) {
+    joint.C0Linear = joint.C0Angular = joint.LambdaLinear = joint.LambdaAngular = {};
+    joint.PenaltyLinear = joint.PenaltyAngular = {1, 1, 1};
+    joint.Twist = 0;
+    for (auto &drive : joint.Drives) {
+        drive.Lambda = drive.Began = 0;
+        drive.Penalty = 1;
+    }
+}
+
 using double3 = simd::double3;
 
 void RotationMatrix(float4 q, double (&m)[3][3]) {
@@ -370,6 +380,35 @@ void World::Wake(Index body) {
         const Contact &contact = Contacts[IncomingSlots[incoming.Start + i]];
         if (contact.Active) Quiet[contact.BodyA] = 0;
     }
+}
+
+void World::ResetDynamics() {
+    for (Index body = 0; body < NumBodies; ++body) {
+        PreviousVelocities[body] = Velocities[body];
+        InitialPoses[body] = InertialPoses[body] = RestPoses[body] = Poses[body];
+        Displacements[body] = {};
+        Iterates[body] = {};
+        Quiet[body] = NextQuiet[body] = Colors[body] = NextColors[body] = 0;
+        Incoming[body] = {};
+        ContactEventCounts[body] = ContactRefusals[body] = 0;
+    }
+    const auto contacts = NumBodies * ContactsPerBody;
+    for (auto *buffer : {&Contacts, &SensorContacts})
+        if (buffer->Handle) std::ranges::fill(buffer->All().first(contacts), Contact{});
+    std::ranges::fill(IncomingSlots.All().first(contacts), NoIndex);
+    if (SensorRefusals.Handle) std::ranges::fill(SensorRefusals.All().first(NumBodies), 0);
+    for (auto &joint : Joints.All().first(NumJoints)) ResetJoint(joint);
+    Changes.clear();
+    SensorOverlaps.clear();
+    SensorChanges.clear();
+    CompletedSteps = 0;
+    ReclaimBodies();
+}
+
+void World::ReclaimBodies() {
+    FreeBodies.append_range(RetiredBodies);
+    RetiredBodies.clear();
+    TrimTail(NumBodies, FreeBodies, [this](Index at) { return LiveBodies[at] != 0; });
 }
 
 // Host removals can invalidate incoming adjacency, so scan contact storage directly.
@@ -832,33 +871,24 @@ namespace {
 uint32_t Modes(const JointAxisMode (&axes)[3]) {
     return uint32_t(axes[0]) | (uint32_t(axes[1]) << 3) | (uint32_t(axes[2]) << 6);
 }
-} // namespace
 
-Index World::AddJoint(const JointDesc &desc) {
-    if (!Alive(desc.BodyA) || !Alive(desc.BodyB)) return NoIndex;
+std::optional<Joint> MakeJoint(const JointDesc &desc, Pose a, Pose b) {
     for (uint32_t row = 0; row < 6; ++row) {
         const uint32_t axis = row % 3;
         const auto *modes = row < 3 ? desc.Linear : desc.Angular;
         const uint32_t mask = row < 3 ? desc.LinearLimitAxes[axis] : desc.AngularLimitAxes[axis];
         if (!mask) continue;
-        if (mask > 7 || std::countr_zero(mask) != axis || modes[axis] != AxisLimited) return NoIndex;
+        if (mask > 7 || uint32_t(std::countr_zero(mask)) != axis || modes[axis] != AxisLimited) return {};
         for (uint32_t other = axis + 1; other < 3; ++other)
-            if ((mask & (1u << other)) && modes[other] != AxisFree) return NoIndex;
+            if ((mask & (1u << other)) && modes[other] != AxisFree) return {};
     }
-    const Index index = TakeSlot(FreeJoints, NumJoints, Joints.Capacity, Overflow.Joints);
-    if (index == NoIndex) return NoIndex;
-    const Pose a = Poses[desc.BodyA], b = Poses[desc.BodyB];
     const float3 at_a = desc.AtA.value_or(desc.At), at_b = desc.AtB.value_or(desc.At);
     const float4 frame = desc.Frame.value_or(b.Orientation);
-    Joints[index] = {
+    Joint joint{
         .AnchorA = LocalPoint(a, at_a),
         .AnchorB = LocalPoint(b, at_b),
         .FrameA = QuatMul(QuatConjugate(a.Orientation), desc.FrameA.value_or(frame)),
         .FrameB = QuatMul(QuatConjugate(b.Orientation), desc.FrameB.value_or(frame)),
-        .LambdaLinear = {0, 0, 0},
-        .LambdaAngular = {0, 0, 0},
-        .PenaltyLinear = {1, 1, 1},
-        .PenaltyAngular = {1, 1, 1},
         .MotorSpeed = desc.MotorSpeed,
         .MotorTarget = desc.MotorTarget,
         .MotorMaxTorque = desc.MotorMaxTorque,
@@ -880,17 +910,35 @@ Index World::AddJoint(const JointDesc &desc) {
         .Active = 1,
         .Suppresses = desc.Collide ? 0u : 1u,
     };
-    for (uint32_t i = 0; i < 6; ++i) {
-        Joints[index].Drives[i] = desc.Drives[i];
-        Joints[index].Drives[i].Lambda = 0;
-        Joints[index].Drives[i].Penalty = 1;
-    }
-    for (uint32_t i = 0; i < 3; ++i) {
-        Joints[index].LinearLimitAxes[i] = desc.LinearLimitAxes[i];
-        Joints[index].AngularLimitAxes[i] = desc.AngularLimitAxes[i];
-    }
+    std::ranges::copy(desc.Drives, joint.Drives);
+    std::ranges::copy(desc.LinearLimitAxes, joint.LinearLimitAxes);
+    std::ranges::copy(desc.AngularLimitAxes, joint.AngularLimitAxes);
+    ResetJoint(joint);
+    return joint;
+}
+} // namespace
+
+Index World::AddJoint(const JointDesc &desc) {
+    if (!Alive(desc.BodyA) || !Alive(desc.BodyB)) return NoIndex;
+    const auto joint = MakeJoint(desc, Poses[desc.BodyA], Poses[desc.BodyB]);
+    if (!joint) return NoIndex;
+    const Index index = TakeSlot(FreeJoints, NumJoints, Joints.Capacity, Overflow.Joints);
+    if (index == NoIndex) return NoIndex;
+    Joints[index] = *joint;
     RebuildJointed();
     return index;
+}
+
+bool World::SetJoint(Index index, const JointDesc &desc) {
+    if (index >= NumJoints || !Joints[index].Active || !Alive(desc.BodyA) || !Alive(desc.BodyB)) return false;
+    const auto joint = MakeJoint(desc, Poses[desc.BodyA], Poses[desc.BodyB]);
+    if (!joint) return false;
+    auto &current = Joints[index];
+    const bool topology_changed = current.BodyA != desc.BodyA || current.BodyB != desc.BodyB || current.Suppresses != joint->Suppresses;
+    Quiet[current.BodyA] = Quiet[current.BodyB] = Quiet[desc.BodyA] = Quiet[desc.BodyB] = 0;
+    current = *joint;
+    if (topology_changed) RebuildJointed();
+    return true;
 }
 
 void World::RebuildJointed() {
@@ -1006,10 +1054,7 @@ void World::OnStepped(float delta_time, const StepSnapshot &snapshot) {
 
     DrainContactEvents(delta_time, snapshot);
     // Delay body-slot reuse until completed reporting no longer refers to its previous occupant.
-    for (const Index body : RetiredBodies) FreeBodies.push_back(body);
-    RetiredBodies.clear();
-
-    TrimTail(NumBodies, FreeBodies, [this](Index at) { return LiveBodies[at] != 0; });
+    ReclaimBodies();
 }
 
 } // namespace rbp
