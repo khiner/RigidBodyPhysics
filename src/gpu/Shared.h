@@ -61,6 +61,11 @@ struct Velocity {
     float3 Angular;
 };
 
+struct SensorFollower {
+    Index Sensor, Owner;
+    Pose Local;
+};
+
 struct Displacement {
     float3 Linear, Angular;
 };
@@ -426,6 +431,50 @@ struct ContactEvent {
     Index SubShapeA = NoIndex;
 };
 
+// Events retain solved fields after subsequent substeps overwrite the contact.
+struct ContactReport {
+    ContactEvent Event;
+    float3 Lambda{};
+    float Approach = 0, BounceImpulse = 0;
+    float3 PointA{}, PointB{}, AnchorA{}, AnchorB{}, Normal{};
+    float Friction = 0, Restitution = 0, NominalArea = 0, NominalExtent = 0;
+};
+
+inline ContactReport ReportContact(ContactEvent event, Contact contact) {
+    ContactReport report{.Event = event};
+    if (event.Kind == ContactRemoved) return report;
+    report.Lambda = contact.Lambda;
+    report.Approach = contact.Approach;
+    report.BounceImpulse = contact.BounceImpulse;
+    report.PointA = contact.PointA;
+    report.PointB = contact.PointB;
+    report.AnchorA = contact.AnchorA;
+    report.AnchorB = contact.AnchorB;
+    report.Normal = contact.Normal;
+    report.Friction = contact.Friction;
+    report.Restitution = contact.Restitution;
+    report.NominalArea = contact.NominalArea;
+    report.NominalExtent = contact.NominalExtent;
+    return report;
+}
+
+struct SensorPair {
+    Index BodyA, BodyB;
+    ulong Children;
+};
+
+struct StepCounts {
+    uint Contacts, RemovedContacts, Sensors, ContactRefusals, SensorRefusals;
+};
+
+struct StepCompletion {
+    uint Colors, Ready, Errors;
+};
+
+struct StepOutputFlags {
+    uint Poses, Sensors;
+};
+
 // A body reports at most one event per slot it filled, plus one per slot it held last step and did not refill, so twice the slot count is an exact bound.
 // Each body's thread writes its own run in slot order, so events need no atomic and no sort to come out identical on every run.
 GPU_CONSTANT uint EventsPerBody = 2 * ContactsPerBody;
@@ -523,6 +572,17 @@ inline uint TwistAxis(uint angular_modes) {
 // A row with unbounded stiffness is a hard constraint.
 // Only a hard row gets a dual, a stabilized constraint, and a penalty free to ramp past its material stiffness.
 inline bool IsHard(float stiffness) { return isinf(stiffness); }
+
+// The first three words are Metal's indirect threadgroup count.
+struct QueryArenaHeader {
+    uint TaskCount, DispatchY, DispatchZ, TaskCapacity;
+    uint ContextCount, ResultCount, ContextCapacity, ResultCapacity;
+    uint ContextOffset, TaskOffset, ResultOffset, BatchOffset;
+    uint BatchCount, BatchCapacity, Bytes;
+};
+GPU_CONSTANT uint QueryHeaderWords = sizeof(QueryArenaHeader) / sizeof(uint);
+static_assert(sizeof(QueryArenaHeader) == 60);
+GPU_CONSTANT uint QueryScratchBytes = 32u * 1024u * 1024u;
 
 // Named for the paper's symbols, so the kernels diff against the references.
 struct StepParams {

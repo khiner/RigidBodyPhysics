@@ -205,6 +205,15 @@ struct SensorChange {
     bool Entered;
 };
 
+struct StepSnapshot {
+    std::span<const Pose> InitialPoses, Poses;
+    std::span<const Velocity> Velocities;
+    std::span<const ContactReport> Contacts;
+    std::span<const ContactEvent> RemovedContacts;
+    std::span<const SensorPair> Sensors;
+    std::span<const StepCounts> Counts;
+};
+
 // Engine-owned struct-of-arrays in shared buffers.
 // Every per-body array is indexed by the same body index, so a body's handle is that index and the engine holds no pointers.
 // The arrays are split by access pattern rather than by concept, so a kernel loads only the lanes it reads.
@@ -287,11 +296,9 @@ struct World {
     // A host restoring a cached pose puts a body back where it already was, and waking there would start a scrubbed timeline running.
     void Wake(Index body);
 
-    // Called by Solver::Step once the step's commands have completed. See RemoveBody.
-    void OnStepped(float delta_time);
+    void OnStepped(float delta_time, const StepSnapshot & = {});
 
     // While set, OnStepped copies each step's event runs into a CPU-side queue.
-    // That copy happens inside Step, so the queue holds every event of the step before the host can mutate anything.
     // RemoveBody and SetBodyShape append the removals they synthesize.
     // Off by default, because an untaken queue only grows.
     bool TrackContacts = false;
@@ -334,6 +341,7 @@ struct World {
     mtl::Buffer<Material> Materials;
     mtl::Buffer<Filter> Filters;
     mtl::Buffer<Index> Jointed; // Body offsets precede two partner indices per collision-suppressing joint.
+    mtl::Buffer<Index> JointIncidence; // Body offsets precede incident joint indices in ascending order.
 
     // Solver state, per body and per contact slot, named for the algorithm.
     // Kept with everything else the GPU addresses, being indexed the same way and living exactly as long.
@@ -411,14 +419,15 @@ private:
     // A sustained excitation that ends without a removal rings for ever.
     void EndContacts(Index body);
     // The step's event runs, translated and appended to the queue. See TrackContacts.
-    void DrainContactEvents(float delta_time);
-    void UpdateSensorOverlaps();
+    void DrainContactEvents(float delta_time, const StepSnapshot &);
+    void UpdateSensorOverlaps(const StepSnapshot &);
     void EndSensorOverlaps(Index);
     // Releases the pool runs and the slot itself, without RemoveShape's checks on remaining users.
     // A compound removing its own children requires skipping those checks.
     void ReleaseShape(Index);
 
     void RebuildJointed();
+    bool RetireJoint(Index joint);
 
     uint32_t NumBodies{}, NumShapes{}, NumJoints{};
     RunPool VertexPool, FacePool, TrianglePool, NodePool, ChildPool;

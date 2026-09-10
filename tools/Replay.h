@@ -5,29 +5,24 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <tuple>
 #include <type_traits>
 
 // Captures use native layouts and require fresh worlds with fixed topology.
 // Recapture after input layout or StepSettings changes.
 namespace rbp::replay {
-struct SensorFollower {
-    Index Sensor, Owner;
-    Pose Local;
-};
-inline void Follow(World &world, std::span<const SensorFollower> followers) {
-    for (const auto &f : followers) {
-        world.Poses[f.Sensor] = ComposePose(world.Poses[f.Owner], f.Local);
-        auto velocity = world.Velocities[f.Owner];
-        velocity.Linear += simd::cross(velocity.Angular, world.Poses[f.Sensor].Position - world.Poses[f.Owner].Position);
-        world.Velocities[f.Sensor] = velocity;
-    }
+inline bool SameSettings(const StepSettings &a, const StepSettings &b) {
+    const auto fields = [](const StepSettings &s) {
+        // Copy SIMD components because const component references may refer to temporaries.
+        return std::tuple(s.Gravity.x, s.Gravity.y, s.Gravity.z, s.DeltaTime, s.Iterations, s.Beta, s.ContactBeta, s.Gamma, s.PenaltyMin, s.PenaltyMax, s.ContactMargin, s.MaxContactReach, s.MaxAngularSpeed, s.BounceSpeedFactor, s.SleepSpeed, s.SleepSteps, s.SleepDrift, s.MaxColors, s.ColoringPasses);
+    };
+    return fields(a) == fields(b);
 }
 using State = std::array<float, 13>;
-inline State StateOf(const World &w, Index i) {
-    const auto p = w.Poses[i];
-    const auto v = w.Velocities[i];
+inline State StateOf(Pose p, Velocity v) {
     return {p.Position.x, p.Position.y, p.Position.z, p.Orientation.x, p.Orientation.y, p.Orientation.z, p.Orientation.w, v.Linear.x, v.Linear.y, v.Linear.z, v.Angular.x, v.Angular.y, v.Angular.z};
 }
+inline State StateOf(const World &w, Index i) { return StateOf(w.Poses[i], w.Velocities[i]); }
 inline uint64_t Refusals(const World &w) {
     uint64_t result = 0;
     for (Index i = 0; i < w.BodyCount(); ++i) {
@@ -87,12 +82,13 @@ struct Writer {
         Write(Out, w.Joints.All().first(Joints));
         Write(Out, w.Jointed.All());
     }
-    void Step(const World &w, const StepSettings &settings) {
+    void Step(const World &w, const StepSettings &settings, const StepResult &step) {
         if (w.BodyCount() != Bodies || w.ShapeCount() != Shapes || w.JointCount() != Joints)
             throw std::runtime_error("Physics capture topology changed");
         Write(Out, settings);
-        Write(Out, Refusals(w));
-        for (Index i = 0; i < Bodies; ++i) Write(Out, StateOf(w, i));
+        if (step.Poses.size() != Bodies || step.Velocities.size() != Bodies) throw std::runtime_error("Physics capture body count changed");
+        Write(Out, step.ContactRefusals + step.SensorRefusals);
+        for (Index i = 0; i < Bodies; ++i) Write(Out, StateOf(step.Poses[i], step.Velocities[i]));
         Out.flush();
         if (!Out) throw std::runtime_error("Cannot flush physics replay");
     }

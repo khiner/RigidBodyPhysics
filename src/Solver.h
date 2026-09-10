@@ -2,6 +2,8 @@
 
 #include "World.h"
 
+#include <functional>
+
 namespace rbp {
 
 struct StepSettings {
@@ -43,23 +45,35 @@ struct StepSettings {
 // StepSettings::MaxColors is clamped to this.
 inline constexpr uint32_t MaxSupportedColors = 32;
 
+struct StepResult {
+    uint64_t Step, ContactRefusals, SensorRefusals;
+    std::span<const Pose> Poses;
+    std::span<const Velocity> Velocities;
+};
+
+struct AdvanceResult {
+    uint32_t Steps = 0;
+    uint64_t ContactRefusals = 0, SensorRefusals = 0;
+};
+
 // The fixed step, encoded as one command buffer with one compute encoder and a barrier between passes that depend on each other.
 // Architecture.md measures that as the cheapest encoding.
 //
-// No pass uses an atomic and no ordering depends on thread completion order, so a step is a pure function of the world it is given.
 // Two runs of the same scene produce bit-identical state.
 struct Solver {
     explicit Solver(const mtl::Context &);
     ~Solver(); // returns the residency set to the queue, then drains. See mtl::Drain.
 
     void Step(World &, const StepSettings & = {});
+    AdvanceResult Advance(World &, const StepSettings &, uint32_t substeps, std::span<const SensorFollower> followers = {}, const std::function<void(const StepResult &)> &observer = {});
 
 private:
     // The inputs the encoded commands depend on.
     // Any other change to a step changes only the contents of the buffers it binds.
     struct Recording {
         uint32_t Bodies{}, Joints{}, Iterations{}, Colors{}, ColoringPasses{};
-        uint32_t ColliderFeatures{};
+        uint32_t ColliderFeatures{}, Parameter{};
+        bool GpuColors = false, Snapshot = false;
     };
 
     // The kernels of a step, in the order of the pipeline table in Solver.cpp.
@@ -98,6 +112,9 @@ private:
         CountQuietPass,
         SpreadWakingPass,
         PublishWakingPass,
+        FollowPass,
+        PrepareColorsPass,
+        CapturePass,
         SensorPass,
         BoundedCollectPass,
         BoundedSensorPass,
@@ -105,14 +122,33 @@ private:
         MeshSensorPass,
         FullCollectPass,
         FullSensorPass,
+        ResetQueryPass,
+        QueryPass,
+        SensorQueryPass,
         PassCount,
     };
 
-    void Encode(const Recording &, World &);
-    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads, uint32_t lanes = 1);
+    struct OutputLayout {
+        uint64_t Initial{}, Poses{}, Velocities{}, Contacts{}, RemovedContacts{}, Sensors{}, Counts{}, Completion{}, Stride{};
+    };
+    struct FollowerRange {
+        uint32_t First, Count;
+    };
+    void PrepareFollowers(World &, std::span<const SensorFollower>);
+    void Bind(World &, uint32_t parameter);
+    void Encode(MTL4::ComputeCommandEncoder *, const Recording &, World &);
+    enum CollectionMode : uint32_t {
+        Direct,
+        Prepare,
+        Queued,
+        Recompute,
+        CollectionModeCount
+    };
+    void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads, uint32_t lanes = 1, uint64_t indirect = 0, CollectionMode = Direct);
 
     const mtl::Context &Context;
-    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[PassCount][4];
+    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[CollectionModeCount][PassCount][4];
+    mtl::Buffer<uint32_t> QueryScratch;
     NS::SharedPtr<MTL4::ArgumentTable> Table;
     NS::SharedPtr<MTL4::CommandAllocator> Allocator;
     NS::SharedPtr<MTL4::CommandBuffer> Commands;
@@ -120,7 +156,14 @@ private:
     NS::SharedPtr<MTL::ResidencySet> Residency;
     mtl::Buffer<StepParams> Params;
     mtl::Buffer<uint32_t> ColorCursor;
+    mtl::Buffer<SensorFollower> Followers;
+    std::vector<FollowerRange> FollowerRanges;
+    mtl::Buffer<uint32_t> ColorGroups;
+    mtl::Buffer<StepOutputFlags> OutputFlags;
+    mtl::Buffer<uint8_t> Outputs;
+    OutputLayout Layout;
     uint64_t Signal{};
+    bool Advancing = false;
 };
 
 } // namespace rbp

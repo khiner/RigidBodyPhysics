@@ -40,6 +40,12 @@ constexpr Layout HostLayouts[]{
     {"Adjacency", sizeof(Adjacency), alignof(Adjacency)},
     {"ContactEvent", sizeof(ContactEvent), alignof(ContactEvent)},
     {"StepParams", sizeof(StepParams), alignof(StepParams)},
+    {"SensorFollower", sizeof(SensorFollower), alignof(SensorFollower)},
+    {"ContactReport", sizeof(ContactReport), alignof(ContactReport)},
+    {"SensorPair", sizeof(SensorPair), alignof(SensorPair)},
+    {"StepCounts", sizeof(StepCounts), alignof(StepCounts)},
+    {"StepCompletion", sizeof(StepCompletion), alignof(StepCompletion)},
+    {"StepOutputFlags", sizeof(StepOutputFlags), alignof(StepOutputFlags)},
 };
 } // namespace
 

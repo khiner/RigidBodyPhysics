@@ -30,6 +30,6 @@ struct Context {
     // Compiles the shared header, then `prefix`, then `source`, and returns the named kernel.
     // `prefix` supplies a #define when one kernel text is compiled more than one way.
     // Throws on a compile failure, carrying the Metal diagnostic.
-    NS::SharedPtr<MTL::ComputePipelineState> Pipeline(std::string_view source, const char *name, std::string_view prefix = {}) const;
+    NS::SharedPtr<MTL::ComputePipelineState> Pipeline(std::string_view source, const char *name, std::string_view prefix = {}, bool safe_math = false) const;
 };
 } // namespace rbp::mtl

@@ -3,7 +3,9 @@
 kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i != 0) return;
     uint k = 0;
-#define REPORT(T) out[k++] = sizeof(T); out[k++] = alignof(T);
+#define REPORT(T)         \
+    out[k++] = sizeof(T); \
+    out[k++] = alignof(T);
     REPORT(Pose)
     REPORT(Velocity)
     REPORT(Displacement)
@@ -23,6 +25,12 @@ kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_positio
     REPORT(Adjacency)
     REPORT(ContactEvent)
     REPORT(StepParams)
+    REPORT(SensorFollower)
+    REPORT(ContactReport)
+    REPORT(SensorPair)
+    REPORT(StepCounts)
+    REPORT(StepCompletion)
+    REPORT(StepOutputFlags)
 #undef REPORT
 }
 

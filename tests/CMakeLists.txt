@@ -1,4 +1,5 @@
 add_executable(RbpTests
+    AdvanceTest.cpp
     BroadPhaseTest.cpp
     ContactTest.cpp
     CylinderTest.cpp
@@ -8,6 +9,7 @@ add_executable(RbpTests
     LayoutTest.cpp
     Main.cpp
     MeshTest.cpp
+    QueryStorageTest.cpp
     SolveBlockTest.cpp
     SolveTest.cpp
     WorldTest.cpp

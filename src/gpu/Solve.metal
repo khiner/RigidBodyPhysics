@@ -1,3 +1,12 @@
+#ifndef RECOMPUTE_QUERIES
+#define RECOMPUTE_QUERIES 0
+#endif
+#ifndef PREPARE_QUERIES
+#define PREPARE_QUERIES 0
+#endif
+#ifndef QUEUED_QUERIES
+#define QUEUED_QUERIES 0
+#endif
 // AVBD for rigid bodies, following Augmented Vertex Block Descent (Giles et al., SIGGRAPH 2025).
 // Ported from ../avbd-demo2d/source/solver.cpp for the algorithm and its equation numbering.
 // The 3D contact basis and friction cone come from ../MetalAVBD/MetalAVBD/AVBDCompute.metal. See NOTICE.md.
@@ -1941,6 +1950,53 @@ struct GeometryManifold {
     bool Visited;
 };
 
+static device QueryArenaHeader &QueryHeader(device uint *pool) { return *((device QueryArenaHeader *)pool); }
+
+// Batches retain each owner's traversal order independently of storage allocation order.
+static uint ReserveQueries(device atomic_uint *count, uint capacity, uint size) {
+    uint first = atomic_load_explicit(count, memory_order_relaxed);
+    while (first <= capacity && size <= capacity - first)
+        if (atomic_compare_exchange_weak_explicit(count, &first, first + size, memory_order_relaxed, memory_order_relaxed)) return first;
+    return NoIndex;
+}
+
+struct QueuedQuery {
+    uint Batch, Candidate, OwnTriangle, Previous;
+    float Weld;
+    uint Result;
+};
+struct QueryContext {
+    GeometryQuery Query;
+    uint Owner, Other, OwnLeaf, TargetLeaf, Cached;
+};
+struct QueryBatch {
+    uint Context, First, Count, Next, Present[2];
+};
+static device QueryBatch *QueryBatches(device uint *pool) { return (device QueryBatch *)((device uchar *)pool + QueryHeader(pool).BatchOffset); }
+static device QueryContext *QueryContexts(device uint *pool) { return (device QueryContext *)((device uchar *)pool + QueryHeader(pool).ContextOffset); }
+static device QueuedQuery *QueryRecords(device uint *pool) { return (device QueuedQuery *)((device uchar *)pool + QueryHeader(pool).TaskOffset); }
+static device GeometryManifold *QueryResults(device uint *pool) { return (device GeometryManifold *)((device uchar *)pool + QueryHeader(pool).ResultOffset); }
+kernel void ResetQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]) {
+    if (body >= p.BodyCount) return;
+    if (body == 0) {
+        QueryHeader(pool).TaskCount = 0;
+        QueryHeader(pool).DispatchY = QueryHeader(pool).DispatchZ = 1;
+        QueryHeader(pool).ContextCount = QueryHeader(pool).ResultCount = QueryHeader(pool).BatchCount = 0;
+        const uint bytes = QueryHeader(pool).Bytes, begin = ((QueryHeaderWords + 2 * p.BodyCount) * sizeof(uint) + 15) & ~15u;
+        const uint part = (bytes - begin) / 4;
+        QueryHeader(pool).TaskCapacity = part / sizeof(QueuedQuery);
+        QueryHeader(pool).ContextCapacity = part / sizeof(QueryContext);
+        QueryHeader(pool).BatchCapacity = part / sizeof(QueryBatch);
+        QueryHeader(pool).ContextOffset = begin;
+        QueryHeader(pool).BatchOffset = (begin + QueryHeader(pool).ContextCapacity * sizeof(QueryContext) + 15) & ~15u;
+        QueryHeader(pool).TaskOffset = (QueryHeader(pool).BatchOffset + QueryHeader(pool).BatchCapacity * sizeof(QueryBatch) + 15) & ~15u;
+        QueryHeader(pool).ResultOffset = (QueryHeader(pool).TaskOffset + QueryHeader(pool).TaskCapacity * sizeof(QueuedQuery) + 15) & ~15u;
+        QueryHeader(pool).ResultCapacity = (bytes - QueryHeader(pool).ResultOffset) / sizeof(GeometryManifold);
+    }
+    pool[QueryHeaderWords + body] = NoIndex;
+    pool[QueryHeaderWords + p.BodyCount + body] = 0;
+}
+
 static GeometryManifold QueryGeometry(
     GeometryQuery q, uint candidate, Index own_triangle, uint previous,
     device const float3 *hull_vertices, device const HullFace *hull_faces, device const Triangle *mesh_triangles, uint lane
@@ -2424,7 +2480,178 @@ static GeometryManifold QueryGeometry(
     return result;
 }
 
+kernel void EvaluateQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], device const float3 *vertices [[buffer(27)]], device const HullFace *faces [[buffer(30)]], device const Triangle *triangles [[buffer(28)]], uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    if (group >= min(QueryHeader(pool).TaskCount, QueryHeader(pool).TaskCapacity)) return;
+    device QueuedQuery &task = QueryRecords(pool)[group];
+    if (task.Batch >= QueryHeader(pool).BatchCapacity) return;
+    device QueryBatch &batch = QueryBatches(pool)[task.Batch];
+    device QueryContext &context = QueryContexts(pool)[batch.Context];
+    GeometryQuery query = context.Query;
+    const bool cooperate = COLLECT_LANES >= 32 && ConvexLeaf(query.Shape.Kind) && ConvexLeaf(query.Target.Kind) && (query.Shape.Kind == ShapeHull || query.Target.Kind == ShapeHull);
+    if (!cooperate && lane != 0) return;
+    query.Weld = task.Weld;
+    if (query.MeshPair) query.OwnPoly = MakeTriangle(query.ShapePose, triangles[task.OwnTriangle]);
+    const GeometryManifold result = QueryGeometry(query, task.Candidate, task.OwnTriangle, task.Previous, vertices, faces, triangles, cooperate ? lane : NoIndex);
+    if (lane == 0 && result.Visited && (result.Count || context.Cached)) {
+        const uint at = atomic_fetch_add_explicit((device atomic_uint *)(&QueryHeader(pool).ResultCount), 1u, memory_order_relaxed);
+        if (at >= QueryHeader(pool).ResultCapacity) atomic_fetch_add_explicit((device atomic_uint *)(pool + QueryHeaderWords + p.BodyCount + context.Owner), 1u, memory_order_relaxed);
+        else {
+            QueryResults(pool)[at] = result;
+            task.Result = at;
+            const uint within = group - batch.First;
+            atomic_fetch_or_explicit((device atomic_uint *)(batch.Present + within / 32), 1u << (within % 32), memory_order_relaxed);
+        }
+    }
+}
+
+struct ContactHistory {
+    uint was_feature[ContactsPerBody], was_stick[ContactsPerBody];
+    Index was_other[ContactsPerBody]; // the partner body, which only a removal still needs
+    Index was_sub_a[ContactsPerBody];
+    Index was_sub[ContactsPerBody]; // and which part of it, which for a mesh is the triangle
+    ulong was_children[ContactsPerBody]; // and which leaf of each shape, which for a compound is the child
+    float3 was_lambda[ContactsPerBody], was_penalty[ContactsPerBody];
+    float3 was_anchor_a[ContactsPerBody], was_anchor_b[ContactsPerBody];
+};
+
+static void CollectManifold(
+    const thread GeometryManifold &geometry, const thread GeometryQuery &q,
+    uint body, uint other, uint own_leaf, uint target_leaf, bool cached_pair,
+    const thread Shape &body_shape, const thread Shape &other_body_shape,
+    device const Material *materials, device Contact *slots, device uint *contact_refusals,
+    constant StepParams &p, thread uint &count, thread uint *inherited,
+    COLLECT_STORAGE const ContactHistory &history
+) {
+    const Shape shape = q.Shape, target = q.Target;
+    const Pose pose = q.Pose, target_pose = q.TargetPose, shape_pose = q.ShapePose, target_shape_pose = q.TargetShapePose;
+    const Velocity own_velocity = q.OwnVelocity, other_velocity = q.OtherVelocity;
+    const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
+    const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
+    const float3 penalty_floor(p.PenaltyMin);
+    const float weld = geometry.Weld;
+    const ulong children = ChildPair(own_leaf, target_leaf);
+    if (!geometry.Visited) return;
+    const Index sub_shape = geometry.SubShape, sub_shape_a = geometry.SubShapeA;
+    const uint found = geometry.Count;
+    const float3 normal = geometry.Normal;
+    const float2 patch = geometry.Patch;
+    const thread float3 *points_here = geometry.Here, *points_there = geometry.There;
+    const thread uint *features = geometry.Feature;
+    if (cached_pair) {
+        for (uint k = 0; k < count; ++k)
+            if (slots[k].BodyB == other && slots[k].Children == children && slots[k].SubShape == sub_shape && slots[k].SubShapeA == sub_shape_a) {
+                slots[k].NominalArea = patch.x;
+                slots[k].NominalExtent = patch.y;
+            }
+        return;
+    }
+
+#if !SENSOR_PASS
+    // Weld matching positions and normals across leaves or triangles without merging unrelated features.
+    const bool siblings = own_leaf_count > 1 || target_leaf_count > 1 || sub_shape_a != NoIndex || sub_shape != NoIndex;
+#endif
+
+    for (uint i = 0; i < found; ++i) {
+#if !SENSOR_PASS
+        const float3 anchor_a = LocalPoint(pose, points_here[i]);
+        const float3 anchor_b = LocalPoint(target_pose, points_there[i]);
+        // The first matching geometric contact retains ownership.
+        bool held = false;
+        for (uint k = 0; k < count && siblings && !held; ++k)
+            held = slots[k].Active && slots[k].BodyB == other && dot(slots[k].Normal, normal) > 0.99999f &&
+                distance(anchor_a, slots[k].PointA) <= weld && distance(anchor_b, slots[k].PointB) <= weld;
+        if (held) continue;
+#endif
+
+        // When full, replace the shallowest retained contact with a deeper candidate.
+        // Maintain a dense run and account for every refused point.
+        const float separation = dot(normal, points_here[i] - points_there[i]) + p.ContactMargin;
+#if SENSOR_PASS
+        if (dot(normal, points_here[i] - points_there[i]) > 0) continue;
+        bool already = false;
+        for (uint k = 0; k < count; ++k)
+            already |= slots[k].BodyB == other && slots[k].Children == children;
+        if (already) continue;
+#endif
+        uint at = count;
+        if (count == ContactsPerBody) {
+            uint shallowest = 0;
+            for (uint k = 1; k < ContactsPerBody; ++k)
+                if (slots[k].C0.x > slots[shallowest].C0.x) shallowest = k;
+            ++contact_refusals[body];
+            if (separation >= slots[shallowest].C0.x) continue;
+            at = shallowest;
+        }
+        device Contact &contact = slots[at];
+        contact.BodyA = body;
+        contact.BodyB = other;
+        contact.Feature = features[i];
+        contact.Children = children;
+        contact.Active = true;
+#if SENSOR_PASS
+        // Sensors retain one identity per overlapping leaf pair, without solver state.
+        contact.C0.x = separation;
+#else
+        contact.AnchorA = anchor_a;
+        contact.AnchorB = anchor_b;
+        contact.PointA = anchor_a;
+        contact.PointB = anchor_b;
+        contact.NominalArea = patch.x;
+        contact.NominalExtent = patch.y;
+        contact.Normal = normal;
+        const Material material_a = shape.HasMaterial ? shape.Surface : (body_shape.HasMaterial ? body_shape.Surface : materials[body]);
+        const Material material_b = target.HasMaterial ? target.Surface : (other_body_shape.HasMaterial ? other_body_shape.Surface : materials[other]);
+        const float3 relative_velocity = (own_velocity.Linear + cross(own_velocity.Angular, points_here[i] - pose.Position)) - (other_velocity.Linear + cross(other_velocity.Angular, points_there[i] - target_pose.Position));
+        const bool resting = length(relative_velocity - normal * dot(relative_velocity, normal)) < 1e-3f;
+        contact.Friction = Combine(resting ? material_a.StaticFriction : material_a.DynamicFriction, resting ? material_b.StaticFriction : material_b.DynamicFriction, material_a.FrictionCombine, material_b.FrictionCombine);
+        contact.Restitution = Combine(material_a.Restitution, material_b.Restitution, material_a.RestitutionCombine, material_b.RestitutionCombine);
+        contact.SubShape = sub_shape;
+        contact.SubShapeA = sub_shape_a;
+
+        contact.Approach = -dot(normal, relative_velocity);
+        contact.BounceImpulse = 0;
+        contact.BounceDelta = 0;
+
+        contact.Penalty = penalty_floor;
+        contact.Lambda = float3(0);
+        contact.Stick = false;
+        inherited[at] = NoIndex;
+        for (uint j = 0; j < ContactsPerBody; ++j) {
+            if (history.was_feature[j] == NoIndex) break;
+            if (history.was_feature[j] != contact.Feature || history.was_other[j] != other || history.was_sub[j] != sub_shape || history.was_sub_a[j] != sub_shape_a || history.was_children[j] != children) continue;
+            inherited[at] = j;
+            contact.Penalty = clamp(history.was_penalty[j] * p.Gamma, penalty_floor, float3(p.PenaltyMax));
+            contact.Lambda = history.was_lambda[j];
+            // Contacts that remained inside the friction cone keep their sticking anchors.
+            // Sliding contacts use fresh anchors so tangential displacement does not accumulate across slip.
+            const float3 want_a = WorldPoint(pose, history.was_anchor_a[j]);
+            const float3 want_b = WorldPoint(target_pose, history.was_anchor_b[j]);
+            bool onto_another = false;
+            for (uint k = 0; k < count && !onto_another; ++k) {
+                if (k == at || !slots[k].Active || slots[k].BodyB != other || slots[k].Children != children || dot(slots[k].Normal, normal) <= 0.99999f) continue;
+                onto_another = distance(history.was_anchor_a[j], slots[k].AnchorA) <= weld &&
+                    distance(history.was_anchor_b[j], slots[k].AnchorB) <= weld;
+            }
+            for (uint k = i + 1; k < found && !onto_another; ++k)
+                onto_another = distance(want_a, points_here[k]) <= weld && distance(want_b, points_there[k]) <= weld;
+            const bool curved = CurvedSurface(shape.Kind, shape_pose.Orientation, normal) || CurvedSurface(target.Kind, target_shape_pose.Orientation, normal);
+            if (history.was_stick[j] && !curved && !onto_another) {
+                contact.AnchorA = history.was_anchor_a[j];
+                contact.AnchorB = history.was_anchor_b[j];
+                contact.Stick = true;
+            }
+            break;
+        }
+        const ContactBasis basis = MakeContactBasis(normal);
+        const float3 gap = WorldPoint(pose, contact.AnchorA) - WorldPoint(target_pose, contact.AnchorB);
+        contact.C0 = float3(dot(basis.Axis[0], gap), dot(basis.Axis[1], gap), dot(basis.Axis[2], gap)) + float3(p.ContactMargin, 0, 0);
+#endif
+        if (at == count) ++count;
+    }
+}
+
 kernel void CollectContacts(
+    device uint *query_pool [[buffer(11)]],
     device Contact *contacts [[buffer(5)]], device const Pose *poses [[buffer(0)]],
     device const BodyMass *masses [[buffer(4)]], device const Index *body_shapes [[buffer(6)]],
     device const Shape *shapes [[buffer(8)]], device const Material *materials [[buffer(10)]],
@@ -2448,8 +2675,24 @@ kernel void CollectContacts(
     const uint lane = 0;
 #endif
     if (body >= p.BodyCount) return;
-    if (lane == 0) contact_refusals[body] = 0;
+#if QUEUED_QUERIES
+    if (query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+#elif RECOMPUTE_QUERIES
+    if (!query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+#endif
+
+    if (!PREPARE_QUERIES && lane == 0) contact_refusals[body] = 0;
+#if PREPARE_QUERIES || QUEUED_QUERIES
+    device QueuedQuery *query_records = QueryRecords(query_pool);
+    COLLECT_STORAGE uint query_base, context_base, batch_base;
+    COLLECT_STORAGE bool first_context;
+    device QueryBatch *query_batches = QueryBatches(query_pool);
+    device QueryContext *query_contexts = QueryContexts(query_pool);
+    uint query_tail = NoIndex;
+#endif
+#if !PREPARE_QUERIES && !QUEUED_QUERIES
     COLLECT_STORAGE GeometryManifold geometries[COLLECT_LANES];
+#endif
     device Contact *slots = contacts + body * ContactsPerBody;
     device ContactEvent *events = contact_events + body * EventsPerBody;
     // Which of last step's slots a point has claimed, and how many events this body has written. The
@@ -2461,31 +2704,25 @@ kernel void CollectContacts(
     uint inherited[ContactsPerBody];
 
     // The previous step's state, kept only so a matching feature can inherit it.
-    COLLECT_STORAGE uint was_feature[ContactsPerBody], was_stick[ContactsPerBody];
-    COLLECT_STORAGE Index was_other[ContactsPerBody]; // the partner body, which only a removal still needs
-    COLLECT_STORAGE Index was_sub_a[ContactsPerBody];
-    COLLECT_STORAGE Index was_sub[ContactsPerBody]; // and which part of it, which for a mesh is the triangle
-    COLLECT_STORAGE ulong was_children[ContactsPerBody]; // and which leaf of each shape, which for a compound is the child
-    COLLECT_STORAGE float3 was_lambda[ContactsPerBody], was_penalty[ContactsPerBody];
-    COLLECT_STORAGE float3 was_anchor_a[ContactsPerBody], was_anchor_b[ContactsPerBody];
+    COLLECT_STORAGE ContactHistory history;
     // A run is dense from zero and one NoIndex sentinel ends it, where every reader of was_* stops.
     if (lane == 0) {
         for (uint i = 0; i < ContactsPerBody; ++i) {
             if (!slots[i].Active) {
-                was_feature[i] = NoIndex;
+                history.was_feature[i] = NoIndex;
                 break;
             }
-            was_feature[i] = slots[i].Feature;
-            was_other[i] = slots[i].BodyB;
-            was_sub[i] = slots[i].SubShape;
-            was_sub_a[i] = slots[i].SubShapeA;
-            was_children[i] = slots[i].Children;
-            was_lambda[i] = slots[i].Lambda;
-            was_penalty[i] = slots[i].Penalty;
-            was_stick[i] = slots[i].Stick;
-            was_anchor_a[i] = slots[i].AnchorA;
-            was_anchor_b[i] = slots[i].AnchorB;
-            slots[i].Active = false;
+            history.was_feature[i] = slots[i].Feature;
+            history.was_other[i] = slots[i].BodyB;
+            history.was_sub[i] = slots[i].SubShape;
+            history.was_sub_a[i] = slots[i].SubShapeA;
+            history.was_children[i] = slots[i].Children;
+            history.was_lambda[i] = slots[i].Lambda;
+            history.was_penalty[i] = slots[i].Penalty;
+            history.was_stick[i] = slots[i].Stick;
+            history.was_anchor_a[i] = slots[i].AnchorA;
+            history.was_anchor_b[i] = slots[i].AnchorB;
+            if (!PREPARE_QUERIES) slots[i].Active = false;
         }
     }
     if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2494,12 +2731,12 @@ kernel void CollectContacts(
     // Deliberately no test for a static body, a dynamic mesh's partner being able to be static.
     // Exiting on mass alone would leave no owner for the pair, and the mesh falls through.
     if (shape_index == NoIndex) {
-        if (lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
+        if (!PREPARE_QUERIES && lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
         return;
     }
     const Shape body_shape = shapes[shape_index];
     if (body_shape.Kind == ShapePlane) {
-        if (lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
+        if (!PREPARE_QUERIES && lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
         return;
     }
     const Pose pose = poses[body];
@@ -2526,20 +2763,22 @@ kernel void CollectContacts(
 #endif
     if (frozen && lane == 0) {
         for (uint j = 0; j < ContactsPerBody; ++j) {
-            if (was_feature[j] == NoIndex) break; // the sentinel ending the dense run
-            const Index partner = was_other[j];
+            if (history.was_feature[j] == NoIndex) break; // the sentinel ending the dense run
+            const Index partner = history.was_other[j];
             if (body_shapes[partner] == NoIndex) continue; // removed, and its contacts end with it
             if (!Frozen(masses[partner], velocities[partner], quiet[partner], p)) continue; // moving, so re-collide
             const Shape other_root = shapes[body_shapes[partner]];
             if (own_filter.Sensor || filters[partner].Sensor ||
-                !Allows(LeafFilter(body_shape, OwnChild(was_children[j]), own_filter, shapes, compound_children), LeafFilter(other_root, OtherChild(was_children[j]), filters[partner], shapes, compound_children))) continue;
+                !Allows(LeafFilter(body_shape, OwnChild(history.was_children[j]), own_filter, shapes, compound_children), LeafFilter(other_root, OtherChild(history.was_children[j]), filters[partner], shapes, compound_children))) continue;
             // A compacting copy, and j never runs ahead of count.
+#if !PREPARE_QUERIES
             slots[count] = slots[j];
             slots[count].Active = true;
             slots[count].Approach = slots[count].BounceImpulse = slots[count].BounceDelta = 0;
+#endif
             // Reporting enabled after sleep measures geometry without replacing cached solver rows.
-            if (p.ReportContacts && slots[count].NominalArea < 0) {
-                slots[count].NominalArea = slots[count].NominalExtent = 0;
+            if (p.ReportContacts && slots[PREPARE_QUERIES ? j : count].NominalArea < 0) {
+                if (!PREPARE_QUERIES) slots[count].NominalArea = slots[count].NominalExtent = 0;
                 measure_cached = true;
             }
             inherited[count] = j;
@@ -2547,6 +2786,30 @@ kernel void CollectContacts(
         }
     }
     if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+#if QUEUED_QUERIES
+    if (lane == 0) {
+        for (Index context_at = query_pool[QueryHeaderWords + body]; context_at != NoIndex; context_at = query_batches[context_at].Next) {
+            device const QueryBatch &batch = query_batches[context_at];
+            device const QueryContext &context = query_contexts[batch.Context];
+            for (uint word = 0; word < 2; ++word) {
+                uint present = batch.Present[word];
+                while (present) {
+                    const uint query_at = batch.First + 32 * word + ctz(present);
+                    present &= present - 1;
+                    const QueuedQuery record = query_records[query_at];
+                    const GeometryQuery q = context.Query;
+                    const Index other = context.Other;
+                    const uint own_leaf = context.OwnLeaf, target_leaf = context.TargetLeaf;
+                    const Shape other_body_shape = shapes[body_shapes[other]];
+                    const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
+
+                    const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
+                    CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                }
+            }
+        }
+    }
+#else
     // Every leaf of this body against every leaf of every other, run full or not.
     // Which contacts a body keeps must not depend on the order the partners were visited in, and the refusal count below is then exact.
     for (uint own_leaf = 0; own_leaf < own_leaf_count; ++own_leaf) {
@@ -2604,7 +2867,6 @@ kernel void CollectContacts(
             const Shape other_body_shape = shapes[other_shape];
             if (shape.Kind == ShapeMesh && other_body_shape.Kind != ShapePlane && (!MESH_PAIRS || other_body_shape.Kind != ShapeMesh) && other_body_shape.Kind != ShapeCompound) continue;
             const Pose target_pose = poses[other];
-            const float3 penalty_floor(p.PenaltyMin);
             // How far apart the pair may be and still be given contacts.
             // A contact built while the bodies are apart carries the gap as slack and does no work until the step's motion consumes it.
             // The step therefore ends at touch.
@@ -2624,6 +2886,10 @@ kernel void CollectContacts(
             // A leaf pair carries its own manifold, duals and name, a point on leaf 3 against leaf 5 being different geometry from leaf 2 against the same 5.
             const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
             for (uint target_leaf = 0; target_leaf < target_leaf_count; ++target_leaf) {
+#if PREPARE_QUERIES
+                if (lane == 0) context_base = NoIndex;
+                if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
                 Shape target = shapes[other_body_shape.Kind == ShapeCompound ? ChildOf(other_body_shape, target_leaf, compound_children) : other_shape];
                 if (shape.Kind == ShapeMesh && target.Kind != ShapePlane && (!MESH_PAIRS || target.Kind != ShapeMesh)) continue;
                 if (other_body_shape.Kind == ShapeCompound) target.Local = ComposePose(other_body_shape.Local, target.Local);
@@ -2673,9 +2939,9 @@ kernel void CollectContacts(
                             // Retain the previous side during mesh-plane penetration.
                             // The vertex feature encodes the side to invalidate the dual when it changes.
                             if (shape.Kind == ShapeMesh && target.DoubleSided && abs(dot(target.Normal, centre) - target.Offset) <= reach) {
-                                for (uint j = 0; j < ContactsPerBody && was_feature[j] != NoIndex; ++j) {
-                                    if (was_other[j] != other || was_children[j] != ChildPair(own_leaf, target_leaf)) continue;
-                                    plane_back = (was_feature[j] & PlaneBackFeature) != 0;
+                                for (uint j = 0; j < ContactsPerBody && history.was_feature[j] != NoIndex; ++j) {
+                                    if (history.was_other[j] != other || history.was_children[j] != ChildPair(own_leaf, target_leaf)) continue;
+                                    plane_back = (history.was_feature[j] & PlaneBackFeature) != 0;
                                     break;
                                 }
                             }
@@ -2753,6 +3019,24 @@ kernel void CollectContacts(
                             }
 
                             for (uint batch = 0; batch < manifolds; batch += COLLECT_LANES) {
+#if PREPARE_QUERIES
+                                const uint query_count = min(uint(COLLECT_LANES), mesh_pair ? own_count - own_base : manifolds - batch);
+                                if (lane == 0) {
+                                    query_base = ReserveQueries((device atomic_uint *)&QueryHeader(query_pool).TaskCount, QueryHeader(query_pool).TaskCapacity, query_count);
+                                    first_context = context_base == NoIndex;
+                                    if (first_context) context_base = ReserveQueries((device atomic_uint *)(&QueryHeader(query_pool).ContextCount), QueryHeader(query_pool).ContextCapacity, 1);
+                                    batch_base = ReserveQueries((device atomic_uint *)(&QueryHeader(query_pool).BatchCount), QueryHeader(query_pool).BatchCapacity, 1);
+                                    if (query_base == NoIndex || context_base >= QueryHeader(query_pool).ContextCapacity || batch_base >= QueryHeader(query_pool).BatchCapacity) query_pool[QueryHeaderWords + p.BodyCount + body] += query_count;
+                                    else {
+                                        if (query_tail == NoIndex) query_pool[QueryHeaderWords + body] = batch_base;
+                                        else query_batches[query_tail].Next = batch_base;
+                                        query_tail = batch_base;
+                                    }
+                                }
+                                if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                                if (lane < query_count && query_base != NoIndex && query_base + lane < QueryHeader(query_pool).TaskCapacity) query_records[query_base + lane].Batch = NoIndex;
+                                if (query_pool[QueryHeaderWords + p.BodyCount + body]) return;
+#endif
                                 const uint manifold = mesh_pair ? 0 : batch + lane;
                                 const bool cooperate = COLLECT_LANES >= 32 && ConvexLeaf(shape.Kind) && ConvexLeaf(target.Kind) && (shape.Kind == ShapeHull || target.Kind == ShapeHull);
                                 if (manifold < manifolds || (cooperate && lane < 32)) {
@@ -2760,154 +3044,36 @@ kernel void CollectContacts(
                                     uint previous = NoIndex;
                                     if (mesh_pair) {
                                         const Index sub_shape = target.FirstTriangle + candidates[manifold];
-                                        for (uint j = 0; j < ContactsPerBody && was_feature[j] != NoIndex; ++j)
-                                            if (was_other[j] == other && was_children[j] == children && was_sub_a[j] == own_triangle && was_sub[j] == sub_shape) {
-                                                previous = was_feature[j];
+                                        for (uint j = 0; j < ContactsPerBody && history.was_feature[j] != NoIndex; ++j)
+                                            if (history.was_other[j] == other && history.was_children[j] == children && history.was_sub_a[j] == own_triangle && history.was_sub[j] == sub_shape) {
+                                                previous = history.was_feature[j];
                                                 break;
                                             }
                                     }
                                     const GeometryQuery query{shape, target, pose, target_pose, shape_pose, target_shape_pose, own_poly, plane_patch, own_bounds.Center, target_bounds.Center, own_velocity, other_velocity, reach, weld, mesh_pair, plane_back, bool(p.ReportContacts)};
                                     const uint candidate = mesh_pair || target.Kind == ShapeMesh || (BoundedPlane(target) && shape.Kind == ShapeMesh) ? candidates[manifold] : 0;
+#if PREPARE_QUERIES
+                                    if (lane < query_count && query_base != NoIndex && query_base + query_count <= QueryHeader(query_pool).TaskCapacity && context_base < QueryHeader(query_pool).ContextCapacity && batch_base < QueryHeader(query_pool).BatchCapacity) {
+                                        if (lane == 0) {
+                                            if (first_context) query_contexts[context_base] = {query, body, other, own_leaf, target_leaf, uint(cached_pair)};
+                                            query_batches[batch_base] = {context_base, query_base, query_count, NoIndex, {0, 0}};
+                                        }
+                                        query_records[query_base + lane] = {batch_base, candidate, own_triangle, previous, weld, NoIndex};
+                                    }
+#else
                                     geometries[lane] = QueryGeometry(query, candidate, own_triangle, previous, hull_vertices, hull_faces, mesh_triangles, cooperate ? lane % 32 : NoIndex);
+#endif
                                 }
                                 if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+#if !PREPARE_QUERIES
                                 if (lane == 0) {
                                     for (uint query_at = 0; query_at < min(uint(COLLECT_LANES), mesh_pair ? own_count - own_base : manifolds - batch); ++query_at) {
                                         const GeometryManifold geometry = geometries[query_at];
-                                        const float weld = geometry.Weld;
-                                        const ulong children = ChildPair(own_leaf, target_leaf);
-                                        if (!geometry.Visited) continue;
-                                        const Index sub_shape = geometry.SubShape, sub_shape_a = geometry.SubShapeA;
-                                        const uint found = geometry.Count;
-                                        const float3 normal = geometry.Normal;
-                                        const float2 patch = geometry.Patch;
-                                        const thread float3 *points_here = geometry.Here, *points_there = geometry.There;
-                                        const thread uint *features = geometry.Feature;
-                                        if (cached_pair) {
-                                            for (uint k = 0; k < count; ++k)
-                                                if (slots[k].BodyB == other && slots[k].Children == children && slots[k].SubShape == sub_shape && slots[k].SubShapeA == sub_shape_a) {
-                                                    slots[k].NominalArea = patch.x;
-                                                    slots[k].NominalExtent = patch.y;
-                                                }
-                                            continue;
-                                        }
-
-#if !SENSOR_PASS
-                                        // The test below costs a scan of the run per point.
-                                        const bool siblings = own_leaf_count > 1 || target_leaf_count > 1 || sub_shape_a != NoIndex || sub_shape != NoIndex;
-#endif
-
-                                        // One slot per manifold point, its feature naming where it came from.
-                                        for (uint i = 0; i < found; ++i) {
-#if !SENSOR_PASS
-                                            const float3 anchor_a = LocalPoint(pose, points_here[i]);
-                                            const float3 anchor_b = LocalPoint(target_pose, points_there[i]);
-                                            bool held = false;
-                                            for (uint k = 0; k < count && siblings && !held; ++k)
-                                                held = slots[k].Active && slots[k].BodyB == other && dot(slots[k].Normal, normal) > 0.99999f &&
-                                                    distance(anchor_a, slots[k].PointA) <= weld && distance(anchor_b, slots[k].PointB) <= weld;
-                                            if (held) continue;
-#endif
-
-                                            // Where this point goes. With room it takes the next slot, and once the
-                                            // run is full it must earn a place: the shallowest contact gives way, so
-                                            // a speculative contact at positive separation goes first and returns
-                                            // the moment it is the deeper. Deciding by body order leaves a box in a
-                                            // lattice holding four contacts with a neighbour it merely touches and
-                                            // none with the box on it.
-                                            const float separation = dot(normal, points_here[i] - points_there[i]) + p.ContactMargin;
-#if SENSOR_PASS
-                                            if (dot(normal, points_here[i] - points_there[i]) > 0) continue;
-                                            bool already = false;
-                                            for (uint k = 0; k < count; ++k)
-                                                already |= slots[k].BodyB == other && slots[k].Children == children;
-                                            if (already) continue;
-#endif
-                                            uint at = count;
-                                            if (count == ContactsPerBody) {
-                                                uint shallowest = 0;
-                                                for (uint k = 1; k < ContactsPerBody; ++k)
-                                                    if (slots[k].C0.x > slots[shallowest].C0.x) shallowest = k;
-                                                ++contact_refusals[body];
-                                                if (separation >= slots[shallowest].C0.x) continue;
-                                                at = shallowest;
-                                            }
-                                            device Contact &contact = slots[at];
-                                            contact.BodyA = body;
-                                            contact.BodyB = other;
-                                            contact.Feature = features[i];
-                                            contact.Children = children;
-                                            contact.Active = true;
-#if SENSOR_PASS
-                                            // Sensors retain one identity per overlapping leaf pair, without solver state.
-                                            contact.C0.x = separation;
-#else
-                                            contact.AnchorA = anchor_a;
-                                            contact.AnchorB = anchor_b;
-                                            contact.PointA = anchor_a;
-                                            contact.PointB = anchor_b;
-                                            contact.NominalArea = patch.x;
-                                            contact.NominalExtent = patch.y;
-                                            contact.Normal = normal;
-                                            const Material material_a = shape.HasMaterial ? shape.Surface : (body_shape.HasMaterial ? body_shape.Surface : materials[body]);
-                                            const Material material_b = target.HasMaterial ? target.Surface : (other_body_shape.HasMaterial ? other_body_shape.Surface : materials[other]);
-                                            const float3 relative_velocity = (own_velocity.Linear + cross(own_velocity.Angular, points_here[i] - pose.Position)) - (other_velocity.Linear + cross(other_velocity.Angular, points_there[i] - target_pose.Position));
-                                            const bool resting = length(relative_velocity - normal * dot(relative_velocity, normal)) < 1e-3f;
-                                            contact.Friction = Combine(resting ? material_a.StaticFriction : material_a.DynamicFriction, resting ? material_b.StaticFriction : material_b.DynamicFriction, material_a.FrictionCombine, material_b.FrictionCombine);
-                                            contact.Restitution = Combine(material_a.Restitution, material_b.Restitution, material_a.RestitutionCombine, material_b.RestitutionCombine);
-                                            contact.SubShape = sub_shape;
-                                            contact.SubShapeA = sub_shape_a;
-
-                                            // The closing speed when the step began, which a bounce is measured against.
-                                            // Ungated, the threshold and coefficient belonging to the velocity pass.
-                                            contact.Approach = -dot(normal, relative_velocity); // positive while they are coming together
-                                            contact.BounceImpulse = 0;
-                                            contact.BounceDelta = 0;
-
-                                            contact.Penalty = penalty_floor;
-                                            contact.Lambda = float3(0);
-                                            contact.Stick = false;
-                                            inherited[at] = NoIndex;
-                                            for (uint j = 0; j < ContactsPerBody; ++j) {
-                                                if (was_feature[j] == NoIndex) break; // the sentinel, with nothing to inherit past it
-                                                if (was_feature[j] != contact.Feature || was_other[j] != other || was_sub[j] != sub_shape || was_sub_a[j] != sub_shape_a || was_children[j] != children) continue;
-                                                inherited[at] = j;
-                                                contact.Penalty = clamp(was_penalty[j] * p.Gamma, penalty_floor, float3(p.PenaltyMax));
-                                                contact.Lambda = was_lambda[j];
-                                                // Static friction: a contact that stayed inside the cone last step keeps the anchor pair it held.
-                                                // C0's friction rows then measure the drift since it stuck.
-                                                // Recomputed anchors would leave a loaded box creeping every step.
-                                                // Not on a curved surface, whose contact sweeps across the material.
-                                                // And not where the anchors land on a row this pair already wrote.
-                                                // Two contacts that stuck at different times can drift onto each other with all but the same Jacobian and C0.
-                                                const float3 want_a = WorldPoint(pose, was_anchor_a[j]);
-                                                const float3 want_b = WorldPoint(target_pose, was_anchor_b[j]);
-                                                bool onto_another = false;
-                                                for (uint k = 0; k < count && !onto_another; ++k) {
-                                                    if (k == at || !slots[k].Active || slots[k].BodyB != other || slots[k].Children != children || dot(slots[k].Normal, normal) <= 0.99999f) continue;
-                                                    onto_another = distance(was_anchor_a[j], slots[k].AnchorA) <= weld &&
-                                                        distance(was_anchor_b[j], slots[k].AnchorB) <= weld;
-                                                }
-                                                for (uint k = i + 1; k < found && !onto_another; ++k)
-                                                    onto_another = distance(want_a, points_here[k]) <= weld && distance(want_b, points_there[k]) <= weld;
-                                                const bool curved = CurvedSurface(shape.Kind, shape_pose.Orientation, normal) || CurvedSurface(target.Kind, target_shape_pose.Orientation, normal);
-                                                if (was_stick[j] && !curved && !onto_another) {
-                                                    contact.AnchorA = was_anchor_a[j];
-                                                    contact.AnchorB = was_anchor_b[j];
-                                                    contact.Stick = true;
-                                                }
-                                                break;
-                                            }
-                                            // Eq. 15: separation in the contact basis, plus the normal row's margin.
-                                            const ContactBasis basis = MakeContactBasis(normal);
-                                            const float3 gap = WorldPoint(pose, contact.AnchorA) - WorldPoint(target_pose, contact.AnchorB);
-                                            contact.C0 = float3(dot(basis.Axis[0], gap), dot(basis.Axis[1], gap), dot(basis.Axis[2], gap)) + float3(p.ContactMargin, 0, 0);
-#endif
-                                            if (at == count) ++count;
-                                        }
+                                        CollectManifold(geometry, GeometryQuery{shape, target, pose, target_pose, shape_pose, target_shape_pose, own_poly, plane_patch, own_bounds.Center, target_bounds.Center, own_velocity, other_velocity, reach, weld, mesh_pair, plane_back, bool(p.ReportContacts)}, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
                                     }
                                 }
-                                if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+                                if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                             }
                         }
                     }
@@ -2916,7 +3082,9 @@ kernel void CollectContacts(
         }
     }
 
-    if (lane != 0) return;
+#endif
+
+    if (PREPARE_QUERIES || lane != 0) return;
 #if !SENSOR_PASS
     for (uint first = 0; first < count;) {
         const Index other = slots[first].BodyB;
@@ -2947,7 +3115,7 @@ kernel void CollectContacts(
         if (inherited[k] != NoIndex) claimed |= 1ul << inherited[k];
         events[reported++] = ContactEvent{body, slots[k].BodyB, slots[k].Feature, slots[k].SubShape, slots[k].Children, uint(inherited[k] != NoIndex ? ContactPersisted : ContactAdded), slots[k].SubShapeA};
     }
-    EndUnclaimed(events, contact_event_counts, body, claimed, reported, was_feature, was_other, was_sub, was_sub_a, was_children);
+    EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
 #endif
 }
 
@@ -3432,6 +3600,7 @@ kernel void UpdateColors(
     device const Contact *contacts [[buffer(5)]], device const BodyMass *masses [[buffer(4)]],
     device const Joint *joints [[buffer(16)]], device const Adjacency *incoming [[buffer(17)]],
     device const uint *incoming_slots [[buffer(18)]], device const uint *quiet [[buffer(21)]],
+    device const uint *joint_incidence [[buffer(20)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
     if (body >= p.BodyCount) return;
@@ -3454,7 +3623,8 @@ kernel void UpdateColors(
             NoteNeighbour(sweep, other, colors[other], body, my_quiet && quiet[other] > 0, degree, taken, taken_all);
         }
         // A joint couples two bodies as a contact does, and without this a jointed pair shares a color and races.
-        for (uint index = 0; index < p.JointCount; ++index) {
+        for (uint at = joint_incidence[body]; at < joint_incidence[body + 1]; ++at) {
+            const uint index = joint_incidence[at];
             const Index other = JointPartner(joints[index], body, masses);
             if (other == NoIndex) continue;
             NoteNeighbour(sweep, other, colors[other], body, my_quiet && quiet[other] > 0, degree, taken, taken_all);
@@ -3504,6 +3674,7 @@ kernel void SolveBodies(
     device const Contact *contacts [[buffer(5)]], device const uint *colors [[buffer(12)]],
     device const uint *cursor [[buffer(14)]], device const Joint *joints [[buffer(16)]],
     device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
+    device const uint *joint_incidence [[buffer(20)]],
     device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -3614,9 +3785,11 @@ kernel void SolveBodies(
         }
     }
 
-    for (uint first_joint = 0; first_joint < p.JointCount; first_joint += JointsPerBatch) {
+    const uint joint_start = joint_incidence[body], joint_count = joint_incidence[body + 1] - joint_start;
+    for (uint first_joint = 0; first_joint < joint_count; first_joint += JointsPerBatch) {
         BodyJointRows rows{};
-        const uint index = first_joint + worker / Dof;
+        const uint at = first_joint + worker / Dof;
+        const uint index = at < joint_count ? joint_incidence[joint_start + at] : NoIndex;
         if (worker < JointsPerBatch * Dof && index < p.JointCount) {
             const Joint joint = joints[index];
             rows.Valid = joint.Active && (joint.BodyA == body || joint.BodyB == body);
@@ -3670,7 +3843,7 @@ kernel void SolveBodies(
                 }
             }
         }
-        for (uint prepared_joint = 0; prepared_joint < min(JointsPerBatch, p.JointCount - first_joint); ++prepared_joint) {
+        for (uint prepared_joint = 0; prepared_joint < min(JointsPerBatch, joint_count - first_joint); ++prepared_joint) {
             const uint joint_source = base + prepared_joint * Dof;
             if (!simd_shuffle(uint(rows.Valid), joint_source)) continue;
             shared_color |= bool(simd_shuffle(uint(rows.Shared), joint_source));
@@ -3897,6 +4070,7 @@ kernel void SpreadWaking(
     device const Contact *contacts [[buffer(5)]], device const Joint *joints [[buffer(16)]],
     device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
     device const BodyMass *masses [[buffer(4)]], device const Velocity *velocities [[buffer(3)]],
+    device const uint *joint_incidence [[buffer(20)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
     if (body >= p.BodyCount) return;
@@ -3913,7 +4087,8 @@ kernel void SpreadWaking(
         // A body the solve skips has no quiet count, and its motion still has to wake whatever sleeps on it.
         else if (Driven(masses[other], velocities[other], p)) least = 0;
     }
-    for (uint index = 0; index < p.JointCount; ++index) {
+    for (uint at = joint_incidence[body]; at < joint_incidence[body + 1]; ++at) {
+        const uint index = joint_incidence[at];
         const Index other = JointPartner(joints[index], body, masses);
         if (other != NoIndex) least = min(least, quiet[other]);
     }
@@ -3926,4 +4101,78 @@ kernel void PublishWaking(
 ) {
     if (body >= p.BodyCount) return;
     quiet[body] = next[body];
+}
+
+kernel void FollowSensors(
+    device Pose *poses [[buffer(0)]], device Velocity *velocities [[buffer(3)]],
+    device const SensorFollower *followers [[buffer(26)]], uint index [[thread_position_in_grid]]
+) {
+    const SensorFollower follower = followers[index];
+    const Pose owner = poses[follower.Owner];
+    const Pose pose = ComposePose(owner, follower.Local);
+    Velocity velocity = velocities[follower.Owner];
+    velocity.Linear += cross(velocity.Angular, pose.Position - owner.Position);
+    poses[follower.Sensor] = pose;
+    velocities[follower.Sensor] = velocity;
+}
+
+kernel void PrepareStepColors(
+    device StepParams &p [[buffer(7)]], device const uint *colors [[buffer(12)]],
+    device const BodyMass *masses [[buffer(4)]], device uint *groups [[buffer(26)]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint used = 1;
+    for (uint body = lane; body < p.BodyCount; body += 32)
+        if (Moves(masses[body])) used = max(used, ColorOf(colors[body]) + 1);
+    const uint count = clamp(simd_max(used) + 1, 1u, p.MaxColors);
+    // All lanes read the old cap before lane zero replaces it with the current count.
+    simdgroup_barrier(mem_flags::mem_device);
+    if (lane == 0) p.MaxColors = count;
+    const uint packed = p.BodyCount > 32 ? SolveBodiesPerGroup : 1;
+    groups[lane * 3] = lane < count ? (p.BodyCount + packed - 1) / packed : 0;
+    groups[lane * 3 + 1] = groups[lane * 3 + 2] = 1;
+}
+
+kernel void CaptureStep(
+    device const Pose *poses [[buffer(0)]], device const Pose *initial [[buffer(1)]],
+    device const Velocity *velocities [[buffer(3)]], device const Contact *contacts [[buffer(5)]],
+    device const Contact *sensors [[buffer(6)]], constant StepParams &p [[buffer(7)]],
+    device ContactReport *out_contacts [[buffer(8)]], device const ContactEvent *events [[buffer(9)]],
+    device const uint *event_counts [[buffer(10)]], device Pose *out_initial [[buffer(11)]],
+    device const BroadPhaseNode *nodes [[buffer(13)]], device const uint *sensor_refusals [[buffer(14)]],
+    device Pose *out_poses [[buffer(15)]], device Velocity *out_velocities [[buffer(16)]],
+    device SensorPair *out_sensors [[buffer(17)]], device StepCounts *out_counts [[buffer(18)]],
+    device StepCompletion *completion [[buffer(19)]], constant StepOutputFlags &output [[buffer(20)]],
+    device ContactEvent *out_removed [[buffer(21)]],
+    device const uint *refusals [[buffer(26)]], uint body [[thread_position_in_grid]]
+) {
+    if (body >= p.BodyCount) return;
+    if (body == 0) {
+        const BroadPhaseNode root = nodes[BroadPhaseRoot(p.BodyCount)];
+        completion[0] = {p.MaxColors, root.Ready, root.Errors};
+    }
+    StepCounts count{0, 0, 0, refusals[body], output.Sensors ? sensor_refusals[body] : 0};
+    if (output.Poses) {
+        out_poses[body] = poses[body];
+        out_velocities[body] = velocities[body];
+    }
+    if (p.ReportContacts) {
+        out_initial[body] = initial[body];
+        for (uint i = 0; i < event_counts[body]; ++i) {
+            const ContactEvent event = events[body * EventsPerBody + i];
+            if (event.Kind == ContactRemoved) out_removed[body * ContactsPerBody + count.RemovedContacts++] = event;
+            else {
+                const uint slot = body * ContactsPerBody + count.Contacts++;
+                out_contacts[slot] = ReportContact(event, contacts[slot]);
+            }
+        }
+    }
+    if (output.Sensors) {
+        for (uint i = 0; i < ContactsPerBody; ++i) {
+            const Contact contact = sensors[body * ContactsPerBody + i];
+            if (!contact.Active) break;
+            out_sensors[body * ContactsPerBody + count.Sensors++] = {contact.BodyA, contact.BodyB, contact.Children};
+        }
+    }
+    out_counts[body] = count;
 }

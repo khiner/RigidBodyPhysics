@@ -12,7 +12,7 @@
 namespace rbp {
 
 namespace {
-// A freed slot first, then the tail, with a refusal counted when neither has room.
+
 Index TakeSlot(std::vector<Index> &free, uint32_t &used, uint32_t capacity, uint32_t &overflow) {
     if (!free.empty()) {
         const Index index = free.back();
@@ -24,17 +24,13 @@ Index TakeSlot(std::vector<Index> &free, uint32_t &used, uint32_t capacity, uint
     return NoIndex;
 }
 
-// A free slot at the end of a pool still costs a thread in every dispatch, so the tail is released while it is free.
-// A slot that is neither live nor on the free list is a body retired this step, which keeps its place until the next step reports its removals.
-// The trim stops there.
+// Trim free tail slots so GPU dispatches do not visit them.
 void TrimTail(uint32_t &used, std::vector<Index> &free, const auto &live) {
     while (used > 0 && !live(used - 1) && std::erase(free, used - 1) != 0) --used;
 }
 
 using double3 = simd::double3;
 
-// A unit quaternion as the matrix whose columns are the axes it turns onto.
-// In double because the tensor sum below is a difference of much larger numbers wherever a piece sits well off the whole's centre, as with CookHull's integral.
 void RotationMatrix(float4 q, double (&m)[3][3]) {
     const double x = q.x, y = q.y, z = q.z, w = q.w;
     m[0][0] = 1 - 2 * (y * y + z * z), m[0][1] = 2 * (x * y - z * w), m[0][2] = 2 * (x * z + y * w);
@@ -42,8 +38,6 @@ void RotationMatrix(float4 q, double (&m)[3][3]) {
     m[2][0] = 2 * (x * z - y * w), m[2][1] = 2 * (y * z + x * w), m[2][2] = 1 - 2 * (x * x + y * y);
 }
 
-// A compound's children taken together, in the frame their poses are written in: the volume, its centre, and the inertia tensor about that centre.
-// At unit density; collider surface materials do not affect mass.
 struct Aggregate {
     double Volume{};
     double3 Center{0, 0, 0};
@@ -62,10 +56,10 @@ Aggregate WeighChildren(const Shape &compound, std::span<const float3> vertices,
         if (child == NoIndex || child >= shapes.size()) break;
         const Shape &piece = shapes[child];
         const BodyMass own = MassProperties(piece, 1, vertices, shapes);
-        if (!(own.InvMass > 0)) continue; // surface leaves contribute no volume
+        if (!(own.InvMass > 0)) continue;
         Aggregate &mass = pieces.emplace_back();
         mass.Volume = 1 / double(own.InvMass);
-        // A shape's own frame is centred on its centre of mass, so Local's position is where that centre sits in the compound's frame.
+
         const float3 at = piece.Local.Position;
         mass.Center = double3{at.x, at.y, at.z};
         double turn[3][3];
@@ -89,18 +83,15 @@ Aggregate WeighChildren(const Shape &compound, std::span<const float3> vertices,
     }
     return whole;
 }
-// One face of a shape, in the frame the caller placed it in.
-// Indexed as the device indexes it: BoxFaceIndex for a box, and its place in the run for a hull. See InternalFaces.
+
 struct ShapeFace {
     uint32_t Index;
     float3 Normal;
-    float Offset; // dot(Normal, a point on it), so two coplanar faces facing each other sum to zero
+    float Offset;
     std::vector<float3> Corner;
     float Radius = 0;
 };
 
-// `local` is where this shape's geometry sits in the frame the faces are wanted in.
-// That is a compound child's Local, or a body's pose composed with it, which puts two static bodies in the world frame.
 std::vector<ShapeFace> ShapeFaces(const Shape &shape, Pose local, std::span<const float3> vertices, std::span<const HullFace> faces) {
     std::vector<ShapeFace> out;
     if (shape.Kind == ShapeBox) {
@@ -140,8 +131,6 @@ std::vector<ShapeFace> ShapeFaces(const Shape &shape, Pose local, std::span<cons
     return out;
 }
 
-// Whether every corner of `inner` lies within `outer`, both convex and in the same plane.
-// The inside of an edge is taken from the centroid rather than from a winding, because a box's faces and a hull cook's are wound by different rules.
 bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
     if (outer.Radius > 0) {
         for (const float3 corner : inner.Corner)
@@ -163,15 +152,12 @@ bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
     return true;
 }
 
-// Which faces of each piece another piece has buried, one bit each, indexed as the device indexes the face, with the pieces all in one frame.
-// A face counts only where the other's covers the whole of it, so a leg's top is buried in a slab and the slab's own bottom is not.
-// Symmetric, and so independent of the order the pieces come in.
 std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces, std::span<const CollisionMask> filters = {}) {
     float scale = 1e-6f;
     for (const auto &piece : pieces)
         for (const ShapeFace &face : piece)
             for (const float3 corner : face.Corner) scale = std::max(scale, simd::length(corner) + face.Radius);
-    // Relative to where the pieces are, because the rounding in a dot product scales with its inputs, as the hull cook's coplanarity epsilon does.
+
     const float tolerance = 1e-5f * scale;
     std::vector<uint32_t> masks(pieces.size(), 0);
     for (size_t i = 0; i < pieces.size(); ++i)
@@ -179,8 +165,8 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
             if (j == i || (!filters.empty() && !SameMask(filters[i], filters[j]))) continue;
             for (const ShapeFace &mine : pieces[i])
                 for (const ShapeFace &theirs : pieces[j]) {
-                    if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue; // not facing each other
-                    if (std::abs(mine.Offset + theirs.Offset) > tolerance) continue; // not in one plane
+                    if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue;
+                    if (std::abs(mine.Offset + theirs.Offset) > tolerance) continue;
                     if (Within(mine, theirs, tolerance)) masks[i] |= 1u << mine.Index;
                 }
         }
@@ -244,8 +230,6 @@ BodyMass MassProperties(const Shape &shape, float density, std::span<const float
     return {.InvInertiaLocal = 1 / inertia, .InvMass = 1 / mass};
 }
 
-// An authored mass takes precedence, only the host being able to supply one for a shape with no volume.
-// An authored zero passes through as a zero inverse, which is a locked axis. See AuthoredMass.
 BodyMass World::ShapeOrAuthoredMass(Index shape, float density, std::optional<AuthoredMass> authored) const {
     if (authored) {
         const auto [mass, inertia] = *authored;
@@ -254,16 +238,13 @@ BodyMass World::ShapeOrAuthoredMass(Index shape, float density, std::optional<Au
     return shape == NoIndex ? StaticMass : MassProperties(Shapes[shape], density, ShapeVertices.All(), Shapes.All(), CompoundChildren.All());
 }
 
-// See BodyDesc::Mass.
-// The computed mass decides this rather than the shape's kind, a static body having no mass properties about a point to get wrong.
-// Only the quaternion's vector part is checked, a zero vector part being the identity whichever sign w carries.
+// Offset collider frames require authored body-frame mass properties.
 bool World::OffsetNeedsAuthoredMass(Index shape, const BodyMass &mass, bool authored) const {
     if (authored || shape == NoIndex || !Moves(mass)) return false;
     const auto [at, turn] = Shapes[shape].Local;
     return at.x != 0 || at.y != 0 || at.z != 0 || turn.x != 0 || turn.y != 0 || turn.z != 0;
 }
 
-// Zero initialization makes allocator reuse independent of previous worlds.
 template<typename T> void World::MakeBuffer(mtl::Buffer<T> &buffer, uint32_t capacity) {
     buffer = {Queue->device(), capacity};
     std::ranges::fill(buffer.All(), T{});
@@ -272,11 +253,10 @@ template<typename T> void World::MakeBuffer(mtl::Buffer<T> &buffer, uint32_t cap
 
 World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Queue) {
     auto *device = context.Device.get();
-    // Metal 4 has no implicit residency tracking, so everything a kernel can reach is in one set attached to the queue for the world's lifetime.
-    // The destructor takes it off again.
+    // Metal 4 requires explicit residency for every resource a shader can reach.
     NS::Error *error{};
     Residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
-    // In the order World declares them, so the header's grouping by access pattern reads the same here.
+
     MakeBuffer(Poses, limits.Bodies);
     MakeBuffer(Velocities, limits.Bodies);
     MakeBuffer(Masses, limits.Bodies);
@@ -290,6 +270,7 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     MakeBuffer(CompoundChildren, limits.CompoundChildren);
     MakeBuffer(Filters, limits.Bodies);
     MakeBuffer(Jointed, limits.Bodies + 1 + 2 * limits.Joints);
+    MakeBuffer(JointIncidence, limits.Bodies + 1 + 2 * limits.Joints);
     MakeBuffer(Bounds, limits.Bodies);
     MakeBuffer(BoundsReductions, RadixBlocks(limits.Bodies) + 1);
     MakeBuffer(BroadPhaseNodes, 2 * limits.Bodies);
@@ -317,6 +298,8 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     Queue->addResidencySet(Residency.get());
 
     std::ranges::fill(Jointed.All().first(limits.Bodies + 1), limits.Bodies + 1);
+    std::ranges::fill(JointIncidence.All().first(limits.Bodies + 1), limits.Bodies + 1);
+
     for (auto *buffer : {&BodyShapes, &IncomingSlots}) std::ranges::fill(buffer->All(), NoIndex);
 
     VertexPool.Capacity = limits.ShapeVertices;
@@ -331,14 +314,12 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
 }
 
 World::~World() {
-    // Null in a world that has been moved from, which owns nothing.
     if (Queue && Residency) {
         Queue->removeResidencySet(Residency.get());
-        mtl::Drain(Queue.get()); // the removal reaches the driver before this returns. See mtl::Drain.
+        mtl::Drain(Queue.get());
     }
 }
 
-// First fit rather than best fit, because a freed run is usually the size asked for next: a mesh replaced by an edited version of itself needs the same length.
 Index World::RunPool::Take(uint32_t count) {
     for (auto run = Free.begin(); run != Free.end(); ++run) {
         if (run->Count < count) continue;
@@ -354,8 +335,8 @@ Index World::RunPool::Take(uint32_t count) {
 }
 
 void World::RunPool::Give(Index start, uint32_t count) {
-    if (count == 0 || start == NoIndex) return; // a run the pool refused, so there is nothing to release
-    // Back onto the tail if that is where it came from, so a shape added and taken away leaves nothing.
+    if (count == 0 || start == NoIndex) return;
+
     if (start + count == Used) {
         Used = start;
         while (!Free.empty() && Free.back().Start + Free.back().Count == Used) {
@@ -366,7 +347,7 @@ void World::RunPool::Give(Index start, uint32_t count) {
     }
     const auto at = std::ranges::lower_bound(Free, start, {}, &Run::Start);
     const auto run = Free.insert(at, {start, count});
-    // Merge with the neighbour on each side, the later one first so the earlier merge does not move it.
+
     const auto next = run + 1;
     if (next != Free.end() && run->Start + run->Count == next->Start) {
         run->Count += next->Count;
@@ -378,7 +359,6 @@ void World::RunPool::Give(Index start, uint32_t count) {
     }
 }
 
-// Both directions: this body's own run holds the contacts where it is A, and last step's incoming list the ones where it is B.
 void World::Wake(Index body) {
     Quiet[body] = 0;
     for (uint32_t i = 0; i < ContactsPerBody; ++i) {
@@ -392,13 +372,7 @@ void World::Wake(Index body) {
     }
 }
 
-// This body's appearances in other bodies' runs are found by scanning the pool, deliberately not by walking Incoming.
-// Incoming is last step's gather, and an earlier mutation in the same between-steps window may have compacted slots since.
-// The list can therefore miss contacts the pool still holds.
-//
-// A run another body owns is compacted from its tail as this empties slots out of its middle, because a run must stay dense from zero.
-// Every reader stops at the first inactive slot.
-// The surviving order changes, which is safe because a contact is matched by feature rather than by slot.
+// Host removals can invalidate incoming adjacency, so scan contact storage directly.
 void World::EndContacts(Index body) {
     EndSensorOverlaps(body);
     const auto end = [this](Contact &contact) {
@@ -484,12 +458,24 @@ void World::EndSensorOverlaps(Index body) {
     }
 }
 
-void World::UpdateSensorOverlaps() {
-    if (!SensorContacts.Handle) return;
+void World::UpdateSensorOverlaps(const StepSnapshot &snapshot) {
+    if (SensorOverlaps.empty() && (snapshot.Counts.empty() ? !SensorContacts.Handle : snapshot.Sensors.empty())) return;
     std::vector<SensorOverlap> current;
-    // The narrowphase emits one point per overlapping leaf pair, in body/slot order.
-    for (const Contact &contact : SensorContacts.All().first(NumBodies * ContactsPerBody))
-        if (contact.Active) current.push_back({IdOf(contact.BodyA), IdOf(contact.BodyB), contact.Children});
+    current.reserve(SensorOverlaps.size());
+    for (Index body = 0; body < NumBodies; ++body) {
+        if (!snapshot.Counts.empty()) {
+            for (uint32_t i = 0; i < snapshot.Counts[body].Sensors; ++i) {
+                const auto pair = snapshot.Sensors[body * ContactsPerBody + i];
+                current.push_back({IdOf(pair.BodyA), IdOf(pair.BodyB), pair.Children});
+            }
+        } else if (SensorContacts.Handle) {
+            for (uint32_t i = 0; i < ContactsPerBody; ++i) {
+                const Contact &contact = SensorContacts[body * ContactsPerBody + i];
+                if (!contact.Active) break;
+                current.push_back({IdOf(contact.BodyA), IdOf(contact.BodyB), contact.Children});
+            }
+        }
+    }
     if (TrackSensors) {
         for (const auto &pair : SensorOverlaps)
             if (std::ranges::find(current, pair) == current.end()) SensorChanges.push_back({pair, false});
@@ -499,20 +485,28 @@ void World::UpdateSensorOverlaps() {
     SensorOverlaps = std::move(current);
 }
 
-// A live contact's event takes its excitation record by position rather than by search.
-// CollectContacts writes one event per live slot in slot order before EndUnclaimed appends the removals.
-// A body's added and persisted events are therefore its contact run, in order.
-void World::DrainContactEvents(float delta_time) {
+// Live event positions correspond to the finalized contact run.
+void World::DrainContactEvents(float delta_time, const StepSnapshot &snapshot) {
     if (!TrackContacts) return;
-    const auto side = [this](Index body, uint32_t child, float3 point, float3 anchor) -> ContactSide {
+    const auto initial = snapshot.InitialPoses.empty() ? InitialPoses.All() : snapshot.InitialPoses;
+    const auto poses = snapshot.Poses.empty() ? Poses.All() : snapshot.Poses;
+    const auto velocities = snapshot.Velocities.empty() ? Velocities.All() : snapshot.Velocities;
+    const auto side = [&](Index body, uint32_t child, float3 point, float3 anchor) -> ContactSide {
         const Index root = BodyShapes[body];
         const auto user_data = Shapes[Shapes[root].Kind == ShapeCompound ? Child(root, child) : root].UserData;
-        return {InitialPoses[body], Poses[body], Velocities[body], point, anchor, user_data, Masses[body].InvMass};
+        return {initial[body], poses[body], velocities[body], point, anchor, user_data, Masses[body].InvMass};
     };
     for (Index body = 0; body < NumBodies; ++body) {
         uint32_t live = 0;
-        for (uint32_t i = 0; i < ContactEventCounts[body]; ++i) {
-            const ContactEvent &event = ContactEvents[body * EventsPerBody + i];
+        const uint32_t count = snapshot.Counts.empty() ? ContactEventCounts[body] : snapshot.Counts[body].Contacts + snapshot.Counts[body].RemovedContacts;
+        for (uint32_t i = 0; i < count; ++i) {
+            ContactReport report;
+            if (snapshot.Counts.empty()) {
+                const ContactEvent event = ContactEvents[body * EventsPerBody + i];
+                report = ReportContact(event, event.Kind == ContactRemoved ? Contact{} : Contacts[body * ContactsPerBody + live++]);
+            } else if (i < snapshot.Counts[body].Contacts) report = snapshot.Contacts[body * ContactsPerBody + i];
+            else report = {.Event = snapshot.RemovedContacts[body * ContactsPerBody + i - snapshot.Counts[body].Contacts]};
+            const ContactEvent &event = report.Event;
             ContactChange change{
                 .A = IdOf(event.BodyA),
                 .B = IdOf(event.BodyB),
@@ -525,7 +519,7 @@ void World::DrainContactEvents(float delta_time) {
                 .DeltaTime = delta_time,
             };
             if (change.Kind != ContactRemoved) {
-                const Contact &contact = Contacts[body * ContactsPerBody + live++];
+                const ContactReport &contact = report;
                 change.Lambda = contact.Lambda;
                 change.Approach = contact.Approach;
                 change.BounceImpulse = contact.BounceImpulse;
@@ -553,20 +547,17 @@ Index World::AddShape(const Shape &shape) {
 Index World::AddHull(std::span<const float3> points, Pose *frame, std::optional<Pose> local) {
     const CookedHull cooked = CookHull(points);
     const uint32_t count = cooked.Vertices.size(), face_count = cooked.Faces.size();
-    if (count == 0) return NoIndex; // no solid, so no shape to make of it
+    if (count == 0) return NoIndex;
     if (frame != nullptr) *frame = cooked.Frame;
-    // The caller's frame first and the cook's underneath it.
-    // The other order would move the caller's offset by however far the cook shifted the centroid, a distance the caller never saw.
     const Pose shape_local = local ? ComposePose(*local, cooked.Frame) : IdentityPose;
-    // Both runs up front, and the refusal is counted against whichever pool refused first.
-    // The cook has already brought the corner count under MaxHullVertices, so only a full pool can refuse here.
+
     const Index first = VertexPool.Take(count);
     const Index first_face = FacePool.Take(face_count);
     uint32_t *refused = nullptr;
     if (first == NoIndex) refused = &Overflow.ShapeVertices;
     else if (first_face == NoIndex) refused = &Overflow.HullFaces;
     const Index shape = refused != nullptr ? NoIndex : AddShape({.FirstVertex = first, .VertexCount = count, .FirstFace = first_face, .FaceCount = face_count, .Kind = ShapeHull, .Local = shape_local});
-    if (shape == NoIndex) { // on any refusal, release every run this took
+    if (shape == NoIndex) {
         VertexPool.Give(first, count);
         FacePool.Give(first_face, face_count);
         if (refused != nullptr) ++*refused;
@@ -579,9 +570,9 @@ Index World::AddHull(std::span<const float3> points, Pose *frame, std::optional<
 
 Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> indices, Pose local) {
     const CookedMesh cooked = CookMesh(points, indices);
-    if (cooked.Triangles.empty()) return NoIndex; // no surface, so no shape to make of it
+    if (cooked.Triangles.empty()) return NoIndex;
     const uint32_t vertices = cooked.Vertices.size(), triangles = cooked.Triangles.size(), nodes = cooked.Nodes.size();
-    // All three runs up front, as AddHull takes its two, so one exit releases whatever was taken.
+
     const Index first_vertex = VertexPool.Take(vertices);
     const Index first_triangle = TrianglePool.Take(triangles);
     const Index root = NodePool.Take(nodes);
@@ -599,7 +590,7 @@ Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> i
     }
 
     std::ranges::copy(cooked.Vertices, ShapeVertices.All().begin() + first_vertex);
-    // Triangles index the pool absolutely, so a kernel reads a corner without resolving which mesh it belongs to.
+
     for (uint32_t i = 0; i < triangles; ++i) {
         Triangle triangle = cooked.Triangles[i];
         triangle.A += first_vertex;
@@ -607,7 +598,7 @@ Index World::AddMesh(std::span<const float3> points, std::span<const uint32_t> i
         triangle.C += first_vertex;
         Triangles[first_triangle + i] = triangle;
     }
-    // Nodes stay relative to their own root, because a traversal starts there.
+
     std::ranges::copy(cooked.Nodes, BvhNodes.All().begin() + root);
     return shape;
 }
@@ -665,7 +656,7 @@ void World::ReleaseShape(Index shape) {
         TrianglePool.Give(held.FirstTriangle, held.TriangleCount);
         NodePool.Give(held.RootNode, held.NodeCount);
     }
-    // A compound owns its children, so they are released with it. One level deep, a child never being a compound.
+
     if (held.Kind == ShapeCompound) {
         for (Index child : CompoundChildren.All().subspan(held.FirstVertex, held.VertexCount)) ReleaseShape(child);
         ChildPool.Give(held.FirstVertex, held.VertexCount);
@@ -794,8 +785,6 @@ uint32_t World::WeldStatic() {
     return buried;
 }
 
-// A weld copy belongs to the weld rather than to the host, so it is released with the body that wore it.
-// The slot is cleared first so the release goes through RemoveShape, which refuses a shape while a second body wears it.
 void World::DropWeld(Index body) {
     const Index copy = WeldedShapes[body];
     if (copy == NoIndex) return;
@@ -805,7 +794,6 @@ void World::DropWeld(Index body) {
 }
 
 Index World::AddBody(const BodyDesc &desc) {
-    // Before a slot is taken, so a body the engine cannot integrate about its own frame is refused rather than half made. See BodyDesc::Mass.
     BodyMass mass = ShapeOrAuthoredMass(desc.Shape, desc.Density, desc.Mass);
     if (OffsetNeedsAuthoredMass(desc.Shape, mass, desc.Mass.has_value())) {
         ++OffsetsWithoutMass;
@@ -814,11 +802,9 @@ Index World::AddBody(const BodyDesc &desc) {
     const Index index = TakeSlot(FreeBodies, NumBodies, Poses.Capacity, Overflow.Bodies);
     if (index == NoIndex) return NoIndex;
     LiveBodies[index] = 1;
-    // A new tenancy, so anything holding the last tenant's identity stops matching. See BodyId.
+
     ++Spawns[index];
-    // A reused slot has to arrive in the state a fresh one would, or a scene's outcome depends on the body that held the slot before.
-    // Most per-body lanes are written by a step before anything reads them, and EndContacts emptied the contact run.
-    // The color and the incoming list are neither, so they are reset here.
+    // Reset reused slots to fresh-body state so retirement cannot leak solver history.
     Colors[index] = 0;
     Incoming[index] = {};
     Poses[index] = desc.Pose;
@@ -829,8 +815,11 @@ Index World::AddBody(const BodyDesc &desc) {
     RestPoses[index] = desc.Pose;
     Materials[index] = desc.Surface.value_or(Material{desc.Friction, desc.Friction, desc.Restitution, CombineGeometricMean, CombineMaximum});
     Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor};
-    if (index + 1 == NumBodies) Jointed[index + 1] = Jointed[index];
-    // Mass properties come from the shape and motion properties from the body, sharing one lane because Integrate reads that lane.
+    if (index + 1 == NumBodies) {
+        Jointed[index + 1] = Jointed[index];
+        JointIncidence[index + 1] = JointIncidence[index];
+    }
+
     mass.GravityScale = desc.GravityScale;
     mass.LinearDamping = desc.LinearDamping;
     mass.AngularDamping = desc.AngularDamping;
@@ -839,7 +828,7 @@ Index World::AddBody(const BodyDesc &desc) {
 }
 
 namespace {
-// Three axis modes packed into the word the kernels read them out of, three bits each.
+
 uint32_t Modes(const JointAxisMode (&axes)[3]) {
     return uint32_t(axes[0]) | (uint32_t(axes[1]) << 3) | (uint32_t(axes[2]) << 6);
 }
@@ -905,41 +894,46 @@ Index World::AddJoint(const JointDesc &desc) {
 }
 
 void World::RebuildJointed() {
+    TrimTail(NumJoints, FreeJoints, [this](Index at) { return Joints[at].Active != 0; });
     std::vector<Index> cursor(NumBodies, 0);
-    for (Index i = 0; i < NumJoints; ++i) {
-        const Joint &joint = Joints[i];
-        if (!joint.Active || !joint.Suppresses) continue;
-        ++cursor[joint.BodyA];
-        ++cursor[joint.BodyB];
-    }
-    Index end = Poses.Capacity + 1;
-    for (Index body = 0; body < NumBodies; ++body) {
-        Jointed[body] = end;
-        end += cursor[body];
-        cursor[body] = Jointed[body];
-    }
-    Jointed[NumBodies] = end;
-    for (Index i = 0; i < NumJoints; ++i) {
-        const Joint &joint = Joints[i];
-        if (!joint.Active || !joint.Suppresses) continue;
-        Jointed[cursor[joint.BodyA]++] = joint.BodyB;
-        Jointed[cursor[joint.BodyB]++] = joint.BodyA;
+    for (const bool suppressing : {false, true}) {
+        auto &links = suppressing ? Jointed : JointIncidence;
+        std::ranges::fill(cursor, 0);
+        for (Index i = 0; i < NumJoints; ++i) {
+            const Joint &joint = Joints[i];
+            if (!joint.Active || (suppressing && !joint.Suppresses)) continue;
+            ++cursor[joint.BodyA];
+            ++cursor[joint.BodyB];
+        }
+        Index end = Poses.Capacity + 1;
+        for (Index body = 0; body < NumBodies; ++body) {
+            links[body] = end;
+            end += cursor[body];
+            cursor[body] = links[body];
+        }
+        links[NumBodies] = end;
+        for (Index i = 0; i < NumJoints; ++i) {
+            const Joint &joint = Joints[i];
+            if (!joint.Active || (suppressing && !joint.Suppresses)) continue;
+            links[cursor[joint.BodyA]++] = suppressing ? joint.BodyB : i;
+            links[cursor[joint.BodyB]++] = suppressing ? joint.BodyA : i;
+        }
     }
 }
 
 bool World::RemoveBody(Index body) {
     if (!Alive(body)) return false;
     Wake(body);
-    // Its joints go with it.
-    // A removed body has no mass, so a joint to it would read as a joint to static geometry and go on holding the live end to a pose nothing maintains.
+
+    bool removed_joints = false;
     for (Index joint = 0; joint < NumJoints; ++joint) {
         const Joint &held = Joints[joint];
-        if (held.Active && (held.BodyA == body || held.BodyB == body)) RemoveJoint(joint);
+        if (held.Active && (held.BodyA == body || held.BodyB == body)) removed_joints |= RetireJoint(joint);
     }
-    // After Wake, which reads the runs this empties.
-    // The removed body's slot is left with no shape and no mass, the condition every per-body kernel early-outs on.
+    if (removed_joints) RebuildJointed();
+    // Wake before clearing the contact runs it traverses.
     EndContacts(body);
-    DropWeld(body); // the weld's copy is released with it, and the faces it buried are faces again
+    DropWeld(body);
     BodyShapes[body] = NoIndex;
     Masses[body] = StaticMass;
     Velocities[body] = {};
@@ -948,17 +942,19 @@ bool World::RemoveBody(Index body) {
     return true;
 }
 
-bool World::RemoveJoint(Index joint) {
+bool World::RetireJoint(Index joint) {
     if (joint >= NumJoints || !Joints[joint].Active) return false;
     const Joint &held = Joints[joint];
-    // Whatever the joint was holding up is now falling, and nothing else wakes either end.
+
     Quiet[held.BodyA] = 0;
     Quiet[held.BodyB] = 0;
     Joints[joint].Active = 0;
     FreeJoints.push_back(joint);
-    // A joint carries nothing across steps that a kernel must read first, so its slot is free at once.
-    // Every body scans the whole joint pool once per color per iteration.
-    TrimTail(NumJoints, FreeJoints, [this](Index at) { return Joints[at].Active != 0; });
+    return true;
+}
+
+bool World::RemoveJoint(Index joint) {
+    if (!RetireJoint(joint)) return false;
     RebuildJointed();
     return true;
 }
@@ -966,8 +962,8 @@ bool World::RemoveJoint(Index joint) {
 bool World::RemoveShape(Index shape) {
     if (shape >= NumShapes || !LiveShapes[shape]) return false;
     for (Index body = 0; body < NumBodies; ++body)
-        if (LiveBodies[body] && BodyShapes[body] == shape) return false; // a live body still uses it
-    // And a child belongs to its compound, which would be left naming a reassigned slot.
+        if (LiveBodies[body] && BodyShapes[body] == shape) return false;
+
     for (Index other = 0; other < NumShapes; ++other) {
         if (!LiveShapes[other] || Shapes[other].Kind != ShapeCompound) continue;
         const Shape parent = Shapes[other];
@@ -985,19 +981,15 @@ bool World::RemoveShape(Index shape) {
 bool World::SetBodyShape(Index body, Index shape, float density, std::optional<AuthoredMass> authored) {
     if (!Alive(body)) return false;
     if (shape != NoIndex && (shape >= NumShapes || !LiveShapes[shape])) return false;
-    // Computed before anything is written, so a shape the engine cannot integrate about the body's frame leaves the body exactly as it was. See BodyDesc::Mass.
+
     BodyMass mass = ShapeOrAuthoredMass(shape, density, authored);
     if (OffsetNeedsAuthoredMass(shape, mass, authored.has_value())) {
         ++OffsetsWithoutMass;
         return false;
     }
     Wake(body);
-    // Its contacts go with the geometry that made them, on both sides of the manifold.
-    // A warm-started contact is matched by a feature naming faces and vertices of the replaced shape.
-    // An identically named feature of the new shape would otherwise inherit the old dual, penalty and anchors.
     EndContacts(body);
-    // And the weld's copy of the replaced geometry is released with it, unless the body has been handed the copy it already wears.
-    // A host that read BodyShapes back passes that copy.
+
     if (shape != WeldedShapes[body]) DropWeld(body);
     BodyShapes[body] = shape;
     const BodyMass held = Masses[body];
@@ -1008,17 +1000,15 @@ bool World::SetBodyShape(Index body, Index shape, float density, std::optional<A
     return true;
 }
 
-void World::OnStepped(float delta_time) {
+void World::OnStepped(float delta_time, const StepSnapshot &snapshot) {
     ++CompletedSteps;
-    UpdateSensorOverlaps();
-    // The step's events first, so the queue holds every event of the step before RemoveBody or SetBodyShape can append a synthesized removal.
-    DrainContactEvents(delta_time);
-    // A body removed between steps is not recycled until a step has run.
-    // The event runs the previous step wrote still name it until this step overwrites them, and a slot standing idle for the step keeps those readable.
-    // BodyId's spawn counter covers anything held longer.
+    UpdateSensorOverlaps(snapshot);
+
+    DrainContactEvents(delta_time, snapshot);
+    // Delay body-slot reuse until completed reporting no longer refers to its previous occupant.
     for (const Index body : RetiredBodies) FreeBodies.push_back(body);
     RetiredBodies.clear();
-    // And only then the tail, since a body waiting to report its removals keeps its place to do so.
+
     TrimTail(NumBodies, FreeBodies, [this](Index at) { return LiveBodies[at] != 0; });
 }
 

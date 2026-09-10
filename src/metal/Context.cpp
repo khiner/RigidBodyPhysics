@@ -45,7 +45,7 @@ void Drain(MTL4::CommandQueue *queue) {
     reported.acquire();
 }
 
-NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view source, const char *name, std::string_view prefix) const {
+NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view source, const char *name, std::string_view prefix, bool safe_math) const {
     const auto text = std::format("{}\n{}\n{}", gpu::SharedSource, prefix, source);
     NS::Error *error{};
     // RBP_MATH=safe compiles without fast math.
@@ -54,7 +54,7 @@ NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view sour
     // Safe math separates a build-to-build divergence from a real defect: agreement under it means the difference is rounding.
     const char *const math = getenv("RBP_MATH");
     auto options = Make<MTL::CompileOptions>();
-    if (math != nullptr && std::string_view{math} == "safe") options->setMathMode(MTL::MathModeSafe);
+    if (safe_math || (math != nullptr && std::string_view{math} == "safe")) options->setMathMode(MTL::MathModeSafe);
     auto library = NS::TransferPtr(Device->newLibrary(NS::String::string(text.c_str(), NS::UTF8StringEncoding), options.get(), &error));
     if (!library) throw std::runtime_error(std::format("Compiling {}: {}", name, Describe(error)));
 
