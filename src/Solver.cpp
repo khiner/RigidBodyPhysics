@@ -19,11 +19,6 @@ constexpr uint32_t BindingCount = 31;
 constexpr uint32_t BatchSteps = 16;
 constexpr uint64_t BatchBytes = 32 * 1024 * 1024;
 
-// Sweeps of the restitution pass over its contacts.
-// The pass is Jacobi: every contact computes an impulse from one velocity snapshot, and a gather applies them.
-// Each point of a manifold therefore takes the whole approach speed on the first sweep, and later sweeps divide it between them.
-// Four is convergence, with eight and sixteen bit-identical.
-constexpr uint32_t RestitutionPasses = 4;
 
 // The number of colors a sweep dispatches.
 // Coloring is incremental, so last step's count carries over, plus one spare for the contacts a closing scene adds.
@@ -35,15 +30,18 @@ uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
     return std::clamp(used + 1, 1u, std::max(1u, std::min(settings.MaxColors, MaxSupportedColors)));
 }
 
-constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2, MeshQueries = 4, RestitutionMaterials = 8;
+constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2, MeshQueries = 4, RestitutionMaterials = 8, FullStepGeometry = 16;
+constexpr uint32_t FullStepBodyLimit = 9;
+static_assert(FullStepBodyLimit <= SolveLanes);
 
 uint32_t ColliderFeatures(const World &world) {
     uint32_t features = 0;
-    bool mesh_seen = false;
+    bool mesh_seen = false, full_step_geometry = true;
     for (Index body = 0; body < world.BodyCount(); ++body) {
         const Index root = world.BodyShapes[body];
         if (root == NoIndex) continue;
         const Shape &shape = world.Shapes[root];
+        full_step_geometry &= shape.Kind == ShapeBox || shape.Kind == ShapeSphere || shape.Kind == ShapeCapsule || shape.Kind == ShapePlane;
         if (world.Materials[body].Restitution != 0 || (shape.HasMaterial && shape.Surface.Restitution != 0)) features |= RestitutionMaterials;
         bool mesh = shape.Kind == ShapeMesh;
         features |= IsBoundedPlane(shape) ? BoundedPlanes : 0u;
@@ -59,7 +57,7 @@ uint32_t ColliderFeatures(const World &world) {
         mesh_seen |= mesh;
         if (features == (BoundedPlanes | MeshPairs | MeshQueries | RestitutionMaterials)) break;
     }
-    return features;
+    return features | (full_step_geometry ? FullStepGeometry : 0u);
 }
 
 // The kernel each pass runs, in the order of Solver::Pass.
@@ -78,9 +76,8 @@ constexpr struct {
     {"RefitRadixTree"},
     {"RefreshRadixLeaves"},
     {"BuildSmallBroadPhase"},
-    {"BuildBodyBounds"},
+    {"BuildBodyBounds", "#define INTEGRATE_BOUNDS 1"},
     {"BuildBodyBounds", "#define SENSOR_PASS 1"},
-    {"Integrate"},
     {"CollectContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0"},
     {"ScanIncoming"},
     {"ScanIncomingBlocks"},
@@ -93,18 +90,18 @@ constexpr struct {
     {"PublishColors"},
     {"SolveBodies"},
     {"PublishPoses"},
-    {"UpdateDuals"},
-    {"UpdateJointDuals"},
+    {"UpdateDuals", "#define MIXED_ISLAND_SOLVE 1"},
+    {"UpdateJointDuals", "#define MIXED_ISLAND_SOLVE 1"},
     {"Finalize"},
     {"Restitution"},
     {"ApplyRestitution"},
     {"SolveBodies", "#define STABILIZE 1"},
-    {"CountQuiet"},
-    {"SpreadWaking"},
-    {"PublishWaking"},
+    {"FinishPoses"},
+    {"FinishWaking"},
     {"FollowSensors"},
     {"PrepareStepColors"},
     {"CaptureStep"},
+    {"CaptureStep", "#define FINISH_WAKING_CAPTURE 1"},
     {"CollectSensorContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
     {"CollectContacts", "#define MESH_PAIRS 0"},
     {"CollectSensorContacts", "#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
@@ -122,13 +119,17 @@ constexpr struct {
     {"ResetQueryReuse"},
     {"CheckQueryInputs"},
     {"CheckQueryGeometry"},
-    {"BuildBodyBounds", "#define CACHE_BOUNDS_HINT 1"},
+    {"BuildBodyBounds", "#define CACHE_BOUNDS_HINT 1\n#define INTEGRATE_BOUNDS 1"},
     {"InitializeIslands"},
     {"UnionIslands"},
     {"PackIslands"},
     {"FinishIslands"},
     {"SolveIslands", "#define FUSED_SMALL_SOLVE 1\n#define FUSED_GENERAL_SOLVE 1\n#define SolveSmallWorld SolveIslands"},
     {"PrepareSmallWorld"},
+    {"CollectContacts", "#define MESH_SHAPES 0\n#define MESH_PAIRS 0\n#define BOUNDED_PLANES 0"},
+    {"CollectSensorContacts", "#define MESH_SHAPES 0\n#define MESH_PAIRS 0\n#define BOUNDED_PLANES 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
+    {"CollectContacts", "#define MESH_SHAPES 0\n#define MESH_PAIRS 0"},
+    {"CollectSensorContacts", "#define MESH_SHAPES 0\n#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
 };
 } // namespace
 
@@ -154,8 +155,7 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
     SmallIslands = {context.Device.get(), SolveLanes};
     ColorScratch = {context.Device.get(), 1};
     OutputFlags = {context.Device.get(), 1};
-    // One slot per color, holding its own index, so a color pass is selected by the slot the cursor binding points at.
-    // No counting kernel is dispatched between colors.
+    FullData = {context.Device.get(), BatchSteps};
     ColorCursor = {context.Device.get(), MaxSupportedColors + 2};
     for (uint32_t color = 0; color < MaxSupportedColors; ++color) ColorCursor[color] = color;
     Residency = NS::TransferPtr(context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
@@ -164,6 +164,7 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
     Residency->addAllocation(SmallIslands.Handle.get());
     Residency->addAllocation(ColorScratch.Handle.get());
     Residency->addAllocation(OutputFlags.Handle.get());
+    Residency->addAllocation(FullData.Handle.get());
     Residency->addAllocation(ColorCursor.Handle.get());
     Residency->commit();
     Residency->requestResidency();
@@ -176,7 +177,7 @@ Solver::~Solver() {
 }
 
 void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads, uint32_t lanes, uint64_t indirect, CollectionMode mode) {
-    const bool collector = pass == CollectPass || pass == SensorPass || (pass >= BoundedCollectPass && pass <= FullSensorPass);
+    const bool collector = pass == CollectPass || pass == SensorPass || (pass >= BoundedCollectPass && pass <= FullSensorPass) || (pass >= NativeCollectPass && pass <= NativeBoundedSensorPass);
     const bool primal = pass == SolvePass || pass == StabilizePass;
     const bool bounds = pass == BoundsPass || pass == SensorBoundsPass || pass == CacheBoundsPass;
     const uint32_t variant = collector ? uint32_t(threads > RadixSimdWidth) + 2 * uint32_t(lanes > 1) :
@@ -537,6 +538,72 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Table->setAddress(Followers.Address() + range.First * sizeof(SensorFollower), 26);
         Dispatch(encoder, FollowPass, range.Count);
     }
+    if (bodies <= FullStepBodyLimit && !joints && (recording.ColliderFeatures & FullStepGeometry) && !(recording.ColliderFeatures & BoundedPlanes)) {
+        if (!FullPipeline) {
+            FullPipeline = Context.Pipeline(gpu::FullStepSource, "FullStep");
+            if (FullPipeline->threadExecutionWidth() != SolveLanes || FullPipeline->maxTotalThreadsPerThreadgroup() < SmallSolveWaves * SolveLanes)
+                throw std::runtime_error("The complete step requires eight 32-lane SIMD groups");
+        }
+        const uint64_t output = Outputs.Address() + recording.Parameter * Layout.Stride;
+        FullData[recording.Parameter] = {
+            .poses = world.Poses.Address(),
+            .initial = world.InitialPoses.Address(),
+            .inertial = world.InertialPoses.Address(),
+            .velocities = world.Velocities.Address(),
+            .masses = world.Masses.Address(),
+            .contacts = world.Contacts.Address(),
+            .body_shapes = world.BodyShapes.Address(),
+            .shapes = world.Shapes.Address(),
+            .previous = world.PreviousVelocities.Address(),
+            .displacements = world.Displacements.Address(),
+            .iterates = world.Iterates.Address(),
+            .colors = world.Colors.Address(),
+            .next = world.NextColors.Address(),
+            .bounds = world.Bounds.Address(),
+            .nodes = world.BroadPhaseNodes.Address(),
+            .materials = world.Materials.Address(),
+            .compound_children = world.CompoundChildren.Address(),
+            .joints = world.Joints.Address(),
+            .incoming = world.Incoming.Address(),
+            .incoming_slots = world.IncomingSlots.Address(),
+            .filters = world.Filters.Address(),
+            .jointed_to = world.Jointed.Address(),
+            .joint_incidence = world.JointIncidence.Address(),
+            .quiet = world.Quiet.Address(),
+            .rest = world.RestPoses.Address(),
+            .next_quiet = world.NextQuiet.Address(),
+            .contact_events = world.ContactEvents.Address(),
+            .contact_event_counts = world.ContactEventCounts.Address(),
+            .contact_refusals = world.ContactRefusals.Address(),
+            .hull_vertices = world.ShapeVertices.Address(),
+            .mesh_triangles = world.Triangles.Address(),
+            .bvh_nodes = world.BvhNodes.Address(),
+            .hull_faces = world.HullFaces.Address(),
+            .sensors = world.SensorContacts.Address(),
+            .sensor_refusals = world.SensorRefusals.Address(),
+            .budgets = ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t),
+            .islands = SmallIslands.Address(),
+            .params = Params.Address() + recording.Parameter * sizeof(StepParams),
+            .out_contacts = output + Layout.Contacts,
+            .out_initial = output + Layout.Initial,
+            .out_poses = output + Layout.Poses,
+            .out_velocities = output + Layout.Velocities,
+            .out_sensors = output + Layout.Sensors,
+            .out_counts = output + Layout.Counts,
+            .completion = output + Layout.Completion,
+            .out_removed = output + Layout.RemovedContacts,
+            .snapshot = recording.Snapshot,
+            .gpu_colors = recording.GpuColors,
+            .output_poses = OutputFlags[0].Poses,
+            .output_sensors = OutputFlags[0].Sensors,
+            .restitution = bool(recording.ColliderFeatures & RestitutionMaterials),
+        };
+        Table->setAddress(FullData.Address() + recording.Parameter * sizeof(FullStepData), 0);
+        encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
+        encoder->setComputePipelineState(FullPipeline.get());
+        encoder->dispatchThreadgroups({1, 1, 1}, {std::min(bodies, SmallSolveWaves) * SolveLanes, 1, 1});
+        return;
+    }
     const uint64_t groups = ColorGroups.Address() + recording.Parameter * MaxSupportedColors * 3 * sizeof(uint32_t);
     if (recording.GpuColors) {
         Table->setAddress(groups, 26);
@@ -553,7 +620,7 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
                                                                                   0;
             Dispatch(encoder, primal, bodies, 1, work_groups);
         }
-        Dispatch(encoder, PublishPass, bodies, 1, general_islands && primal == SolvePass ? GeneralIslands.Address() + IslandPublishAt * sizeof(uint32_t) : 0);
+        Dispatch(encoder, primal == StabilizePass ? FinishPosesPass : PublishPass, bodies, 1, general_islands && primal == SolvePass ? GeneralIslands.Address() + IslandPublishAt * sizeof(uint32_t) : 0);
     };
 
     const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
@@ -572,6 +639,11 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Table->setAddress(world.BroadPhaseKeys.Address(), 11);
         Table->setAddress(world.BroadPhaseNodes.Address(), 13);
         Dispatch(encoder, SmallBroadPhasePass, std::bit_ceil(std::max(RadixSimdWidth, bodies)));
+    } else if (recording.Parameter && Params[recording.Parameter - 1].BodyCount == bodies) {
+        // Rebuild at each submission boundary; within it the same body slots retain a valid topology.
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, RefreshTreePass, bodies);
+        Dispatch(encoder, RefitTreePass, bodies);
     } else {
         const uint32_t blocks = RadixBlocks(bodies);
         Table->setAddress(world.BoundsReductions.Address(), 13);
@@ -602,7 +674,6 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     Table->setAddress(world.Iterates.Address(), 11);
     Table->setAddress(world.NextColors.Address(), 13);
     Table->setAddress(world.ContactEventCounts.Address(), 25);
-    Dispatch(encoder, IntegratePass, bodies);
     // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from, before WarmStart moves the body to its starting guess.
     // This is the reference's order, and the only one that expands the Taylor series about the pose the constraint was measured at.
     constexpr Pass collectors[]{CollectPass, BoundedCollectPass, MeshCollectPass, FullCollectPass};
@@ -610,7 +681,15 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     // Shared lanes increase parallelism for mesh queries and small worlds.
     const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : 1;
     const auto collect = [&](Pass pass, bool sensor) {
-        if (!(recording.ColliderFeatures & MeshQueries) || uint64_t(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 >= QueryScratchBytes) {
+        if (!(recording.ColliderFeatures & MeshQueries)) {
+            if (collision_lanes == 1)
+                pass = (recording.ColliderFeatures & BoundedPlanes) ?
+                    (sensor ? NativeBoundedSensorPass : NativeBoundedCollectPass) :
+                    (sensor ? NativeSensorPass : NativeCollectPass);
+            Dispatch(encoder, pass, bodies, collision_lanes);
+            return;
+        }
+        if (uint64_t(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 >= QueryScratchBytes) {
             Dispatch(encoder, pass, bodies, collision_lanes);
             return;
         }
@@ -671,9 +750,12 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Dispatch(encoder, InitializeIslandsPass, bodies);
         Dispatch(encoder, UnionIslandsPass, std::max(bodies, joints));
         Dispatch(encoder, PackIslandsPass, bodies);
-        Dispatch(encoder, FinishIslandsPass, MaxSupportedColors);
+        Table->setAddress(ColorScratch.Address(), 25);
+        Dispatch(encoder, FinishIslandsPass, bodies);
+        Table->setAddress(GeneralIslands.Address(), 25);
         Table->setAddress(ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t), BroadPhaseOrCursorAt);
         Dispatch(encoder, SolveIslandsPass, bodies, 1, GeneralIslands.Address());
+        Table->setAddress(GeneralIslands.Address() + (IslandHeaderWords + (3 + IslandBodyLimit) * uint64_t(bodies)) * sizeof(uint32_t), 13);
         Table->setAddress(ColorScratch.Address(), 26);
     }
     if (bodies <= SolveLanes) {
@@ -690,6 +772,8 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
             if (joints > 0) Dispatch(encoder, JointDualPass, joints, 1, GeneralIslands.Address() + IslandJointDualAt * sizeof(uint32_t));
         }
     }
+    if (general_islands) Table->setAddress(world.NextColors.Address(), 13);
+    Table->setAddress(world.ContactEventCounts.Address(), 25);
     // Velocity is taken from the motion the iterations above produced, before the stabilization sweep, so removing leftover penetration adds no velocity.
     Dispatch(encoder, FinalizePass, bodies);
     // Restitution runs as a velocity pass rather than as a row inside the solve. See Restitution for the gapped-contact case that requires it.
@@ -700,13 +784,10 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
             Dispatch(encoder, ApplyRestitutionPass, bodies);
         }
     sweep(StabilizePass);
-    // Sleep state is settled at the very end of a step, after the stabilization sweep, so every kernel of a step sees one sleep state per body.
     // Published before the sweep, a body woken by the spread would run a stabilization pass for a step it slept through.
     // Asleep at Integrate its inertial target is its frozen pose with no gravity in it, while its contact duals still carry the force balancing gravity.
     // The pass then shifts it out of rest and the body above penetrates it.
-    Dispatch(encoder, CountQuietPass, bodies);
-    Dispatch(encoder, SpreadWakingPass, bodies);
-    Dispatch(encoder, PublishWakingPass, bodies);
+    if (!recording.Snapshot || OutputFlags[0].Sensors) Dispatch(encoder, FinishWakingPass, bodies);
 
     if (OutputFlags[0].Sensors) {
         Table->setAddress(world.Jointed.Address(), 20);
@@ -743,7 +824,14 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Table->setAddress(output + Layout.RemovedContacts, 21);
         Table->setAddress(OutputFlags.Address(), 20);
         Table->setAddress(world.ContactRefusals.Address(), 26);
-        Dispatch(encoder, CapturePass, bodies);
+        if (!OutputFlags[0].Sensors) {
+            Table->setAddress(world.Quiet.Address(), 22);
+            Table->setAddress(world.Joints.Address(), 27);
+            Table->setAddress(world.Incoming.Address(), 28);
+            Table->setAddress(world.IncomingSlots.Address(), 29);
+            Table->setAddress(world.JointIncidence.Address(), 30);
+        }
+        Dispatch(encoder, OutputFlags[0].Sensors ? CapturePass : FinishCapturePass, bodies);
     }
 }
 

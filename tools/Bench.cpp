@@ -1,22 +1,4 @@
-// Times the solver's step, per scene, in a form two runs can be diffed.
-//
-//   RbpBench [scene ...]      no names runs every scene, names run just those
-//   ITERATIONS=n COLORS=n     override the solver's iteration count and colour cap, to separate
-//                             sweep-count cost from per-sweep cost
-//
-// A COLORS clamp below the colours a scene needs degrades its physics deliberately, so it prices dispatches rather than the solve.
-// Sleeping is off, so every timed step does the whole solve rather than measuring the sleep gate.
-// Compare two runs on the median.
-// The min is the machine's noise floor.
-//
-// A run on battery is noise, and the header reports which power source was in use.
-// The first run after a shader change pays kernel compilation past the warmup, and a 0.5 ms scene read 2.6 ms for a whole window.
-// That compilation lands in the system shader cache, so run twice and read the second.
-// Absolute numbers only compare on the same quiet, plugged-in machine.
-//
-// The scenes: `floor` is the fixed overhead of a near-empty step and `stack20` a box-box chain at two colours.
-// `raft` is a pile under contact-budget pressure and `coins` the hull path with ConvexManifold and reduction live.
-// `chain` is ten jointed links swinging and `slab` a wide body over mesh quads, which runs the batched gather.
+
 
 #include "BenchQuality.h"
 #include "Replay.h"
@@ -53,29 +35,23 @@ std::string FirstLine(const char *command) {
     return line;
 }
 
-// Links ball-jointed to an anchor, released straight out.
-// Nothing damps the swing, so the joint rows stay loaded for the whole run.
-void Chain(World &world, uint32_t links) {
+void Chain(World &world, uint32_t links, float3 shift = {}) {
     const auto shape = world.AddShape(UnitBox);
-    Index previous = world.AddBody({.Pose = At(float3{-Half - 0.01f, 0, 0}), .Density = 0});
+    Index previous = world.AddBody({.Pose = At(shift + float3{-Half - 0.01f, 0, 0}), .Density = 0});
     for (uint32_t i = 0; i < links; ++i) {
         const float x = 1.02f * float(i);
-        const auto link = Place(world, shape, float3{x, 0, 0});
-        world.AddJoint({.BodyA = previous, .BodyB = link, .At = {x - Half - 0.01f, 0, 0}});
+        const auto link = Place(world, shape, shift + float3{x, 0, 0});
+        world.AddJoint({.BodyA = previous, .BodyB = link, .At = shift + float3{x - Half - 0.01f, 0, 0}});
         previous = link;
     }
 }
 
-// A slab on a floor cut into 0.3125 m quads.
-// At four metres that is about 330 triangles under one body, so the resumable mesh gather runs its batch loop ten or so times a step.
 bool Slab(World &world, float half_width) {
     if (!AddMeshFloor(world, 64)) return false;
     Place(world, world.AddShape({.HalfExtents = {half_width, 0.25f, half_width}, .Kind = ShapeBox}), float3{0, 0.25f, 0});
     return true;
 }
 
-// Columns of stacked boxes in a grid, spaced so every contact is vertical.
-// The physics is then the same at any body count, so the series reads as a slope.
 void Lattice(World &world, uint32_t across, uint32_t deep, uint32_t high) {
     const auto shape = world.AddShape(UnitBox);
     AddGround(world);
@@ -122,15 +98,14 @@ int main(int argc, char **argv) try {
     const std::string power = FirstLine("pmset -g batt");
     const bool on_ac = power.contains("AC Power");
     std::println("RbpBench: {}, {}, {} timed updates after {} warmup, {} substeps/update, ms/substep, sleeping off", FirstLine("sysctl -n machdep.cpu.brand_string"), on_ac ? "AC power" : "ON BATTERY", timed, warmup, substeps);
-    // Another Rbp process with a Metal queue open costs the heavy scenes 2-3x.
-    // The light scenes read clean either way, so a spot check misses it.
+
     const std::string siblings = "pgrep -l Rbp | grep -v '^" + std::to_string(getpid()) + " ' | head -1";
     if (const std::string other = FirstLine(siblings.c_str()); !other.empty())
         std::println("!! another Rbp process is running ({}) - kill it or these timings are noise", other);
 
     StepSettings settings;
     settings.SleepSteps = ~0u;
-    // GRAVITY=0 leaves every body at its spawn pose, so an ablated kernel is priced against a control doing the same work in the same place.
+
     if (getenv("GRAVITY")) settings.Gravity = {0, float(std::atof(getenv("GRAVITY"))), 0};
     settings.Iterations = Env("ITERATIONS", settings.Iterations);
     settings.MaxColors = Env("COLORS", settings.MaxColors);
@@ -155,7 +130,7 @@ int main(int argc, char **argv) try {
             for (Index body = 0; body < world.BodyCount(); ++body)
                 quality.Observe(replay::StateOf(world, body), origins[body], options.ColumnHeight && body > 0 ? int((body - 1) % options.ColumnHeight) : -1, options.BoxHalf);
         };
-        // A sleeping scene prices the idle step, so timing starts only once every body is asleep rather than averaging two regimes.
+
         StepSettings scene_settings = settings;
         if (options.Sleeping) scene_settings.SleepSteps = StepSettings{}.SleepSteps;
         const auto advance = [&] {
@@ -189,9 +164,9 @@ int main(int argc, char **argv) try {
         }
         std::ranges::sort(ms);
         uint32_t colors = 0;
-        // The sweep count a step pays includes the extra colour dispatched to grow into.
+
         for (uint32_t body = 0; body < world.BodyCount(); ++body) colors = std::max(colors, ColorOf(world.Colors[body]) + 1);
-        // The first thing to look at when a scene's colour count reads higher than its graph needs.
+
         if (getenv("HISTOGRAM")) {
             std::vector<uint32_t> spread(colors, 0);
             for (uint32_t body = 0; body < world.BodyCount(); ++body) ++spread[ColorOf(world.Colors[body])];
@@ -203,18 +178,26 @@ int main(int argc, char **argv) try {
     };
 
     bench("floor", [](World &world) { return BuildStack(world, 1), true; }, {.ColumnHeight = 1});
+    bench("stack2", [](World &world) { return BuildStack(world, 2), true; }, {.ColumnHeight = 2});
+    bench("stack4", [](World &world) { return BuildStack(world, 4), true; }, {.ColumnHeight = 4});
+    bench("stack8", [](World &world) { return BuildStack(world, 8), true; }, {.ColumnHeight = 8});
+    bench("stack16", [](World &world) { return BuildStack(world, 16), true; }, {.ColumnHeight = 16});
     bench("stack20", [](World &world) { return BuildStack(world, 20), true; }, {.ColumnHeight = 20});
     bench("raft", [](World &world) { return BuildRaft(world, 5, 3), true; });
     bench("coins", [](World &world) { return !BuildCoins(world, 16, 10, 0.5f).empty(); });
+    bench("coins2", [](World &world) { return !BuildCoins(world, 16, 2, 0.5f).empty(); });
+    bench("coins4", [](World &world) { return !BuildCoins(world, 16, 4, 0.5f).empty(); });
+    bench("coins8", [](World &world) { return !BuildCoins(world, 16, 8, 0.5f).empty(); });
     bench("chain", [](World &world) { return Chain(world, 10), true; });
+    bench("chain2", [](World &world) { return Chain(world, 2), true; });
+    bench("chain4", [](World &world) { return Chain(world, 4), true; });
+    bench("chain8", [](World &world) { return Chain(world, 8), true; });
     bench("chain64", [](World &world) { return Chain(world, 64), true; });
-    // Three widths, so the cost per triangle reached and any fixed cost under it read off the slope.
+
     bench("slab", [](World &world) { return Slab(world, 2); }, {.ColumnHeight = 1, .BoxHalf = {2, 0.25f, 2}});
     bench("slab2m", [](World &world) { return Slab(world, 1); }, {.ColumnHeight = 1, .BoxHalf = {1, 0.25f, 1}});
     bench("slab1m", [](World &world) { return Slab(world, 0.5f); }, {.ColumnHeight = 1, .BoxHalf = {0.5f, 0.25f, 0.5f}});
-    // 25 bodies at slab1m's triangle load, so occupancy is the only difference.
-    // One wide body is a single latency-bound thread at ~13 us a triangle and 25 bodies pay ~1.2 us.
-    // The ratio of this line to slab1m's is the standing check on that amortization.
+
     bench("slabs25", [](World &world) {
         if (!AddMeshFloor(world, 64)) return false;
         const auto shape = world.AddShape({.HalfExtents = {0.5f, 0.25f, 0.5f}, .Kind = ShapeBox});
@@ -226,12 +209,13 @@ int main(int argc, char **argv) try {
           {.ColumnHeight = 1, .BoxHalf = {0.5f, 0.25f, 0.5f}});
     bench("lattice125", [](World &world) { return Lattice(world, 5, 5, 5), true; }, {.ColumnHeight = 5});
     bench("lattice294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, {.ColumnHeight = 6});
-    // The same 294 bodies fully asleep.
-    // Sleeping skips the solve and still runs the narrowphase, so this is the per-frame cost of a world of resting bodies.
+
     bench("resting294", [](World &world) { return Lattice(world, 7, 7, 6), true; }, {.Sleeping = true, .ColumnHeight = 6});
     bench("lattice600", [](World &world) { return Lattice(world, 10, 10, 6), true; }, {.ColumnHeight = 6});
     bench("lattice1176", [](World &world) { return Lattice(world, 14, 14, 6), true; }, {.ColumnHeight = 6});
 
+    bench("mixed6000", [](World &world) { Lattice(world, 25, 40, 6); Chain(world, 64, float3{-100, 200, -100}); return true; }, {.Capacity = 6066});
+    bench("mixed600", [](World &world) { Lattice(world, 10, 10, 6); Chain(world, 64, float3{-100, 200, -100}); return true; }, {.Capacity = 666});
     bench("lattice6000", [](World &world) { return Lattice(world, 25, 40, 6), true; }, {.Capacity = 6001, .ColumnHeight = 6});
     if (args.size() > 1) {
         bench("lattice96000", [](World &world) { return Lattice(world, 100, 160, 6), true; }, {.Capacity = 96001, .ColumnHeight = 6});
@@ -249,7 +233,6 @@ int main(int argc, char **argv) try {
     }
     return passed ? 0 : 2;
 } catch (const std::exception &error) {
-    // See mtl::Buffer: a bad index is reported here and the process exits normally.
     std::println(stderr, "RbpBench: {}", error.what());
     return 1;
 }

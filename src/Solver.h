@@ -1,6 +1,7 @@
 #pragma once
 
 #include "World.h"
+#include "gpu/FullStepData.h"
 
 #include <functional>
 
@@ -86,7 +87,6 @@ private:
         SmallBroadPhasePass,
         BoundsPass,
         SensorBoundsPass,
-        IntegratePass,
         CollectPass,
         ScanIncomingPass,
         ScanIncomingBlocksPass,
@@ -105,12 +105,12 @@ private:
         RestitutionPass,
         ApplyRestitutionPass,
         StabilizePass, // SolveBodies again, compiled with the C0 term kept
-        CountQuietPass,
-        SpreadWakingPass,
-        PublishWakingPass,
+        FinishPosesPass,
+        FinishWakingPass,
         FollowPass,
         PrepareColorsPass,
         CapturePass,
+        FinishCapturePass,
         SensorPass,
         BoundedCollectPass,
         BoundedSensorPass,
@@ -135,6 +135,10 @@ private:
         FinishIslandsPass,
         SolveIslandsPass,
         PrepareSmallWorldPass,
+        NativeCollectPass,
+        NativeSensorPass,
+        NativeBoundedCollectPass,
+        NativeBoundedSensorPass,
         PassCount,
     };
 
@@ -173,6 +177,8 @@ private:
     mtl::Buffer<ColorWork> ColorScratch;
     mtl::Buffer<StepOutputFlags> OutputFlags;
     mtl::Buffer<uint8_t> Outputs;
+    mtl::Buffer<FullStepData> FullData;
+    NS::SharedPtr<MTL::ComputePipelineState> FullPipeline;
     OutputLayout Layout;
     uint64_t Signal{};
     bool Advancing = false;

@@ -235,3 +235,57 @@ TEST_CASE("cooperative body bounds match scalar bounds through geometry and sens
         }
     }
 }
+
+TEST_CASE("body bounds retain incoming speed before damping and waking") {
+    const mtl::Context context;
+    Solver solver{context};
+    const StepSettings settings{.Gravity = {0, 0, 0}, .DeltaTime = .125f, .Iterations = 0, .ContactMargin = 0};
+    for (uint32_t count : {32u, 33u})
+        for (bool mesh : {false, true})
+            for (bool sleeping : {false, true}) {
+                CAPTURE(count);
+                CAPTURE(mesh);
+                CAPTURE(sleeping);
+                World world{context, {.Bodies = count}};
+                const Index sphere = world.AddShape({.Radius = 1, .Kind = ShapeSphere});
+                REQUIRE(world.AddBody({.Velocity = {.Linear = {4, 0, 0}}, .Shape = sphere, .LinearDamping = 4}) == 0);
+                if (mesh) REQUIRE(world.AddBody({.Pose = At(float3{100, 0, 0}), .Shape = BoxMesh(world, .5f), .Density = 0}) == 1);
+                while (world.BodyCount() < count) REQUIRE(world.AddBody({.Density = 0}) != NoIndex);
+                if (sleeping) world.Quiet[0] = settings.SleepSteps;
+                solver.Step(world, settings);
+                // Radius 1, roundoff 1e-5, and incoming speculative reach h |v| = .5.
+                // Search bounds retain the initial speculative reach after damping halves velocity.
+                for (uint32_t axis = 0; axis < 3; ++axis) {
+                    CHECK(std::abs(world.Bounds[0].Low[axis] + 1.50001f) < 2e-6f);
+                    CHECK(std::abs(world.Bounds[0].High[axis] - 1.50001f) < 2e-6f);
+                }
+                CHECK(world.InitialPoses[0].Position.x == 0);
+                CHECK(world.Poses[0].Position.x == .25f);
+                CHECK(world.Velocities[0].Linear.x == 2);
+                CHECK(world.Quiet[0] == 0);
+            }
+}
+
+TEST_CASE("GPU broad phase refits moving bounds against brute force across batched steps") {
+    const mtl::Context context;
+    Solver solver{context};
+    const StepSettings settings{.Gravity = {0, 0, 0}, .DeltaTime = 1.f / 64, .SleepSteps = ~0u};
+    for (uint32_t count : {257u, 769u})
+        for (bool sensors : {false, true}) {
+            CAPTURE(count);
+            CAPTURE(sensors);
+            World world{context, {.Bodies = count}};
+            const auto sphere = world.AddShape({.Radius = .125f, .Kind = ShapeSphere});
+            REQUIRE(world.AddBody({.Shape = world.AddShape(GroundPlane), .Density = 0}) == 0);
+            for (uint32_t body = 1; body < count; ++body)
+                REQUIRE(world.AddBody({.Pose = At(float3{float((body * 37) % 64) * .125f, 2.f + float(body % 32), float(body / 32)}), .Velocity = {.Linear = {body % 2 ? 128.f : -128.f, 0, 0}}, .Shape = sphere, .Density = 0, .Sensor = sensors && body == 1}) == body);
+            for (uint32_t steps : {2u, 10u, 17u}) {
+                const auto result = solver.Advance(world, settings, steps);
+                REQUIRE(result.Steps == steps);
+                CHECK(result.ContactRefusals == 0);
+                CHECK(result.SensorRefusals == 0);
+                CheckTree(world);
+                CheckPairs(context, world);
+            }
+        }
+}

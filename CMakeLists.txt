@@ -38,10 +38,24 @@ option(RBP_TOOLS "Build the engine's scene and bench tools and its tests" ${RBP_
 
 # Metal source is embedded here and compiled at runtime, which keeps the build off Xcode's Metal toolchain.
 # Shared.h is embedded the same way, so host and device compile one definition instead of two.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(GeneratedFullStep ${CMAKE_CURRENT_BINARY_DIR}/gen/FullStep.metal)
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FullStep.py
+        --source ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu --compiler ${CMAKE_CXX_COMPILER}
+        --output ${GeneratedFullStep}
+    COMMAND_ERROR_IS_FATAL ANY
+)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FullStep.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/FullStep.metal
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/FullStepData.h
+)
 set(GpuSources
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Shared.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Layout.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/BroadPhase.metal
+    ${GeneratedFullStep}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Solve.metal
 )
 set(GeneratedGpuSource ${CMAKE_CURRENT_BINARY_DIR}/gen/GpuSource.h)

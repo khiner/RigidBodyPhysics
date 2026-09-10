@@ -176,6 +176,8 @@ GPU_CONSTANT uint SolveLanes = 32;
 GPU_CONSTANT uint SolveDof = 6;
 GPU_CONSTANT uint SolveBodiesPerGroup = SolveLanes / SolveDof;
 GPU_CONSTANT uint SmallSolveWaves = 8;
+// Jacobi impulse sweeps distribute the approach speed across a manifold.
+GPU_CONSTANT uint RestitutionPasses = 4;
 GPU_CONSTANT uint RadixWaves = RadixBlockSize / RadixSimdWidth;
 inline uint RadixBlocks(uint bodies) { return (bodies + RadixBlockSize - 1) / RadixBlockSize; }
 inline uint BroadPhaseRoot(uint bodies) { return bodies == 1 ? 0 : bodies; }
@@ -334,7 +336,7 @@ GPU_CONSTANT uint IslandBodyLimit = SolveLanes;
 GPU_CONSTANT uint IslandPublishAt = 3, IslandContactDualAt = 6, IslandJointDualAt = 9;
 GPU_CONSTANT uint IslandLargeAt = 12, IslandColorsAt = 13;
 GPU_CONSTANT uint IslandHeaderWords = IslandColorsAt + MaxSupportedColors * 3;
-GPU_CONSTANT uint IslandWordsPerBody = 2 + IslandBodyLimit;
+GPU_CONSTANT uint IslandWordsPerBody = 4 + IslandBodyLimit;
 
 struct ColorWork {
     uint Counts[MaxSupportedColors], Offsets[MaxSupportedColors + 1], Cursors[MaxSupportedColors];
