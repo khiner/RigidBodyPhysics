@@ -2,15 +2,18 @@
 
 `src/gpu/Solve.metal` is ported from the two AVBD reference implementations below, both MIT.
 
-Its convex narrowphase — the hull path — is ported from nothing: neither of the two, nor jure/webphysics, has a hull or a general convex query, so it follows the published algorithms directly.
-GJK uses the signed-volume distance subalgorithm of Montanari, Petrinic and Barbieri (ACM TOG 36(3), 2017), EPA is bounded in the manner of van den Bergen, and manifold reduction follows Gregorius, "Robust Contact Creation for Physics Simulations" (GDC 2015).
-Written from the papers and the talk: openGJK, the GJK authors' reference implementation, was deliberately not read, and no code derives from it.
+The convex narrowphase follows these published algorithms:
+
+- GJK distance follows Montanari, Petrinic and Barbieri's signed-volume method (ACM TOG 36(3), 2017).
+- Bounded EPA follows van den Bergen.
+- Manifold reduction follows Gregorius, "Robust Contact Creation for Physics Simulations" (GDC 2015).
+
 The cylinder support mapping and penetration initialization reference [Jolt's cylinder][jolt-cylinder] and EPA implementations.
 The cylinder query fixture uses the same revision with authored radii and zero additional convex radius.
 
 [jolt-cylinder]: https://github.com/jrouwe/JoltPhysics/blob/187da15da976652567738cc7603ade72bd0ae702/Jolt/Physics/Collision/Shape/CylinderShape.cpp
 
-## avbd-demo2d — the algorithm, its parameters and its sign conventions
+## avbd-demo2d
 
 https://github.com/savant117/avbd-demo2d
 
@@ -38,7 +41,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## MetalAVBD — the three-dimensional contact basis, friction cone and GPU pass structure
+## MetalAVBD
 
 https://github.com/tatsuya-ogawa/MetalAVBD
 

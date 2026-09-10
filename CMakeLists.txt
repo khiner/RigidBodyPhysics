@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# A host that add_subdirectory()s this one has already chosen its compiler and flags, so every toolchain-wide setting below is standalone-only.
-# Per-target settings go on the target.
+# Embedding hosts choose their own toolchain.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(RBP_STANDALONE ON)
 else()
@@ -9,7 +8,7 @@ else()
 endif()
 
 if(RBP_STANDALONE)
-    # Homebrew LLVM, not Apple clang, chosen before project() probes the compiler.
+    # Select Homebrew LLVM before project() detects the compiler.
     execute_process(COMMAND brew --prefix llvm OUTPUT_VARIABLE HomebrewLlvm OUTPUT_STRIP_TRAILING_WHITESPACE)
     set(CMAKE_CXX_COMPILER "${HomebrewLlvm}/bin/clang++" CACHE FILEPATH "")
 endif()
@@ -27,17 +26,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(RBP_STANDALONE)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clangd
     set(CMAKE_CXX_FLAGS "-stdlib=libc++")
-    # Designated initializers leave unnamed fields at their defaults on purpose, hence -Wno-missing-field-initializers.
+    # Allow partial designated initialization.
     add_compile_options(-Wall -Wextra -Wno-missing-field-initializers)
     add_link_options("-L${HomebrewLlvm}/lib/c++" "-Wl,-rpath,${HomebrewLlvm}/lib/c++")
 endif()
 
-# A program may hold exactly one metal-cpp private-implementation TU, so a host that already has one sets this OFF.
+# Compile metal-cpp definitions in exactly one translation unit per program.
 option(RBP_METAL_CPP_IMPL "Compile the metal-cpp private implementation into rbp" ON)
 option(RBP_TOOLS "Build the engine's scene and bench tools and its tests" ${RBP_STANDALONE})
 
-# Metal source is embedded here and compiled at runtime, which keeps the build off Xcode's Metal toolchain.
-# Shared.h is embedded the same way, so host and device compile one definition instead of two.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(GeneratedFullStep ${CMAKE_CURRENT_BINARY_DIR}/gen/FullStep.metal)
 execute_process(
@@ -53,6 +50,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 )
 set(GpuSources
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Shared.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/SolveCommandData.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/SolveCommands.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Layout.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/BroadPhase.metal
     ${GeneratedFullStep}
@@ -67,8 +66,6 @@ foreach(Path IN LISTS GpuSources)
 endforeach()
 string(APPEND EmbeddedText "} // namespace gpu\n")
 file(GENERATE OUTPUT ${GeneratedGpuSource} CONTENT "${EmbeddedText}")
-# These sources are read at configure time, so editing a .metal file or Shared.h requires re-running cmake configure.
-# A build without that re-run keeps the previously embedded kernel source.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GpuSources})
 
 add_library(rbp STATIC
@@ -82,9 +79,7 @@ if(RBP_METAL_CPP_IMPL)
     target_sources(rbp PRIVATE src/metal/MetalCppImpl.cpp)
 endif()
 target_sources(rbp PRIVATE ${GeneratedGpuSource})
-# -O1, not -O2: Homebrew clang 22.1.8 silently miscompiles vector growth at -O2.
-# probes/VectorMiscompile.cpp reproduces it, re-checkable with OPT=-O2 ./run VectorMiscompile.
-# Set on the target because the later flag wins, so an embedding host's -O2 cannot override it.
+# Preserve the embedding workaround for the compiler issue reproduced by probes/VectorMiscompile.cpp.
 target_compile_options(rbp PRIVATE -O1)
 target_compile_features(rbp PUBLIC cxx_std_23)
 target_include_directories(rbp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/gen)

@@ -10,15 +10,8 @@
 #ifndef QUEUED_QUERIES
 #define QUEUED_QUERIES 0
 #endif
-// AVBD for rigid bodies, following Augmented Vertex Block Descent (Giles et al., SIGGRAPH 2025).
-// Ported from ../avbd-demo2d/source/solver.cpp for the algorithm and its equation numbering.
-// The 3D contact basis and friction cone come from ../MetalAVBD/MetalAVBD/AVBDCompute.metal. See NOTICE.md.
-//
-// One step: integrate to an inertial target, build contacts against the pose the step began from, then alternate primal sweeps with dual updates.
-// Velocity is read from the motion before a final stabilization sweep removes leftover penetration, so error correction adds no energy.
-//
-// Sign convention: the normal points out of B towards A, and C is the separation along it.
-// Penetration is therefore negative, and a contact's normal force is at most zero.
+// Rigid-body AVBD; source attribution and algorithm references are in NOTICE.md.
+// Normals point from B to A; penetration and the normal dual are negative.
 
 #ifndef COLLECT_LANES
 #define COLLECT_LANES 1
@@ -46,27 +39,23 @@
 #ifndef SOLVE_BODIES_PER_GROUP
 #define SOLVE_BODIES_PER_GROUP 1
 #endif
+#ifndef COMPACT_BODY_WORK
+#define COMPACT_BODY_WORK (SOLVE_BODIES_PER_GROUP > 1)
+#endif
 constant uint Dof = SolveDof;
 
-// A body too slow for long enough stops being solved and keeps its contacts, so loads stay up.
 static bool Asleep(uint quiet, constant StepParams &p) { return quiet >= p.SleepSteps; }
 
-// The single threshold for movement, used everywhere in a step.
 static bool Moving(Velocity v, constant StepParams &p) { return length(v.Linear) > p.SleepSpeed || length(v.Angular) > p.SleepSpeed; }
 
-// Kinematic: a body the solve cannot move that the host is moving.
-// Keyed on Moves rather than on inverse mass, because a body pinned in space with an inertia of its own is dynamic and the solve still turns it.
 static bool Driven(BodyMass mass, Velocity v, constant StepParams &p) {
     return !Moves(mass) && Moving(v, p);
 }
 
-// Whether this body's pose is unchanged since the last step, which lets a sleeping body carry its pairs forward rather than re-collide them.
-// A kinematic body is not frozen.
 static bool Frozen(BodyMass mass, Velocity v, uint quiet, constant StepParams &p) {
     return !Moves(mass) ? !Driven(mass, v, p) : Asleep(quiet, p);
 }
 
-// Whether the primal sweeps move this body. A pair with neither side solved has nothing for Eq. 11.
 static bool Solved(BodyMass mass, uint quiet, constant StepParams &p) {
     return Moves(mass) && !Asleep(quiet, p);
 }
@@ -76,31 +65,25 @@ static bool ConvexLeaf(uint kind) { return kind != ShapePlane && kind != ShapeMe
 static bool BoundedPlane(Shape shape) { return BOUNDED_PLANES && IsBoundedPlane(shape); }
 constant uint PlaneBackFeature = 1u << 31;
 
-// Box2D-lite's bias towards keeping the reference face already chosen, kept by both references.
+// Box2D-lite reference-face bias preserves contact identity.
 constant float RelativeTolerance = 0.95f;
 constant float AbsoluteTolerance = 0.01f;
-// The same bias between an edge pair and a face, at MetalAVBD's value.
-// Absolute rather than scaled by a half extent, an edge pair having no single box's extent to scale by.
+// Absolute edge/face bias; an edge pair has no single half-extent scale.
 constant float EdgeTolerance = 0.01f;
 
-// Compiled a second time with STABILIZE set, for the final pass that keeps the C0 term.
 #ifndef STABILIZE
 #define STABILIZE 0
 #endif
-// How much of the error a step began with a hard row may ignore.
-// Eq. 18 spreads the correction over several steps, and post-stabilization instead runs the solve at 1 and one pass at 0.
-// A soft row takes 0 always.
+// Hard rows retain C0 during stabilization and relax it during ordinary iterations.
 #if STABILIZE
-constant float ConstraintAlpha = 0; // keep all of the accumulated error, and correct it
-constant float Stabilizing = 1; // and a joint row is stiff enough to move it - see SolveBodies
+constant float ConstraintAlpha = 0;
+constant float Stabilizing = 1;
 #else
-constant float ConstraintAlpha = 1; // ignore it, and only resist error added during this step
+constant float ConstraintAlpha = 1;
 constant float Stabilizing = 0;
 #endif
 
-// The inertial stiffness a pair brings to a row measuring a distance between them: their reduced mass over h squared.
-// That is the scale a penalty is meaningful against (Sec. 3.4).
-// `inverse` is the sum of the inverse masses, so an infinite mass drops out and two static bodies floor to zero penalty rather than an infinite one.
+// Pair inertial stiffness is reduced mass / h^2, including pinned and static endpoints.
 static float PairStiffness(float inverse, float dt) { return inverse > 0 ? 1 / (inverse * dt * dt) : 0; }
 
 static float3 UnitAxis(uint i) { return float3(i == 0 ? 1.f : 0.f, i == 1 ? 1.f : 0.f, i == 2 ? 1.f : 0.f); }
@@ -113,16 +96,16 @@ static float3x3 QuatToMatrix(float4 q) {
     return float3x3(Rotate(q, float3(1, 0, 0)), Rotate(q, float3(0, 1, 0)), Rotate(q, float3(0, 0, 1)));
 }
 
-// R D R^T: a body-frame diagonal tensor in the world. Takes the matrix, not the quaternion.
 static float3x3 WorldTensor(float3x3 rotation, float3 diagonal) {
     return rotation * Diagonal(diagonal) * transpose(rotation);
 }
 
-// Zero for a static body, as its inverse mass is, so a pair with one takes only the other's.
 static float3x3 WorldInverseInertia(float4 orientation, float3 inverse_local) {
     return WorldTensor(QuatToMatrix(orientation), inverse_local);
 }
 
+// Compensated pairs retain inertial terms beside stiff constraint rows.
+// Normalize each accumulation before factorization.
 static float2 WideSum(float a, float b) {
 #pragma clang fp reassociate(off) contract(off)
     const float sum = a + b;
@@ -153,6 +136,7 @@ static float2 WideDiv(float2 a, float2 b) {
     return WideSum(quotient, (remainder.x + remainder.y) / b.x);
 }
 
+// Six adjacent lanes own one body's rows; shuffles stay inside that tile.
 static float SolveBlock(thread float2 H[Dof], float2 g, uint row, uint base) {
     uint coupled = 0;
     float2 diagonal_value = 0;
@@ -196,7 +180,6 @@ static float SolveBlock(thread float2 H[Dof], float2 g, uint row, uint base) {
 }
 
 // Gradient of dot(Log(Exp(delta) Exp(turn)), axis) at delta = 0.
-
 static float3 LogGradient(float3 turn, float3 axis) {
     // Inverse left Jacobian transpose: https://borglab.github.io/gtsam/so3/
     const float squared = dot(turn, turn);
@@ -221,6 +204,12 @@ static void AddRow(
     g = WideAdd(g, WideMul(float2(row[block_row], 0), float2(force, 0)));
 #pragma unroll
     for (uint j = 0; j < Dof; ++j) H[j] = WideAdd(H[j], WideMul(WideMul(float2(stiffness, 0), float2(row[block_row], 0)), float2(row[j], 0)));
+}
+
+static void MergePreparedBlock(thread float2 H[Dof], thread float2 &g, thread const float2 partial[Dof], float2 partial_g, uint source) {
+    g = WideAdd(g, simd_shuffle(partial_g, source));
+#pragma unroll
+    for (uint j = 0; j < Dof; ++j) H[j] = WideAdd(H[j], simd_shuffle(partial[j], source));
 }
 
 // Preserve the ordered projection sums in P H P + held a a^T and P g.
@@ -249,14 +238,10 @@ static Displacement Since(Pose now, Pose start) {
     return {now.Position - start.Position, RotationVector(QuatMul(now.Orientation, QuatConjugate(start.Orientation)))};
 }
 
-// Where one step of the body's own motion carries it, with `share` of gravity added.
 static Pose FreeFlight(Pose pose, Velocity v, float3 gravity, float share, float dt) {
     return {pose.Position + dt * v.Linear + (share * dt * dt) * gravity, normalize(QuatMul(QuatFromRotationVector(dt * v.Angular), pose.Orientation))};
 }
 
-// Eq. 2: where free flight would put the body, the target the inertial term pulls back towards.
-// The pose is deliberately left where it is, so collision and every C0 and Jacobian are taken at the pose the step began from.
-// WarmStart then moves the body to its starting guess.
 static void IntegrateBody(
     device const Pose *poses, device Pose *initial, device Pose *inertial,
     device Velocity *velocities,
@@ -293,8 +278,7 @@ static void IntegrateBody(
     inertial[body] = FreeFlight(pose, v, (Translates(mass) ? mass.GravityScale : 0) * p.Gravity, 1, p.DeltaTime);
 }
 
-// The starting guess the sweeps begin from, which is not the inertial target.
-// Gravity enters in proportion to how much recent acceleration matched it, so a resting body is not guessed into the floor each step.
+// Warm-start guesses differ from inertial targets and use the previous acceleration.
 static void WarmStartBody(
     device Pose *poses, device const Pose *initial,
     device const Velocity *velocities, device Velocity *previous,
@@ -343,7 +327,6 @@ kernel void WarmStart(
     WarmStartBody(poses, initial, velocities, previous, masses, displacements, iterates, p, body);
 }
 
-// An oriented box, with its axes already in world space.
 struct BoxPose {
     float3 Center;
     float3 Axis[3];
@@ -365,12 +348,10 @@ static float Reach(BoxPose box, float3 axis) {
         abs(dot(box.Axis[2], axis)) * box.Half[2];
 }
 
-// The separating axis test: positive when the two boxes overlap along the axis, and negative by the gap otherwise.
 static float Overlap(BoxPose a, BoxPose b, float3 axis) {
     return Reach(a, axis) + Reach(b, axis) - abs(dot(b.Center - a.Center, axis));
 }
 
-// The corners of one face of a box, wound so consecutive pairs are edges.
 static void FaceCorners(BoxPose box, uint axis, float side, thread float3 *out) {
     const uint u = (axis + 1) % 3, v = (axis + 2) % 3;
     const float3 centre = box.Center + box.Axis[axis] * (side * box.Half[axis]);
@@ -381,26 +362,21 @@ static void FaceCorners(BoxPose box, uint axis, float side, thread float3 *out) 
     out[3] = centre - du + dv;
 }
 
-// A convex polytope as the narrowphase addresses it: a pose, and an indexed vertex accessor.
-// A box is one too, its eight corners computed rather than stored.
-// A sphere or capsule is the one or two points of its core, because the Minkowski difference of two cores is that of the solids moved in by their radii.
-// Everything below therefore works on cores and takes the radii off at the end.
 struct Poly {
     float3 Center;
     float4 Orientation;
     float3 Half; // Box half extents or cylinder radius and half height use X/Y; capsule half-segment length uses Y.
-    float Radius; // a sphere's or a capsule's, and zero for a polytope
-    uint First, Count; // a hull's run of the vertex pool
-    uint FirstFace, FaceCount; // and of the face pool, the faces its cook produced
-    uint3 Corner; // and a triangle's three, which are anywhere in the pool rather than a run
-    uint Kind; // the ShapeKind it was made from, which selects the fields above
+    float Radius; // Spheres and capsules have a nonzero radius.
+    uint First, Count; // Hull vertices and faces use contiguous ranges; triangle vertices use absolute indices.
+    uint FirstFace, FaceCount;
+    uint3 Corner;
+    uint Kind;
 };
 
 static Poly MakePoly(Pose pose, Shape shape) {
     return {pose.Position, pose.Orientation, shape.HalfExtents, shape.Radius, shape.FirstVertex, shape.VertexCount, shape.FirstFace, shape.FaceCount, uint3(0), shape.Kind};
 }
 
-// One triangle of a mesh, as a polytope with no thickness. The caller resolves which side is out.
 static Poly MakeTriangle(Pose pose, Triangle triangle) {
     return {pose.Position, pose.Orientation, float3(0), 0, 0, 0, 0, 0, uint3(triangle.A, triangle.B, triangle.C), ShapeMesh};
 }
@@ -418,7 +394,6 @@ static uint PolyCount(Poly poly) {
     return poly.Kind == ShapeCapsule ? 2 : 1;
 }
 
-// Vertex `i` in world. A box's eight are its half-extent sign patterns, in the order `i`'s bits give.
 static float3 LocalVertex(Poly poly, device const float3 *pool, uint i) {
     float3 local = float3(0);
     if (poly.Kind == ShapeBox) local = poly.Half * float3((i & 1) ? 1.f : -1.f, (i & 2) ? 1.f : -1.f, (i & 4) ? 1.f : -1.f);
@@ -433,7 +408,7 @@ static float3 PolyVertex(Poly poly, device const float3 *pool, uint i) {
     return poly.Center + Rotate(poly.Orientation, LocalVertex(poly, pool, i));
 }
 
-// The vertex furthest along `direction`, as an index, because a contact is named by its geometry.
+// Return the support vertex index to keep contact identity tied to geometry.
 static uint PolySupport(Poly poly, device const float3 *pool, float3 direction, uint lane = NoIndex) {
     const float3 local = Rotate(QuatConjugate(poly.Orientation), direction);
     if (poly.Kind == ShapeBox) return (local.x > 0 ? 1u : 0u) | (local.y > 0 ? 2u : 0u) | (local.z > 0 ? 4u : 0u);
@@ -562,7 +537,6 @@ static bool OutsideFaces(Poly convex, Poly triangle, device const float3 *pool, 
     return false;
 }
 
-// How far the furthest vertex sits from the centre, the scale a face tolerance is measured against.
 static float PolyReach(Poly poly, device const float3 *pool, uint lane = NoIndex) {
     if (poly.Kind == ShapeCylinder) return length(poly.Half.xy);
     if (poly.Kind == ShapeBox || (BOUNDED_PLANES && poly.Kind == ShapePlane)) return length(poly.Half);
@@ -577,17 +551,16 @@ static float PolyReach(Poly poly, device const float3 *pool, uint lane = NoIndex
     return reach;
 }
 
-// How far apart two corners must be before the polytope rests on one. Relative, with a floor.
 static float FaceTolerance(Poly poly, device const float3 *pool, uint lane = NoIndex) { return 1e-3f * PolyReach(poly, pool, lane) + 1e-6f; }
 
-// A sphere and a capsule are one shape with a different core: every point within Radius of a segment.
+// Sphere and capsule surfaces are at Radius from a point or segment core.
 struct Core {
     float3 From, To;
     float Radius;
 };
 
 static Core MakeCore(Pose pose, Shape shape) {
-    const float3 along = Rotate(pose.Orientation, float3(0, shape.HalfExtents.y, 0)); // zero for a sphere
+    const float3 along = Rotate(pose.Orientation, float3(0, shape.HalfExtents.y, 0));
     return {pose.Position - along, pose.Position + along, shape.Radius};
 }
 
@@ -596,14 +569,12 @@ static bool CurvedSurface(uint kind, float4 orientation, float3 normal) {
     return IsRound(kind) || (kind == ShapeCylinder && abs(dot(Rotate(orientation, float3(0, 1, 0)), normal)) < 0.999999f);
 }
 
-// The point of a box nearest `at`, and how far outside the box `at` is. Negative for a point inside.
 static float3 ClosestOnBox(BoxPose box, float3 at, thread float &distance, thread uint &feature) {
     const float3 offset = at - box.Center;
     float3 local = float3(dot(offset, box.Axis[0]), dot(offset, box.Axis[1]), dot(offset, box.Axis[2]));
     const float3 clamped = clamp(local, -box.Half, box.Half);
     const float3 outside = local - clamped;
     if (dot(outside, outside) > 1e-14f) {
-        // Which axes were clamped and to which side, naming the face, edge or vertex the point landed on.
         feature = 0;
         for (uint i = 0; i < 3; ++i) feature |= (local[i] != clamped[i] ? (local[i] > 0 ? 1u : 2u) : 0u) << (2 * i);
         distance = length(outside);
@@ -624,12 +595,10 @@ static float3 ClosestOnBox(BoxPose box, float3 at, thread float &distance, threa
     return box.Center + box.Axis[0] * local[0] + box.Axis[1] * local[1] + box.Axis[2] * local[2];
 }
 
-// The outward direction from a box to a point. Reversed for a point inside, and arbitrary on the surface.
 static float3 OutOfBox(float3 at, float3 nearest, float away) {
     return away < 0 ? normalize(nearest - at) : (away > 1e-9f ? (at - nearest) / away : float3(0, 1, 0));
 }
 
-// The box edge along `axis` furthest in `direction`, with `which` naming it so its parallels do not inherit its dual.
 static void SupportEdge(BoxPose box, uint axis, float3 direction, thread float3 *ends, thread uint &which) {
     const uint u = (axis + 1) % 3, v = (axis + 2) % 3;
     const float su = dot(direction, box.Axis[u]) >= 0 ? 1.f : -1.f;
@@ -675,19 +644,11 @@ static void ClosestOnSegments(float3 p0, float3 p1, float3 q0, float3 q1, thread
     on_q = q0 + d2 * t;
 }
 
-// Sutherland-Hodgman against one half-space, keeping the part behind the plane and carrying each point's name.
-// Clips in place through the caller's scratch.
-//
-// A name is the set of planes the point lies on: bits 0-3 the four edges of the incident face, and bits 4-7 the four side planes of the reference face.
-// Two bits are always set, and the pair names the point uniquely, so the same geometry takes the same name next step whatever order the points came out in.
-//
-// `tolerance` must be nonzero.
-// Two faces that meet exactly have every corner of one on a side plane of the other, computed differently on the two sides.
-// The result then lands either side of zero on rounding alone, and the pair contend over one piece of geometry.
 static uint ClipAgainst(
     thread float3 *poly, thread uint *names, uint count, float3 normal, float offset, uint plane,
     float tolerance, uint limit, thread float3 *out, thread uint *out_names
 ) {
+    // Sutherland-Hodgman clipping with geometry-derived point identities.
     uint kept = 0;
     for (uint i = 0; i < count && kept < limit; ++i) {
         const uint next = (i + 1) % count;
@@ -700,7 +661,7 @@ static uint ClipAgainst(
             ++kept;
         }
         if (from_inside == to_inside || kept == limit) continue;
-        // A cut at either end is that endpoint renamed, so only a cut strictly between them is new.
+        // Interior cuts receive new identities; endpoint cuts retain the endpoint identity.
         const float at = in_from / (in_from - in_to);
         if (at <= 1e-4f || at >= 1 - 1e-4f) continue;
         out[kept] = from + (to - from) * at;
@@ -714,21 +675,10 @@ static uint ClipAgainst(
     return kept;
 }
 
-// Convex against convex, following the sources LiteratureReview.md names under "Convex queries".
-// GJK with Montanari's signed-volume subalgorithm gives the direction the two are apart along, and bounded EPA in fixed scratch the one they overlap along.
-// The manifold is then a one-shot clip.
-// Nothing here reads a polytope's topology, only its vertices through Poly's support function.
-// One path therefore serves hull against hull, hull against box, and hull against a capsule's segment.
-
-// The most points clipping one face into another can produce, which is more than either face holds.
-// A convex polygon cut by a half-plane gains a vertex, so an eight point face against an eight edge one is a sixteen-gon.
-// Bounding at MaxFacePoints instead drops a contiguous run of the perimeter, half the shape, which does not carry the body's centre.
-// Jolt fills only half its buffer for the same reason.
 constant uint MaxClipPoints = 2 * MaxFacePoints;
-// EPA's scratch, bounded on purpose: it stops expanding and returns the best face it reached.
+
 constant uint MaxEpaVertices = 16;
 
-// A point of the Minkowski difference, carrying which vertex of each polytope produced it, so it can be named.
 struct Mink {
     float3 At;
     uint IndexA, IndexB;
@@ -744,29 +694,18 @@ static Mink MinkSupport(Poly a, Poly b, device const float3 *pool, float3 direct
     return {PolyVertex(a, pool, ia) - PolyVertex(b, pool, ib), ia, ib};
 }
 
-// The signed-volume distance subalgorithm (Montanari, Petrinic and Barbieri, TOG 36(3) 2017).
-// The paper is kept at ~/acoustic_solver_papers/2017_montanari-petrinic-barbieri_improving-gjk-signed-volumes.pdf.
-// It replaces both Johnson's subalgorithm and the backup procedure GJK otherwise needs.
-// It never drops the newest vertex, which requires the simplex ordered newest-first, so Gjk prepends.
-// It projects onto whichever plane or axis the simplex shades most of.
-// A needle simplex therefore yields a NaN the sign comparisons reject rather than a poisoned division.
-
-// The paper's CompareSigns. Zero and NaN both give false, so a degenerate simplex is rejected.
 static bool SameSign(float a, float b) { return (a > 0 && b > 0) || (a < 0 && b < 0); }
 
-// Six times the signed tetrahedron volume. Replacing a corner by the origin gives that corner's coordinate.
 static float Signed4(float3 a, float3 b, float3 c, float3 d) { return dot(b - a, cross(c - a, d - a)); }
 
-// And twice the signed area of the triangle projected onto the (u, v) plane, the same way.
 static float Signed2(float3 a, float3 b, float3 c, uint u, uint v) {
     return (b[u] - a[u]) * (c[v] - a[v]) - (b[v] - a[v]) * (c[u] - a[u]);
 }
 
-// The point of a segment nearest the origin, with a mask of which ends carry it. s1 is the newest vertex.
 static float3 SignedVolume1(float3 s1, float3 s2, thread uint &mask) {
     const float3 along = s2 - s1;
     const float3 projected = s2 - along * (dot(s2, along) / dot(along, along));
-    // The axis the segment shades longest, which its coordinates are best conditioned on.
+    // Use the largest segment coordinate for numerical conditioning.
     uint axis = 0;
     float span = 0;
     for (uint i = 0; i < 3; ++i) {
@@ -779,16 +718,15 @@ static float3 SignedVolume1(float3 s1, float3 s2, thread uint &mask) {
         mask = 3;
         return (s1 * first + s2 * second) / span;
     }
-    mask = 1; // the origin is past the newest vertex, and the older one cannot be nearest on its own
+    mask = 1; // The origin projects beyond the newest vertex.
     return s1;
 }
 
-// The point of a triangle nearest the origin, likewise.
 static float3 SignedVolume2(float3 s1, float3 s2, float3 s3, thread uint &mask) {
     const float3 turn = cross(s2 - s1, s3 - s1);
-    // The origin projected onto the triangle's plane. A needle triangle makes this a NaN.
+    // Degenerate triangles can produce a nonfinite projection.
     const float3 projected = turn * (dot(s1, turn) / dot(turn, turn));
-    // The Cartesian plane the triangle shades most, in cyclic order so an area's sign means one thing.
+    // Project onto the largest-area Cartesian plane in cyclic order to preserve orientation.
     uint u = 1, v = 2;
     float area = 0;
     for (uint i = 0; i < 3; ++i) {
@@ -809,7 +747,7 @@ static float3 SignedVolume2(float3 s1, float3 s2, float3 s3, thread uint &mask) 
     float nearest = INFINITY;
     float3 closest = s1;
     mask = 1;
-    for (uint j = 1; j < 3; ++j) { // never the newest vertex, which is why j starts at one
+    for (uint j = 1; j < 3; ++j) {
         if (!SameSign(area, -(j == 1 ? second : third))) continue;
         uint sub;
         const float3 point = SignedVolume1(s1, j == 1 ? s3 : s2, sub);
@@ -821,7 +759,6 @@ static float3 SignedVolume2(float3 s1, float3 s2, float3 s3, thread uint &mask) 
     return closest;
 }
 
-// And of a tetrahedron. All four coordinates agreeing in sign with its volume means the origin is inside it.
 static float3 SignedVolume3(float3 s1, float3 s2, float3 s3, float3 s4, thread uint &mask, thread bool &inside) {
     const float volume = Signed4(s1, s2, s3, s4);
     const float first = Signed4(float3(0), s2, s3, s4), second = Signed4(s1, float3(0), s3, s4);
@@ -842,15 +779,15 @@ static float3 SignedVolume3(float3 s1, float3 s2, float3 s3, float3 s4, thread u
         if (dot(point, point) >= nearest) continue;
         nearest = dot(point, point);
         closest = point;
-        const uint from[3] = {0, j == 1 ? 2u : 1u, j == 3 ? 2u : 3u}; // where each of the three came from
+        const uint from[3] = {0, j == 1 ? 2u : 1u, j == 3 ? 2u : 3u};
         mask = 0;
         for (uint b = 0; b < 3; ++b) mask |= ((sub >> b) & 1) << from[b];
     }
     return closest;
 }
 
-// The point of the simplex nearest the origin, cut back to the vertices that carry it.
 static float3 ReduceSimplex(thread Mink *simplex, thread uint &count, thread bool &inside) {
+    // Signed-volume simplex reduction (Montanari, Petrinic and Barbieri, 2017).
     inside = false;
     uint mask = 1;
     float3 closest = simplex[0].At;
@@ -867,10 +804,6 @@ static float3 ReduceSimplex(thread Mink *simplex, thread uint &count, thread boo
     return closest;
 }
 
-// GJK, Algorithm 1 of the same paper.
-// Returns false with the direction the two cores are apart along, out of b towards a, and the distance.
-// Returns true where they overlap, leaving its tetrahedron for EPA.
-// The new support point goes in at the front, the subalgorithm above taking s1 for the newest.
 static bool Gjk(
     Poly a, Poly b, device const float3 *pool, thread Mink *simplex, thread uint &count,
     thread float3 &direction, thread float &distance, uint lane
@@ -944,7 +877,6 @@ static float EpaSide(float3 a, float3 b, float3 c, float3 d) {
     return sum.x + sum.y;
 }
 
-// Adds one face to the polytope EPA is growing. False where the turn has no area to normalize by.
 static bool PushFace(
     thread const Mink *vertices, thread uint (*faces)[3], thread float3 *planes, thread float *offsets,
     thread uint &face_count, uint i, uint j, uint k, float3 turn
@@ -960,8 +892,6 @@ static bool PushFace(
     return true;
 }
 
-// The expanding polytope: grows the tetrahedron GJK finished inside towards the nearest face of the Minkowski difference.
-// That face's outward normal is the least separating direction, so the contact normal is its opposite.
 template<uint Capacity = MaxEpaVertices, bool Curved = false>
 static bool Epa(Poly a, Poly b, device const float3 *pool, thread Mink *simplex, thread float3 &normal, thread float &depth, uint lane) {
     Mink vertices[Capacity];
@@ -1037,9 +967,7 @@ static bool Epa(Poly a, Poly b, device const float3 *pool, thread Mink *simplex,
     return true;
 }
 
-// At most `limit` of the polytope's vertices at or past `threshold` along `axis`, named by index.
-// Where more qualify, taking the first of them would take a contiguous run of the rim, half a disc, which does not carry the body's centre.
-// They are picked by spread instead: the lowest-indexed qualifier anchors the set, and each one after it is the furthest from everything already kept.
+// Keep up to limit support vertices at or beyond threshold, named by vertex index.
 static uint SpreadSupport(
     Poly poly, device const float3 *pool, float3 axis, float threshold, uint limit, thread float3 *out, thread uint *names
 ) {
@@ -1052,11 +980,7 @@ static uint SpreadSupport(
         qualify += along >= threshold ? 1 : 0;
     }
 
-    // More corners reach than may be kept, and which ones go is constrained.
-    // A plane carries no face list, so the level of the deepest corner is the presented face.
-    // A corner further back than the resolution of the geometry is behind it.
-    // Left to the spread alone, a crowned plate keeps three untouching rim corners over three of the four it stands on.
-    // A body reduced to one point then rocks on nothing but I/h^2.
+    // Retain extremal support points in stable order.
     const float presented = deepest - FaceTolerance(poly, pool);
     if (qualify > limit && presented > threshold) {
         threshold = presented;
@@ -1090,7 +1014,7 @@ static uint SpreadSupport(
             if (dot(at, axis) < threshold) continue;
             float nearest = INFINITY;
             for (uint k = 0; k < found; ++k) nearest = min(nearest, distance_squared(at, out[k]));
-            if (nearest <= widest) continue; // ties go to the lower index, so the set is deterministic
+            if (nearest <= widest) continue;
             widest = nearest;
             pick = i;
         }
@@ -1101,10 +1025,7 @@ static uint SpreadSupport(
     return found;
 }
 
-// The face `poly` presents along `direction`: its vertices ordered so consecutive pairs are its edges, with the face's plane normal out of the polytope.
-// Fewer than three vertices is a corner or an edge, which cannot hold a manifold.
-// Which face it is comes from the shape's own construction, and a hull's from its cook, so no tolerance is needed. See HullFace in Shared.h.
-// The first point is the lowest vertex index, so edge zero is the same edge every step and a clipped point keeps its name.
+// Return the support face with outward winding and stable vertex identities.
 static uint SupportFace(
     Poly poly, device const float3 *pool, device const HullFace *hull_faces, float3 direction,
     thread float3 *out, thread uint *names, thread float3 &plane, uint lane = NoIndex, float3 towards = float3(0)
@@ -1221,7 +1142,6 @@ static uint SupportFace(
     return found;
 }
 
-// The unit normal of side plane `e`, out of the face. False where the edge is too short to give one.
 static bool SidePlane(thread const float3 *face, uint count, uint e, float3 plane, thread float3 &unit) {
     const float3 side = cross(face[(e + 1) % count] - face[e], plane);
     const float span = length(side);
@@ -1238,11 +1158,8 @@ static void AppendClipPoint(thread float3 *points, thread uint *names, thread ui
     names[count++] = name;
 }
 
-// How closely a normal must line up with a face to be that face's own. Loose, the match being unambiguous.
 constant float BuriedAlignment = 0.999f;
 
-// Whether `direction`, out of this shape, is a face buried against a sibling of its compound.
-// A contact there is inside the body's own solid, the join two coplanar children share being interior rather than surface. See InternalFaces.
 static bool BuriedAlong(Shape shape, Pose pose, device const HullFace *hull_faces, float3 direction) {
     const uint internal = InternalFaces(shape);
     if (internal == 0) return false;
@@ -1311,16 +1228,7 @@ static bool ConvexSeparation(Poly a, Poly b, device const float3 *pool, thread f
     return true;
 }
 
-// The manifold between two convex polytopes, `a` this body's and `b` the other's.
-// Fills each contact's pair of points, on a and on b, with the geometry's name and the normal out of b towards a.
-//
-// A name is the planes the point lies on: bits 0-7 an edge of the incident face and bits 8-15 a side plane of the reference one.
-// Then comes each polytope's face as its lowest vertex index, then which body presented the reference.
-// No part of a name is a position in the output array.
-//
-// `known` is a direction the caller has established the two are apart along, or zero to search.
-// A triangle requires it: a search a thousandth of a radian off stops a flat triangle presenting a face.
-// Given the direction, the triangle always takes the reference.
+// Return up to four contacts with normals from B to A and geometry-derived identities.
 static uint ConvexManifold(
     Poly a, Poly b, device const float3 *pool, device const HullFace *hull_faces, float margin, float3 known, thread float3 *here,
     thread float3 *there, thread uint *names, thread float3 &normal, uint lane = NoIndex
@@ -1597,10 +1505,7 @@ static uint MeshManifold(
     return kept;
 }
 
-// One piece of geometry, one row.
-// A clip emits the same point twice wherever the geometry is degenerate against it.
-// Each copy carries its own dual and penalty, which doubles the force at one spot.
-// Welded here rather than in each clipper, at the scale SupportFace resolves geometry at, keeping the first of each pair.
+// Weld coincident features into one constraint while preserving distinct contact geometry.
 static uint WeldManifold(thread float3 *here, thread float3 *there, thread uint *names, uint found, float tolerance) {
     uint kept = 0;
     for (uint i = 0; i < found; ++i) {
@@ -1616,8 +1521,8 @@ static uint WeldManifold(thread float3 *here, thread float3 *there, thread uint 
     return kept;
 }
 
-// Project the unreduced patch onto its tangent plane. Gift wrapping handles unordered points,
-// including interior and collinear points. Stationary patches use their diameter as extent.
+// Gift wrapping includes boundary points from an unordered projected patch.
+// Stationary patches use their diameter as extent.
 static float2 ManifoldGeometry(thread const float3 *points, uint count, float3 normal, Pose a, Pose b, Velocity va, Velocity vb) {
     if (count < 2) return float2(0);
     float3 center = float3(0);
@@ -1641,7 +1546,7 @@ static float2 ManifoldGeometry(thread const float3 *points, uint count, float3 n
         uint next = (at + 1) % count;
         for (uint i = 0; i < count; ++i) {
             const float2 a = projected[next] - projected[at], b = projected[i] - projected[at];
-            // Extent is attained at hull vertices, so this walk also finds the widest span.
+
             extent = max(extent, speed > 1e-6f ? abs(dot(b, direction)) : length(b));
             const float turn = a.x * b.y - a.y * b.x;
             if (turn < 0 || (turn == 0 && dot(b, b) > dot(a, a))) next = i;
@@ -1654,24 +1559,16 @@ static float2 ManifoldGeometry(thread const float3 *points, uint count, float3 n
     return float2(0.5f * abs(twice_area), extent);
 }
 
-// The four points of a manifold with the largest area between them, Gregorius's reduction (GDC 2015).
-// The talk is kept at ~/acoustic_solver_papers/2015_gregorius_robust-contact-creation.pdf.
-// Four points hold a face contact against turning as well as sliding.
-// Area rather than distance, because two points far apart on one edge leave the body free to rock about it.
 static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uint *names, uint found, float3 normal) {
+    // Gregorius manifold reduction: deepest point, furthest point, largest triangle, then greatest added area.
     if (found <= ManifoldPoints) return found;
-    // Every comparison below is settled by the geometry rather than by the last bits of a world position.
-    // A tie falling the other way renames all four points and discards their duals.
-    // An octagon lying flat is such a case: eight points at one depth and two squares of identical area.
-    // Rounding alone then flips the choice every few steps as the body turns.
-    // A challenger therefore has to beat the incumbent by a margin relative to the manifold's own size, which leaves every tie with the lowest-indexed point.
-    // This is the same relative-plus-absolute bias the box SAT keeps on its reference axis, for the same reason.
+    // Break ties with feature identity so rounding of world coordinates does not rename contacts.
     float extent = 0;
     for (uint i = 0; i < found; ++i) extent = max(extent, distance(here[i], here[0]));
     const float slack = 1e-5f * extent + 1e-9f, area_slack = 1e-5f * extent * extent + 1e-9f;
 
-    uint keep[4]; // the four picked here: deepest, furthest, largest triangle, most added area
-    // The deepest, so the point resolving penetration is always in the set.
+    uint keep[4];
+
     float deepest = INFINITY;
     keep[0] = 0;
     for (uint i = 0; i < found; ++i) {
@@ -1680,7 +1577,7 @@ static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uin
         deepest = separation;
         keep[0] = i;
     }
-    // The furthest from it, which is the longest the manifold reaches.
+
     float furthest = -1;
     keep[1] = keep[0];
     for (uint i = 0; i < found; ++i) {
@@ -1689,8 +1586,6 @@ static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uin
         furthest = dot(span, span);
         keep[1] = i;
     }
-    // The one making the largest triangle on that edge.
-    // Its sign gives the winding of the triangle about the normal, and swapping the pair to wind it positively lets the fourth point be found by sign alone.
     float widest = 0;
     keep[2] = keep[0];
     for (uint i = 0; i < found; ++i) {
@@ -1699,14 +1594,12 @@ static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uin
         widest = area;
         keep[2] = i;
     }
-    if (widest == 0) return 4; // every point on one line, so there is no area to choose by
+    if (widest == 0) return 4;
     if (widest < 0) {
         const uint swap = keep[1];
         keep[1] = keep[2];
         keep[2] = swap;
     }
-    // And the point adding the most to that triangle: outside one of its edges, the side the signed area comes out negative on.
-    // The largest such area decides, rather than the largest distance.
     float best = 0;
     keep[3] = keep[0];
     for (uint i = 0; i < found; ++i) {
@@ -1719,27 +1612,20 @@ static uint ReduceManifold(thread float3 *here, thread float3 *there, thread uin
         }
     }
 
-    // In the order they were found in, so a point's slot does not depend on which of the four roles it was chosen for.
-    float3 kept_here[4], kept_there[4];
-    uint kept_names[4], kept = 0;
+    uint kept = 0;
     for (uint i = 0; i < found; ++i) {
         bool wanted = false;
         for (uint k = 0; k < 4; ++k) wanted = wanted || keep[k] == i;
         if (!wanted) continue;
-        kept_here[kept] = here[i];
-        kept_there[kept] = there[i];
-        kept_names[kept] = names[i];
+        here[kept] = here[i];
+        there[kept] = there[i];
+        names[kept] = names[i];
         ++kept;
-    }
-    for (uint i = 0; i < kept; ++i) {
-        here[i] = kept_here[i];
-        there[i] = kept_there[i];
-        names[i] = kept_names[i];
     }
     return kept;
 }
 
-// How many triangles of one mesh a body may be collided against in a batch, and how deep the walk may go.
+// Batch capacity bounds temporary storage; traversal resumes until all candidates are visited.
 constant uint MaxMeshTriangles = COLLECT_LANES > 32 ? COLLECT_LANES : 32;
 constant uint MeshStackDepth = 32;
 
@@ -1776,14 +1662,9 @@ static bool OutsideNode(Poly convex, BvhNode node, float3 offset, float3x3 rotat
     return false;
 }
 
-// The next batch of triangles of a mesh whose bounds the body's own box reaches into.
-// `low` and `high` are the body's box in the mesh's frame, the frame the tree was built in.
-//
-// The walk's stack belongs to the caller and survives between calls.
-// `MaxMeshTriangles` therefore bounds how many are held at once rather than how much of the mesh a body may touch.
-// A body cut off at a fixed number gets no contacts at all and falls through the floor.
-//
-// A leaf's `First` counts from the mesh's first triangle and an interior node's from its own root.
+// Return the next triangle batch overlapping bounds in the mesh frame.
+// The caller retains traversal state between calls.
+
 static uint GatherTriangles(
     Shape mesh, float3 low, float3 high, Poly convex, float3 offset, float3x3 rotation, device const HullFace *faces, float margin,
     device const BvhNode *nodes, thread uint *stack, thread uint &depth, thread uint *out, uint lane
@@ -1888,7 +1769,7 @@ static uint GatherMeshPairs(
     return found;
 }
 
-// Whether a point lies along edge `e`'s line, to the tolerance the clip that made it measured with.
+// Return whether the point lies on the edge line within clipping tolerance.
 static bool OnEdgeLine(Poly face, device const float3 *pool, float3 outward, uint e, float3 at_point, float seam) {
     const float3 at = PolyVertex(face, pool, e);
     const float3 side = cross(PolyVertex(face, pool, (e + 1) % 3) - at, outward);
@@ -1896,8 +1777,7 @@ static bool OnEdgeLine(Poly face, device const float3 *pool, float3 outward, uin
     return span > 1e-12f && abs(dot(side / span, at_point - at)) <= seam;
 }
 
-// Reports the contacts a body held last step that were not claimed this one.
-// Every exit from CollectContacts goes through this, a body that stopped colliding having still ended every contact it held.
+// Report prior contacts that were unclaimed during collection.
 static void EndUnclaimed(
     device ContactEvent *events, device uint *counts, uint body, ulong claimed, uint reported,
     COLLECT_STORAGE const uint *was_feature, COLLECT_STORAGE const Index *was_other, COLLECT_STORAGE const Index *was_sub, COLLECT_STORAGE const Index *was_sub_a,
@@ -2629,15 +2509,30 @@ kernel void EvaluateQueries(device uint *pool [[buffer(11)]], constant StepParam
     }
 }
 
+// Lane zero owns contact slots; cooperative lanes share history and geometry scratch.
 struct ContactHistory {
     uint was_feature[ContactsPerBody], was_stick[ContactsPerBody];
-    Index was_other[ContactsPerBody]; // the partner body, which only a removal still needs
+    Index was_other[ContactsPerBody];
     Index was_sub_a[ContactsPerBody];
-    Index was_sub[ContactsPerBody]; // and which part of it, which for a mesh is the triangle
-    ulong was_children[ContactsPerBody]; // and which leaf of each shape, which for a compound is the child
+    Index was_sub[ContactsPerBody];
+    ulong was_children[ContactsPerBody];
     float3 was_lambda[ContactsPerBody], was_penalty[ContactsPerBody];
     float3 was_anchor_a[ContactsPerBody], was_anchor_b[ContactsPerBody];
 };
+
+static void SaveContactHistory(COLLECT_STORAGE ContactHistory &history, device Contact *slots, uint i) {
+    history.was_feature[i] = slots[i].Feature;
+    history.was_other[i] = slots[i].BodyB;
+    history.was_sub[i] = slots[i].SubShape;
+    history.was_sub_a[i] = slots[i].SubShapeA;
+    history.was_children[i] = slots[i].Children;
+    history.was_lambda[i] = slots[i].Lambda;
+    history.was_penalty[i] = slots[i].Penalty;
+    history.was_stick[i] = slots[i].Stick;
+    history.was_anchor_a[i] = slots[i].AnchorA;
+    history.was_anchor_b[i] = slots[i].AnchorB;
+    if (!PREPARE_QUERIES) slots[i].Active = false;
+}
 
 static void CollectManifold(
     const thread GeometryManifold &geometry, const thread GeometryQuery &q,
@@ -2843,65 +2738,52 @@ kernel void CollectContacts(
 #endif
     device Contact *slots = contacts + body * ContactsPerBody;
     device ContactEvent *events = contact_events + body * EventsPerBody;
-    // Which of last step's slots a point has claimed, and how many events this body has written. The
-    // claim must accumulate over every body this one touches before anything can be called removed.
-    // One bit a slot, in a word wide enough for the whole run, which caps ContactsPerBody at 64.
+    // Track claimed prior slots and emitted events separately from the current contact count.
     ulong claimed = 0;
     uint reported = 0;
-    // Which slot each live contact inherited from, per slot since a contact can lose its place later.
+
     uint inherited[ContactsPerBody];
 
-    // The previous step's state, kept only so a matching feature can inherit it.
     COLLECT_STORAGE ContactHistory history;
-    // A run is dense from zero and one NoIndex sentinel ends it, where every reader of was_* stops.
+    // One SIMD group copies the dense history run without changing its sentinel.
+#if COLLECT_LANES >= 32
+    if (lane < 32) {
+        uint first_inactive = ContactsPerBody;
+        for (uint i = lane; i < ContactsPerBody; i += 32)
+            if (!slots[i].Active) first_inactive = min(first_inactive, i);
+        first_inactive = simd_min(first_inactive);
+        for (uint i = lane; i < first_inactive; i += 32) SaveContactHistory(history, slots, i);
+        if (lane == 0 && first_inactive < ContactsPerBody) history.was_feature[first_inactive] = NoIndex;
+    }
+#else
+
     if (lane == 0) {
         for (uint i = 0; i < ContactsPerBody; ++i) {
             if (!slots[i].Active) {
                 history.was_feature[i] = NoIndex;
                 break;
             }
-            history.was_feature[i] = slots[i].Feature;
-            history.was_other[i] = slots[i].BodyB;
-            history.was_sub[i] = slots[i].SubShape;
-            history.was_sub_a[i] = slots[i].SubShapeA;
-            history.was_children[i] = slots[i].Children;
-            history.was_lambda[i] = slots[i].Lambda;
-            history.was_penalty[i] = slots[i].Penalty;
-            history.was_stick[i] = slots[i].Stick;
-            history.was_anchor_a[i] = slots[i].AnchorA;
-            history.was_anchor_b[i] = slots[i].AnchorB;
-            if (!PREPARE_QUERIES) slots[i].Active = false;
+            SaveContactHistory(history, slots, i);
         }
     }
-    if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+    if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     const Index shape_index = body_shapes[body];
-    // Deliberately no test for a static body, a dynamic mesh's partner being able to be static.
-    // Exiting on mass alone would leave no owner for the pair, and the mesh falls through.
-    if (shape_index == NoIndex) {
+    if (shape_index == NoIndex || shapes[shape_index].Kind == ShapePlane) {
         if (!PREPARE_QUERIES && lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
         return;
     }
     const Shape body_shape = shapes[shape_index];
-    if (body_shape.Kind == ShapePlane) {
-        if (!PREPARE_QUERIES && lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
-        return;
-    }
     const Pose pose = poses[body];
     const Filter own_filter = filters[body];
     const float own_inverse_mass = masses[body].InvMass;
-    // Whether the solve moves this body at all, which decides which body owns a pair.
-    // Not the inverse mass alone, because a body pinned in space with an inertia of its own is turned by every contact.
     const bool i_move = Moves(masses[body]);
-    // The pieces this body presents, each already at its pose within the body frame. See Shape.
+
     const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
 
     uint count = 0;
-    // A sleeping body's pairs against equally frozen partners are carried forward verbatim.
-    // Neither pose has moved, so every anchor, C0 and dual is still exact.
-    // Coverage survives because an approaching body is awake and its pairs are re-collided from whichever side owns them.
-    // Sleep state is settled once a step, so both sides agree on frozen without communicating.
-    // Frozen rather than static or asleep: a kinematic body is moved by nothing here yet is moving, and an undriven static body has not moved either.
+    // Carry frozen pairs forward unchanged; remeasure reporting geometry when reporting is enabled later.
     COLLECT_STORAGE bool measure_cached;
     if (lane == 0) measure_cached = false;
 #if SENSOR_PASS
@@ -2911,14 +2793,14 @@ kernel void CollectContacts(
 #endif
     if (frozen && lane == 0) {
         for (uint j = 0; j < ContactsPerBody; ++j) {
-            if (history.was_feature[j] == NoIndex) break; // the sentinel ending the dense run
+            if (history.was_feature[j] == NoIndex) break;
             const Index partner = history.was_other[j];
-            if (body_shapes[partner] == NoIndex) continue; // removed, and its contacts end with it
-            if (!Frozen(masses[partner], velocities[partner], quiet[partner], p)) continue; // moving, so re-collide
+            if (body_shapes[partner] == NoIndex) continue;
+            if (!Frozen(masses[partner], velocities[partner], quiet[partner], p)) continue;
             const Shape other_root = shapes[body_shapes[partner]];
             if (own_filter.Sensor || filters[partner].Sensor ||
                 !Allows(LeafFilter(body_shape, OwnChild(history.was_children[j]), own_filter, shapes, compound_children), LeafFilter(other_root, OtherChild(history.was_children[j]), filters[partner], shapes, compound_children))) continue;
-            // A compacting copy, and j never runs ahead of count.
+
 #if !PREPARE_QUERIES
             slots[count] = slots[j];
             slots[count].Active = true;
@@ -2960,8 +2842,7 @@ kernel void CollectContacts(
         }
     }
 #else
-    // Every leaf of this body against every leaf of every other, run full or not.
-    // Which contacts a body keeps must not depend on the order the partners were visited in, and the refusal count below is then exact.
+    // Visit every leaf pair even after the contact run fills.
 #if PREPARE_QUERIES
     for (uint own_leaf = first_leaf; own_leaf < last_leaf; ++own_leaf) {
 #else
@@ -2972,14 +2853,10 @@ kernel void CollectContacts(
         if (shape.Kind == ShapePlane) continue;
         const CollisionMask leaf_filter = ResolveFilter(shape, ResolveFilter(body_shape, {own_filter.Layer, own_filter.Collides}));
         if (own_filter.Mixed && InternalFaces(shape) != 0) shape.FirstTriangle = 0;
-        // Where this leaf's geometry is.
-        // Everything reading geometry works from this, and everything naming a point - anchors, lever arms, C0 - works from `pose`.
-        // A contact belongs to the body frame whatever pose the shape sits at.
         const Pose shape_pose = ComposePose(pose, shape.Local);
         Poly leaf_poly = MakePoly(shape_pose, shape);
         // A mesh against a half-space queries its vertex run, with no hull cook or face list.
         if ((MESH_SHAPES && shape.Kind == ShapeMesh)) leaf_poly.Kind = ShapeHull;
-        // Hoisted out of the partner loop, being a scan over every vertex of a hull.
         const uint geometry_lane = COLLECT_LANES >= 32 ? lane % 32 : NoIndex;
         float own_reach = (MESH_SHAPES && shape.Kind == ShapeMesh) ? -1 : PolyReach(leaf_poly, hull_vertices, geometry_lane) + shape.Radius;
 #if BROAD_PHASE_MODE == 1
@@ -2989,23 +2866,17 @@ kernel void CollectContacts(
         for (uint other = 0; other < p.BodyCount; ++other) {
 #endif
             if (!(broad_phase[body].Candidates & (1u << other))) continue;
+#elif !MESH_SHAPES && COLLECT_LANES == 1
+        BodyCandidateCursor candidates{};
+        for (uint other = NextBodyCandidateBatch<2>(broad_phase, p.BodyCount, body, candidates); other != NoIndex; other = NextBodyCandidateBatch<2>(broad_phase, p.BodyCount, body, candidates)) {
 #else
-        for (uint other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, 0); other != NoIndex; other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, other + 1)) {
+    for (uint other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, 0); other != NoIndex; other = NextBodyCandidate<2>(broad_phase, p.BodyCount, body, other + 1)) {
 #endif
             const Index other_shape = body_shapes[other];
             if (other == body || other_shape == NoIndex) continue;
-            // The pairs the carry above holds, two frozen poses producing nothing new.
+
             const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
             if (cached_pair && !measure_cached) continue;
-            // One manifold per pair, owned by the lower-indexed body, as the references do.
-            // Generating it from both sides gives two independent constraint sets with two sets of duals for one physical contact.
-            // Jacobi's symmetry hides that and Gauss-Seidel does not.
-            // A body may defer only to a partner that will actually present the manifold.
-            // Of two convex bodies the one the solve moves comes first.
-            // A body of infinite mass that turns counts as moving, or nothing spins a pinned wheel.
-            // Deliberately not split by parity to even the load.
-            // Consecutive indices in a stack always sum odd, so parity flips every pair rather than alternating.
-            // The middle of the stack then creeps under SleepSpeed and over SleepDrift for ever.
             const bool they_move = Moves(masses[other]);
 #if SENSOR_PASS
             if (!(own_filter.Sensor || filters[other].Sensor)) continue;
@@ -3015,7 +2886,7 @@ kernel void CollectContacts(
             if (!i_move && !they_move) continue;
 
 #endif
-            // Each must be in the other's mask, and a joint between them makes the overlap by design.
+
             const Filter theirs = filters[other];
             if (!Allows(leaf_filter, theirs.Aggregate)) continue;
             bool jointed = false;
@@ -3025,12 +2896,6 @@ kernel void CollectContacts(
             const Shape other_body_shape = shapes[other_shape];
             if ((MESH_SHAPES && shape.Kind == ShapeMesh) && other_body_shape.Kind != ShapePlane && (!MESH_PAIRS || (!MESH_SHAPES || other_body_shape.Kind != ShapeMesh)) && other_body_shape.Kind != ShapeCompound) continue;
             const Pose target_pose = poses[other];
-            // How far apart the pair may be and still be given contacts.
-            // A contact built while the bodies are apart carries the gap as slack and does no work until the step's motion consumes it.
-            // The step therefore ends at touch.
-            // Avian's velocity-scaled margin with MetalAVBD's gravity term, a whole g h^2, since Integrate's target is x + h v + h^2 g.
-            // Rotation is deliberately left out, collision at the pose the step began from being blind to swept orientation.
-            // This replaces the margin in every generation test and nowhere else, C0 keeping ContactMargin.
             const Velocity own_velocity = velocities[body], other_velocity = velocities[other];
 #if SENSOR_PASS
             const float reach = 0;
@@ -3040,8 +2905,6 @@ kernel void CollectContacts(
                     p.MaxContactReach);
 #endif
 
-            // And the other body's pieces, each against this one.
-            // A leaf pair carries its own manifold, duals and name, a point on leaf 3 against leaf 5 being different geometry from leaf 2 against the same 5.
             const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
             for (uint target_leaf = 0; target_leaf < target_leaf_count; ++target_leaf) {
 #if PREPARE_QUERIES
@@ -3079,7 +2942,7 @@ kernel void CollectContacts(
                     }
                     for (uint own_base = 0; own_base < own_count; own_base += mesh_pair ? COLLECT_LANES : 1) {
                         // Padded mesh-pair lanes repeat the last query to keep traversal uniform.
-                        // Collection discards padded results.
+// Collection discards padded results.
                         const uint own_at = mesh_pair ? min(own_base + lane, own_count - 1) : own_base;
                         const Index own_triangle = mesh_pair ? shape.FirstTriangle + own_candidates[own_at].x : NoIndex;
                         Poly own_poly = mesh_pair ? MakeTriangle(shape_pose, mesh_triangles[own_triangle]) : leaf_poly;
@@ -3116,7 +2979,7 @@ kernel void CollectContacts(
                                 if (nearest > offset + reach + roundoff) continue;
                             }
                         }
-                        const Pose target_shape_pose = ComposePose(target_pose, target.Local); // as above, on the other side
+                        const Pose target_shape_pose = ComposePose(target_pose, target.Local);
                         Poly plane_patch{};
                         float pair_reach = own_reach;
                         if (BoundedPlane(target)) {
@@ -3134,16 +2997,13 @@ kernel void CollectContacts(
                             pair_reach = PolyReach(own_poly, hull_vertices, mesh_pair ? NoIndex : geometry_lane);
                             if (!mesh_pair) own_reach = pair_reach;
                         }
-                        // How close two points must be to be one, the scale SupportFace resolves at.
+
                         const float geometry = max(pair_reach, BoundedPlane(target) ? PolyReach(plane_patch, hull_vertices) : PolyReach(MakePoly(target_shape_pose, target), hull_vertices, mesh_pair ? NoIndex : geometry_lane) + target.Radius);
                         const float weld = 1e-3f * geometry + 1e-6f;
 
-                        // How many manifolds this pair has: one, or one per mesh triangle the body reaches, a batch at a time.
-                        // The walk's stack lives out here so it survives between batches.
                         uint candidates[MaxMeshTriangles], walk[MeshStackDepth], depth = 0;
                         float3 low = 0, high = 0;
                         if ((MESH_SHAPES && target.Kind == ShapeMesh) && !mesh_pair) {
-                            // The body's box in the mesh's frame, let out by radius and margin.
                             PolyBounds(own_poly, target_shape_pose, hull_vertices, low, high, geometry_lane);
                             const float let_out = own_poly.Radius + reach;
                             low -= let_out;
@@ -3199,6 +3059,7 @@ kernel void CollectContacts(
 #endif
                                 const uint manifold = mesh_pair ? 0 : batch + lane;
                                 const bool cooperate = COLLECT_LANES >= 32 && ConvexLeaf(shape.Kind) && ConvexLeaf(target.Kind) && (shape.Kind == ShapeHull || target.Kind == ShapeHull);
+                                const GeometryQuery query{shape, target, pose, target_pose, shape_pose, target_shape_pose, own_poly, plane_patch, own_bounds.Center, target_bounds.Center, own_velocity, other_velocity, reach, weld, mesh_pair, plane_back, bool(p.ReportContacts)};
                                 if (manifold < manifolds || (cooperate && lane < 32)) {
                                     const ulong children = ChildPair(own_leaf, target_leaf);
                                     uint previous = NoIndex;
@@ -3210,7 +3071,6 @@ kernel void CollectContacts(
                                                 break;
                                             }
                                     }
-                                    const GeometryQuery query{shape, target, pose, target_pose, shape_pose, target_shape_pose, own_poly, plane_patch, own_bounds.Center, target_bounds.Center, own_velocity, other_velocity, reach, weld, mesh_pair, plane_back, bool(p.ReportContacts)};
                                     const uint candidate = mesh_pair || (MESH_SHAPES && target.Kind == ShapeMesh) || (BoundedPlane(target) && (MESH_SHAPES && shape.Kind == ShapeMesh)) ? candidates[manifold] : 0;
 #if PREPARE_QUERIES
                                     if (lane < query_count && query_base != NoIndex && query_base + query_count <= QueryHeader(query_pool).TaskCapacity && context_base < QueryHeader(query_pool).ContextCapacity && batch_base < QueryHeader(query_pool).BatchCapacity) {
@@ -3229,7 +3089,7 @@ kernel void CollectContacts(
                                 if (lane == 0) {
                                     for (uint query_at = 0; query_at < min(uint(COLLECT_LANES), mesh_pair ? own_count - own_base : manifolds - batch); ++query_at) {
                                         const GeometryManifold geometry = geometries[query_at];
-                                        CollectManifold(geometry, GeometryQuery{shape, target, pose, target_pose, shape_pose, target_shape_pose, own_poly, plane_patch, own_bounds.Center, target_bounds.Center, own_velocity, other_velocity, reach, weld, mesh_pair, plane_back, bool(p.ReportContacts)}, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                                        CollectManifold(geometry, query, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
                                     }
                                 }
 #endif
@@ -3244,19 +3104,30 @@ kernel void CollectContacts(
 
 #endif
 
-    if (PREPARE_QUERIES || lane != 0) return;
+    if (PREPARE_QUERIES) return;
+#if !SENSOR_PASS && COLLECT_LANES >= 32
+    threadgroup_barrier(mem_flags::mem_device);
+    if (lane >= 32) return;
+    const uint final_count = simd_shuffle(count, 0);
+    constexpr uint final_stride = 32;
+#else
+    if (lane != 0) return;
+    const uint final_count = count;
+    constexpr uint final_stride = 1;
+#endif
 #if !SENSOR_PASS
-    for (uint first = 0; first < count;) {
+    for (uint first = 0; lane == 0 && first < count;) {
         const Index other = slots[first].BodyB;
         uint end = first + 1;
         while (end < count && slots[end].BodyB == other) ++end;
         atomic_fetch_add_explicit((device atomic_uint *)&incoming[other].Count, end - first, memory_order_relaxed);
         first = end;
     }
-    for (uint k = 0; k < count; ++k) {
+    // Divide the pair's inertial stiffness among points sharing a normal to avoid multiplying support stiffness.
+    for (uint k = lane; k < final_count; k += final_stride) {
         device Contact &contact = slots[k];
         uint points = 0;
-        for (uint j = 0; j < count; ++j)
+        for (uint j = 0; j < final_count; ++j)
             points += slots[j].BodyB == contact.BodyB && dot(slots[j].Normal, contact.Normal) > 0.99999f;
         const uint other = contact.BodyB;
         float inverse = own_inverse_mass + masses[other].InvMass;
@@ -3269,8 +3140,8 @@ kernel void CollectContacts(
         contact.StiffnessScale = PairStiffness(inverse, p.DeltaTime) / float(points);
         contact.Penalty.x = max(contact.Penalty.x, contact.StiffnessScale);
     }
-    // The events, once the run has settled rather than as each point is written.
-    // A contact that lost its place to a deeper one was never held, so it reports no addition and its inherited slot does not count as claimed.
+    if (lane != 0) return;
+    // Emit events after replacement and welding finish so only retained contacts are reported.
     for (uint k = 0; k < count; ++k) {
         if (inherited[k] != NoIndex) claimed |= 1ul << inherited[k];
         events[reported++] = ContactEvent{body, slots[k].BodyB, slots[k].Feature, slots[k].SubShape, slots[k].Children, uint(inherited[k] != NoIndex ? ContactPersisted : ContactAdded), slots[k].SubShapeA};
@@ -3279,22 +3150,17 @@ kernel void CollectContacts(
 #endif
 }
 
-// A joint's frame on a body: the frame it recorded, turned by the body's current orientation.
 static float4 JointFrame(float4 orientation, float4 frame) { return QuatMul(orientation, frame); }
 
-// How far the frames have turned apart, back in the frame on B, where the joint's axes are named.
 static float4 RelativeFrame(float4 frame_a, float4 frame_b) { return QuatMul(QuatConjugate(frame_b), frame_a); }
 
-// The twist half of that rotation about one of the frame's axes.
-// The remainder is the swing, whose axis is perpendicular, so the two together give the rotation with nothing double counted (Sec. 3.3).
 static float4 TwistPart(float4 relative, float3 axis) {
     const float4 along = MakeFloat4(dot(relative.xyz, axis) * axis, relative.w);
     const float size = length(along);
-    // Zero only where the pair has swung a half turn about a perpendicular axis, which is a hinge already come apart.
+
     return size > 1e-7f ? along / size : float4(0, 0, 0, 1);
 }
 
-// The twist angle, within a half turn of `near`, so a wheel's angle stays continuous.
 static float TwistAngle(float4 relative, float3 axis, float near) {
     const float4 twist = TwistPart(relative, axis);
     const float turn = 2 * atan2(dot(twist.xyz, axis), twist.w);
@@ -3302,15 +3168,11 @@ static float TwistAngle(float4 relative, float3 axis, float near) {
     return near + (turn - near) - full * round((turn - near) / full);
 }
 
-// How far the two frames have turned apart, resolved along the joint frame's own three axes.
-// With a twist axis it is swing-twist: the two locked rows read the swing's rotation-vector components and the twist row the unwrapped angle.
-// Neither goes near the log map's seam, where every component flips sign at once and the gain collapses.
-// Without a twist axis the whole misalignment is the plain rotation vector, which does reach that seam.
 static float3 AngularError(float4 relative, uint twist_axis, float unwrapped) {
     if (twist_axis > 2) return RotationVector(relative);
     const float3 axis = UnitAxis(twist_axis);
     float3 error = RotationVector(QuatMul(relative, QuatConjugate(TwistPart(relative, axis))));
-    error[twist_axis] = unwrapped; // exactly where the swing has nothing, its axis being perpendicular to this one
+    error[twist_axis] = unwrapped;
     return error;
 }
 
@@ -3332,9 +3194,7 @@ static float3 AngularGradient(float4 relative, uint twist_axis, uint row) {
     return gradient - twist_gradient * dot(Rotate(swing, axis), gradient);
 }
 
-// Everything a joint's rows are measured from at the pose an iteration has reached.
-// The frame on B, the reach between the anchors, the angular error about those axes, and how far the pair has turned since the step began.
-// Primal and dual must agree here.
+// Remeasure joint rows at the current iterate without advancing the stored twist.
 struct JointMeasure {
     float4 FrameB;
     float3 Reach, Error, Turned;
@@ -3350,16 +3210,11 @@ static JointMeasure MeasureJoint(JointPointer joint, Pose a, Pose b, device cons
     return {frame_b, WorldPoint(a, joint->AnchorA) - WorldPoint(b, joint->AnchorB), AngularError(relative, twist_axis, unwrapped), RotationVector(QuatMul(a.Orientation, QuatConjugate(initial[joint->BodyA].Orientation))) - RotationVector(QuatMul(b.Orientation, QuatConjugate(initial[joint->BodyB].Orientation))), relative};
 }
 
-// The configuration of one axis of a joint, in its row's units: metres and newtons for a linear axis, radians and newton metres for an angular one.
-// One struct, because the two are the same row twice over with only the Jacobian differing.
-// The remaining fields hold its measured coordinate and solver state.
 struct AxisSetup {
     uint Mode;
     float Stiffness, Damping, Speed, Target, MaxForce, Low, High;
-    float3 Axis; // the direction the row acts along or about, in world
-    // `Value` is the row's coordinate now and `Began` its value when the step began.
-    // `Moved` is how far the bodies travelled along the row since, which differs from the error.
-    // A motor turning for ever wraps its error at half a turn but never its travel.
+    float3 Axis;
+    // Value is the current coordinate; Began is its value at the start of the step.
     float Value, Began, Moved;
     float Lambda, Penalty;
 };
@@ -3409,43 +3264,27 @@ static AxisSetup JointRowAt(JointPointer joint, JointMeasure measured, uint row)
     return setup;
 }
 
-// The correction one row of a joint requests this iteration, and the bounds on the force it may apply.
-// Primal and dual both come through here, because Eq. 16 ramps a row only while strictly inside its bounds.
-// A row they disagreed about would be clamped in one and free in the other.
-// Returns false where the row holds nothing, which is a limited axis inside its range, handled by the caller.
-// A free axis never reaches here.
 static bool JointRow(
     AxisSetup axis, float dt, thread float &c, thread float &damped, thread float &low, thread float &high
 ) {
-    // A spring carries its whole extension, so alpha holds nothing back for it.
     const float alpha = IsHard(axis.Stiffness) ? ConstraintAlpha : 0;
     c = axis.Value - axis.Began * alpha;
-    // What the damper acts on: how far the row moved this step against the rate asked of it.
-    // For every mode but one that rate is zero.
-    // A driven row's value is already travel measured against its speed's travel, so a brake damps the whole velocity error.
+    // Damping acts on displacement relative to the requested velocity over this step.
     damped = axis.Value - axis.Began;
     low = -INFINITY;
     high = INFINITY;
     if (axis.Mode == AxisDriven) {
-        // Against the travel its speed makes in a step, the solve moving distances rather than velocities.
         c = axis.Moved - axis.Speed * dt;
         damped = c;
         low = -axis.MaxForce;
         high = axis.MaxForce;
     } else if (axis.Mode == AxisPositioned) {
-        // How far the row is from where it is driven to, the same shift a stop makes below.
-        // The target is this row's zero, and the rest follows a locked row's rule.
-        // A hard row spreads its error by alpha exactly as a lock does, and post-stabilization removes the error a step begins with after velocity is read.
-        // Taken whole it is Sec. 3.6's explosive correction.
-        // A soft row takes alpha zero and carries its whole extension.
         c -= axis.Target * (1 - alpha);
         damped -= axis.Speed * dt;
         low = -axis.MaxForce;
         high = axis.MaxForce;
     } else if (axis.Mode == AxisLimited) {
-        // Which stop the row is against is taken from where the step began rather than from where the sweep reached, so a row cannot change sides mid-solve.
-        // That is the same discipline that fixes a contact's feature.
-        // Outside the range the row is one-sided exactly as a contact's normal row is.
+        // Choose a limit side from the initial pose so the row cannot switch stops during a solve.
         if (axis.Began > axis.High) {
             c -= axis.High * (1 - alpha);
             low = 0;
@@ -3459,13 +3298,8 @@ static bool JointRow(
     return true;
 }
 
-// The force a row applies, and the stiffness reported to the block: two Eq. 7 forces plus Eq. 13's dual.
-// The viscous one is `rate`, the damping coefficient over the step.
-// Backwards Euler on -c dC/dt gives energy (c/2h)(C - C0)^2 with Hessian (c/h) J^T J, so the row's stiffness is penalty + c/h.
-// The damper needs no dual and no ramp, its stiffness being exact.
-//
-// Eq. 14's secant applies where the bounds bind, held in [0, penalty + rate] to keep H definite for an LDL without pivoting.
-// Without it a bounded motor asked for a distant angle saturates and reaches half its due rate.
+// Combine elastic and viscous forces with the dual in the shifted force interval.
+// The stiffness returned to the body block follows the unclamped force.
 static float RowForce(
     float penalty, float rate, float c, float damped, float lambda, float low, float high, thread float &stiffness
 ) {
@@ -3476,7 +3310,6 @@ static float RowForce(
     return force;
 }
 
-// Joints are re-measured every iteration, so a step records only C0 and the penalty decay.
 static void PrepareJointsBody(
     device Joint *joints, device const Pose *poses,
     constant StepParams &p, uint index
@@ -3523,13 +3356,13 @@ kernel void PrepareJoints(
     PrepareJointsBody(joints, poses, p, index);
 }
 
-// Eqs. 11 and 16 for joints.
 static bool LargeIsland(device const uint *pool, constant StepParams &p, uint body) {
     uint root = pool[IslandHeaderWords + body];
     while (root != pool[IslandHeaderWords + root]) root = pool[IslandHeaderWords + root];
     return pool[IslandHeaderWords + p.BodyCount + root] > IslandBodyLimit;
 }
 
+// A joint with two unsolved endpoints still updates its dual once, owned by A.
 static uint JointDualOwner(device const Joint &joint, device const BodyMass *masses, device const uint *quiet, constant StepParams &p) {
     return Solved(masses[joint.BodyA], quiet[joint.BodyA], p) ? joint.BodyA :
         Solved(masses[joint.BodyB], quiet[joint.BodyB], p)    ? joint.BodyB :
@@ -3714,11 +3547,6 @@ kernel void SortIncoming(
     SortIncomingBody(incoming, slots, masses, p, body);
 }
 
-// The separation the normal row measures from, before this step's motion.
-// A contact generated while the bodies were apart has a gap to consume first, and that slack is the separation alone.
-// C0's normal row is separation plus ContactMargin, and the margin is the depth a contact rests at rather than slack.
-// Carrying the margin here too would step by a whole margin as a contact crosses from apart to touching.
-// Post-stabilization keeps the whole of C0.
 static float NormalOffset(Contact contact, constant StepParams &p) {
 #if STABILIZE
     return contact.C0[0];
@@ -3727,9 +3555,6 @@ static float NormalOffset(Contact contact, constant StepParams &p) {
 #endif
 }
 
-// Eq. 15's constraint in the contact basis: the separation the step began with, plus the two bodies' displacement since.
-// `arm_a` and `arm_b` are the anchors turned by the pose the step began from, so the Jacobian is the fixed one.
-// Primal and dual both come through here and must agree exactly, or Eq. 16 ramps against a constraint nothing is solving.
 static float3 ContactConstraint(
     Contact contact, constant StepParams &p, ContactBasis basis, float3 arm_a, float3 arm_b,
     Displacement moved_a, Displacement moved_b
@@ -3745,7 +3570,6 @@ static float3 ContactConstraint(
     return c;
 }
 
-// The requested contact force, clamped: row 0 only pushes and rows 1 and 2 stay inside the cone.
 static float3 ContactForce(float3 requested, float friction) {
     float3 force = requested;
     force[0] = min(force[0], 0.f);
@@ -3760,17 +3584,12 @@ static float3 ContactForce(float3 requested, float friction) {
 
 static Index ContactPartner(Contact contact, uint body) { return contact.BodyA == body ? contact.BodyB : contact.BodyA; }
 
-// And the body at the other end of a joint, NoIndex where the joint is not this body's or the far end cannot move.
 static Index JointPartner(Joint joint, uint body, device const BodyMass *masses) {
     if (!joint.Active || (joint.BodyA != body && joint.BodyB != body)) return NoIndex;
     const Index other = joint.BodyA == body ? joint.BodyB : joint.BodyA;
     return Moves(masses[other]) ? other : NoIndex;
 }
 
-// Walks a body's contacts: its own run, where it is A, then the list gathered this step, where it is B.
-// The two together cover all of them without reading another body's slots.
-// Returns NoIndex where there is nothing at `i`.
-// The own run is dense from zero, so its first inactive slot ends it and `i` skips the rest.
 static uint ContactSlot(thread uint &i, uint own, uint start, device const uint *incoming_slots, device const Contact *contacts) {
     const uint slot = i < ContactsPerBody ? own + i : incoming_slots[start + i - ContactsPerBody];
     if (contacts[slot].Active) return slot;
@@ -3778,16 +3597,10 @@ static uint ContactSlot(thread uint &i, uint own, uint start, device const uint 
     return NoIndex;
 }
 
-// The lowest color the mask does not hold, capped at the width of the mask itself.
 static uint LowestFree(uint taken) {
-    uint at = 0;
-    while (at < 31 && (taken & (1u << at)) != 0) ++at;
-    return at;
+    return ctz(~taken | (1u << 31));
 }
 
-// One neighbour of a body being coloured, counted in the first sweep and read for its colour in the
-// second, since degree must be whole before priority can be judged. Conflicts are judged against
-// prioritized neighbours, and a compacting body moves only to a colour no neighbour holds.
 static void NoteNeighbour(
     uint sweep, uint other, uint other_word, uint body, bool both_quiet,
     thread uint &degree, thread uint &taken, thread uint &taken_all
@@ -3801,13 +3614,8 @@ static void NoteNeighbour(
     if (Prioritized(other_word, other, degree, body, both_quiet)) taken |= held;
 }
 
-// Algorithm 1 line 2, "update colorization".
-// Bodies of one color share no constraint, so a color solves in parallel, and the sequence of colors gives the Gauss-Seidel propagation a stack needs.
-// The paper's scheme, incremental and allowed to come out imperfect, because two neighbours sharing a color fall back to Jacobi.
-//
-// Two amendments, both gated on the pair having gone quiet. See Prioritized.
-// Priority goes by contact degree before index, Welsh-Powell's ordering, because index order is add order.
-// And a quiet body moves down to the lowest free color, which lets a settled coloring improve.
+// Incremental coloring uses degree and body identity for deterministic priority.
+// Unresolved conflicts retain snapshot reads and relaxed body updates.
 static void UpdateColorsBody(
     device const uint *colors, device uint *next,
     device const Contact *contacts, device const BodyMass *masses,
@@ -3924,6 +3732,7 @@ static bool SolveBody(
     const uint worker = lane % WorkLanes;
     if (body >= p.BodyCount) return false;
     const BodyMass mass = masses[body];
+
     if (!Solved(mass, quiet[body], p) || ColorOf(colors[body]) % p.MaxColors != color) return false;
 
     const uint block_row = worker % Dof, base = lane - worker;
@@ -3935,10 +3744,6 @@ static bool SolveBody(
 #pragma unroll
     for (uint j = 0; j < Dof; ++j) H[j] = 0;
 
-    // Eqs. 5 and 6: M / h^2 on the block diagonal, and a gradient pulling back towards free flight.
-    // An infinite mass or inertia contributes nothing and is dropped from the block at the end. See LockDirection.
-    // A rigid axis is held out of the reciprocal on the way in and zeroed on the way out, and never divided by.
-    // Fast math may assume no infinity arises, and an ordinary body must come out bit for bit as before.
     const bool3 rigid = mass.InvInertiaLocal == float3(0);
     const float3 heavy = select(1 / select(mass.InvInertiaLocal, float3(1), rigid), float3(0), rigid);
     const float m = Translates(mass) ? 1 / mass.InvMass : 0;
@@ -3960,25 +3765,25 @@ static bool SolveBody(
         for (uint j = 0; j < 3; ++j) H[3 + j] = WideMul(float2(world_inertia[j][block_row - 3], 0), float2(inv_dt2, 0));
     }
 
-    // Every contact this body is party to, at a cost independent of the body count. See ContactSlot.
     const Adjacency neighbours = incoming[body];
     bool shared_color = false;
     uint own_count = 0;
     while (own_count < ContactsPerBody && contacts[body * ContactsPerBody + own_count].Active) ++own_count;
     const uint contact_count = own_count + neighbours.Count;
-    for (uint first = 0; first < contact_count; first += WorkLanes) {
-        const uint i = first + worker;
+    constexpr uint ContactsPerBatch = SOLVE_BODIES_PER_GROUP == 1 ? WorkLanes / Dof : WorkLanes;
+    for (uint first = 0; first < contact_count; first += ContactsPerBatch) {
+        const uint i = first + (SOLVE_BODIES_PER_GROUP == 1 ? worker / Dof : worker);
         const uint slot = i >= contact_count ? NoIndex : i < own_count ? body * ContactsPerBody + i :
                                                                          incoming_slots[neighbours.Start + i - own_count];
         BodyContactRows rows{};
-        rows.Valid = slot != NoIndex && contacts[slot].Active;
+        rows.Valid = (SOLVE_BODIES_PER_GROUP != 1 || worker < ContactsPerBatch * Dof) && slot != NoIndex && contacts[slot].Active;
         if (rows.Valid) {
             const Contact contact = contacts[slot];
             const bool mine_is_a = contact.BodyA == body;
             const Index other = ContactPartner(contact, body);
             rows.Shared = Solved(masses[other], quiet[other], p) && ColorOf(colors[other]) % p.MaxColors == color;
 
-            // C is always A minus B.
+            // Contact anchors and axes remain fixed during sweeps; map angular displacement through LogGradient.
             const Pose start_a = mine_is_a ? start : initial[contact.BodyA];
             const Pose start_b = mine_is_a ? initial[contact.BodyB] : start;
             const float3 arm_a = Rotate(start_a.Orientation, contact.AnchorA);
@@ -4012,15 +3817,37 @@ static bool SolveBody(
                 rows.Angular[r] = LogGradient(mine_is_a ? moved_a.Angular : moved_b.Angular, cross(arm, basis.Axis[r]));
             }
         }
+#if SOLVE_BODIES_PER_GROUP == 1
+        // Normalize each addition, then merge blocks in contact order.
+        float2 partial[Dof], partial_g = 0;
+#pragma unroll
+        for (uint j = 0; j < Dof; ++j) partial[j] = 0;
+        if (rows.Valid)
+            for (uint r = 0; r < 3; ++r)
+                AddRow(partial, partial_g, block_row, rows.Axis[r], rows.Angular[r], rows.Side, rows.Force[r], rows.Stiffness[r]);
+        for (uint prepared = 0; prepared < min(ContactsPerBatch, contact_count - first); ++prepared) {
+            const uint source = base + prepared * Dof;
+            if (!simd_shuffle(uint(rows.Valid), source)) continue;
+            shared_color |= bool(simd_shuffle(uint(rows.Shared), source));
+            MergePreparedBlock(H, g, partial, partial_g, source + block_row);
+        }
+#else
         for (uint prepared = 0; prepared < min(WorkLanes, contact_count - first); ++prepared) {
             const uint source = base + prepared;
             if (!simd_shuffle(uint(rows.Valid), source)) continue;
             shared_color |= bool(simd_shuffle(uint(rows.Shared), source));
             const float side = simd_shuffle(rows.Side, source);
             const float3 force = simd_shuffle(rows.Force, source), stiffness = simd_shuffle(rows.Stiffness, source);
+            float2 partial[Dof], partial_g = 0;
+#pragma unroll
+            for (uint j = 0; j < Dof; ++j) partial[j] = 0;
             for (uint r = 0; r < 3; ++r)
-                AddRow(H, g, block_row, simd_shuffle(rows.Axis[r], source), simd_shuffle(rows.Angular[r], source), side, force[r], stiffness[r]);
+                AddRow(partial, partial_g, block_row, simd_shuffle(rows.Axis[r], source), simd_shuffle(rows.Angular[r], source), side, force[r], stiffness[r]);
+            g = WideAdd(g, partial_g);
+#pragma unroll
+            for (uint j = 0; j < Dof; ++j) H[j] = WideAdd(H[j], partial[j]);
         }
+#endif
     }
 
     const uint joint_start = joint_incidence[body], joint_count = joint_incidence[body + 1] - joint_start;
@@ -4041,15 +3868,9 @@ static bool SolveBody(
                 float3 arm = Rotate(pose.Orientation, mine_is_a ? joint.AnchorA : joint.AnchorB);
                 const BodyMass other_mass = masses[mine_is_a ? joint.BodyB : joint.BodyA];
 
-                // What a hard row is stiffened to in post-stabilization, and only there.
-                // That pass alone removes the error a step began with, and an unloaded error has ramped no penalty, so it would sit at PenaltyMin for good.
-                // Moving the pair one step's worth costs the pair's own inertial stiffness (Sec. 3.4), in the row's own units.
-                //
-                // Deliberately not applied to the main iterations, whose ramp from PenaltyMin is Sec. 3.4's device.
-                // Starting them at this floor costs a swinging jointed pair 0.5% of its linear momentum against a 0.1% bar, and lets a hinge past the seam come apart.
+                // Hard rows use a minimum inertial stiffness during stabilization.
                 const float linear_floor = Stabilizing * PairStiffness(mass.InvMass + other_mass.InvMass, p.DeltaTime);
 
-                // Base and drive rows share one rule. A soft row applies Eq. 7 on its extension, with no dual.
                 const JointMeasure measured = MeasureJoint(&joint, a, b, initial);
                 // Rotation of B changes the measurement axes and the torque arm to A's anchor.
                 if (!mine_is_a) arm += measured.Reach;
@@ -4068,7 +3889,7 @@ static bool SolveBody(
                     float force = 0, stiffness = 0;
                     if (active) {
                         const bool hard = IsHard(setup.Stiffness);
-                        // The stabilization floor, in this row's units. See linear_floor above.
+
                         const float floored = is_linear ? linear_floor : Stabilizing * PairStiffness(dot(setup.Axis, inverse_inertia * setup.Axis), p.DeltaTime);
                         const float penalty = hard ? max(setup.Penalty, floored) : setup.Penalty;
                         const float lambda = hard ? setup.Lambda : 0;
@@ -4106,7 +3927,7 @@ static bool SolveBody(
                     }
                 }
             }
-            // Sec. 3.5's geometric stiffness, which the reference keeps for joints and drops for contacts.
+            // Joint geometric stiffness follows section 3.5; contact blocks omit that term.
             const float3x3 outer = float3x3(arm * applied.x, arm * applied.y, arm * applied.z);
             const float3x3 geometric = (mine_is_a ? outer : transpose(outer)) - float3x3(dot(arm, applied));
 #pragma unroll
@@ -4116,8 +3937,6 @@ static bool SolveBody(
     }
     if (worker >= Dof) return false;
 
-    // And the degrees of freedom this body does not have, now that every row is gathered.
-    // An infinite inertia about a body axis locks turning about wherever that axis now points, and KHR's pinned wheel authors (0, 1, 0).
     if (!Translates(mass)) {
         for (uint i = 0; i < 3; ++i) LockDirection(H, g, block_row, base, 0, UnitAxis(i));
     }
@@ -4130,6 +3949,7 @@ static bool SolveBody(
     const float3 angular{simd_shuffle(step, base + 3), simd_shuffle(step, base + 4), simd_shuffle(step, base + 5)};
     if (block_row != 0) return false;
     if (!isfinite(linear.x + linear.y + linear.z + angular.x + angular.y + angular.z)) return false;
+    // Half steps stabilize simultaneous updates when adjacent bodies share a color.
     const float relaxation = shared_color ? 0.5f : 1.f;
     pose.Position += relaxation * linear;
     pose.Orientation = normalize(QuatMul(QuatFromRotationVector(relaxation * angular), pose.Orientation));
@@ -4151,7 +3971,7 @@ kernel void SolveBodies(
     device const uint *cursor [[buffer(14)]], device const Joint *joints [[buffer(16)]],
     device const Adjacency *incoming [[buffer(17)]], device const uint *incoming_slots [[buffer(18)]],
     device const uint *joint_incidence [[buffer(20)]],
-#if SOLVE_BODIES_PER_GROUP > 1
+#if COMPACT_BODY_WORK
     device const uint *body_ids [[buffer(13)]], device const ColorWork &color_work [[buffer(26)]],
 #endif
     device const uint *quiet [[buffer(21)]], constant StepParams &p [[buffer(7)]],
@@ -4160,7 +3980,7 @@ kernel void SolveBodies(
     constexpr uint WorkLanes = SOLVE_BODIES_PER_GROUP == 1 ? 32 : Dof;
     if (lane >= WorkLanes * SOLVE_BODIES_PER_GROUP) return;
     const uint work = group * SOLVE_BODIES_PER_GROUP + lane / WorkLanes;
-#if SOLVE_BODIES_PER_GROUP > 1
+#if COMPACT_BODY_WORK
     const uint first = color_work.Offsets[cursor[0]], end = color_work.Offsets[cursor[0] + 1];
     if (work >= end - first) return;
     const uint body = body_ids[first + work];
@@ -4171,6 +3991,7 @@ kernel void SolveBodies(
     SolveBody(poses, iterates, initial, inertial, masses, displacements, contacts, colors, cursor[0], joints, incoming, incoming_slots, joint_incidence, quiet, p, body, lane);
 }
 
+// Publish after every color finishes; keep the iteration snapshot unchanged within the sweep.
 static void PublishBody(
     device Pose *poses, device const BodyIterate *iterates,
     device Displacement *displacements,
@@ -4191,7 +4012,6 @@ kernel void PublishPoses(
     PublishBody(poses, iterates, displacements, masses, quiet, p, body);
 }
 
-// Eqs. 11 and 16: the dual absorbs the sweep's violation and the penalty ramps, unless at a limit.
 static bool UpdateContactDualAtSlot(
     device Contact *contacts, device const Displacement *displacements,
     device const Pose *initial, device const BodyMass *masses,
@@ -4265,7 +4085,6 @@ kernel void UpdateDuals(
     UpdateContactDual(contacts, displacements, initial, masses, quiet, incoming, incoming_slots, p, id);
 }
 
-// Velocity is read from the sweeps' motion, before post-stabilization, so error correction adds no energy.
 kernel void Finalize(
     device const Displacement *displacements [[buffer(10)]],
     device Velocity *velocities [[buffer(3)]], device const BodyMass *masses [[buffer(4)]],
@@ -4278,11 +4097,7 @@ kernel void Finalize(
     velocities[body] = {moved.Linear * inv_dt, moved.Angular * inv_dt};
 }
 
-// Restitution, as a velocity pass after the solve rather than as a distance requested by the normal row.
-// One displacement per step cannot carry both an approach and a rebound, and Box2D v3 and the XPBD rigid-body paper both use a pass after the solve.
-//
-// XPBD Eq. 34 with Box2D's gates: a contact bounces only where the solve's normal dual pushed and the approach beat the threshold.
-// Contact-parallel, so it computes an impulse and the gather below moves the bodies, with no atomics and symmetric over a manifold's points.
+// Restitution requires a compressive normal force and initial approach speed above MinBounceSpeed.
 kernel void Restitution(
     device Contact *contacts [[buffer(5)]], device const Pose *poses [[buffer(0)]],
     device const Velocity *velocities [[buffer(3)]], device const BodyMass *masses [[buffer(4)]],
@@ -4318,7 +4133,6 @@ kernel void Restitution(
     contact.BounceImpulse = total;
 }
 
-// And the gather that moves the bodies, exactly as the primal sweep gathers forces.
 kernel void ApplyRestitution(
     device Velocity *velocities [[buffer(3)]], device const Contact *contacts [[buffer(5)]],
     device const Pose *poses [[buffer(0)]], device const BodyMass *masses [[buffer(4)]],
@@ -4341,7 +4155,7 @@ kernel void ApplyRestitution(
         if (contact.BounceDelta == 0) continue;
         const bool mine_is_a = contact.BodyA == body;
         const float3 arm = Rotate(orientation, mine_is_a ? contact.AnchorA : contact.AnchorB);
-        // Each half takes its own inverse quantity, so a pinned body takes the whole impulse into spin.
+
         const float3 impulse = contact.Normal * (mine_is_a ? contact.BounceDelta : -contact.BounceDelta);
         linear += impulse * mass.InvMass;
         angular += inverse_inertia * cross(arm, impulse);
@@ -4373,11 +4187,7 @@ kernel void FinishPoses(
     if (counted == 0) rest[body] = poses[body];
 }
 
-// No body is quieter than what it is touching, which makes sleeping a property of a group.
-// A stack settles and sleeps together, and one link still moving holds all of it awake.
-// The whole count spreads rather than a test for zero, because a body reaching the threshold while a neighbour is five steps behind would sleep mid-settle.
-// The neighbour would then press on against a body no longer being solved.
-// The count spreads one hop per step, which costs nothing.
+// Propagate the minimum quiet count across one contact per step to synchronize sleeping.
 static void FinishWakingBody(
     device const uint *counted, device uint *quiet,
     device const Contact *contacts, device const Joint *joints,
@@ -4432,6 +4242,39 @@ kernel void FollowSensors(
     velocities[follower.Sensor] = velocity;
 }
 
+kernel void ReduceStepColors(
+    constant StepParams &p [[buffer(7)]], device const uint *colors [[buffer(12)]],
+    device const BodyMass *masses [[buffer(4)]], device atomic_uint *used [[buffer(26)]],
+    uint body [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup uint partial[4];
+    const uint local = body < p.BodyCount && Moves(masses[body]) ? ColorOf(colors[body]) + 1 : 1;
+    const uint maximum = simd_max(local);
+    if (lane == 0) partial[simd] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        const uint group_maximum = simd_max(lane < 4 ? partial[lane] : 1);
+        if (lane == 0) atomic_fetch_max_explicit(used, group_maximum, memory_order_relaxed);
+    }
+}
+
+static void PublishStepColors(device StepParams &p, device uint *groups, uint count, uint lane) {
+    // All lanes read the old cap before lane zero replaces it with the current count.
+    simdgroup_barrier(mem_flags::mem_device);
+    if (lane == 0) p.MaxColors = count;
+    const uint packed = FallbackBodiesPerGroup(p.BodyCount);
+    groups[lane * 3] = lane < count ? (p.BodyCount + packed - 1) / packed : 0;
+    groups[lane * 3 + 1] = groups[lane * 3 + 2] = 1;
+}
+
+kernel void FinishStepColors(
+    device StepParams &p [[buffer(7)]], device uint *groups [[buffer(26)]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    PublishStepColors(p, groups, clamp(groups[0] + 1, 1u, p.MaxColors), lane);
+}
+
 kernel void PrepareStepColors(
     device StepParams &p [[buffer(7)]], device const uint *colors [[buffer(12)]],
     device const BodyMass *masses [[buffer(4)]], device uint *groups [[buffer(26)]],
@@ -4440,13 +4283,7 @@ kernel void PrepareStepColors(
     uint used = 1;
     for (uint body = lane; body < p.BodyCount; body += 32)
         if (Moves(masses[body])) used = max(used, ColorOf(colors[body]) + 1);
-    const uint count = clamp(simd_max(used) + 1, 1u, p.MaxColors);
-    // All lanes read the old cap before lane zero replaces it with the current count.
-    simdgroup_barrier(mem_flags::mem_device);
-    if (lane == 0) p.MaxColors = count;
-    const uint packed = p.BodyCount > 32 ? SolveBodiesPerGroup : 1;
-    groups[lane * 3] = lane < count ? (p.BodyCount + packed - 1) / packed : 0;
-    groups[lane * 3 + 1] = groups[lane * 3 + 2] = 1;
+    PublishStepColors(p, groups, clamp(simd_max(used) + 1, 1u, p.MaxColors), lane);
 }
 
 kernel void CaptureStep(
@@ -4514,12 +4351,12 @@ kernel void CountColorWork(
 
 kernel void PrefixColorWork(
     device ColorWork &work [[buffer(26)]], device uint *groups [[buffer(14)]],
-    uint lane [[thread_index_in_simdgroup]]
+    constant StepParams &p [[buffer(7)]], uint lane [[thread_index_in_simdgroup]]
 ) {
     const uint count = work.Counts[lane], first = simd_prefix_exclusive_sum(count);
     work.Offsets[lane] = work.Cursors[lane] = first;
     if (lane == MaxSupportedColors - 1) work.Offsets[MaxSupportedColors] = first + count;
-    groups[lane * 3] = (count + SolveBodiesPerGroup - 1) / SolveBodiesPerGroup;
+    groups[lane * 3] = (count + FallbackBodiesPerGroup(p.BodyCount) - 1) / FallbackBodiesPerGroup(p.BodyCount);
     groups[lane * 3 + 1] = groups[lane * 3 + 2] = 1;
 }
 
@@ -4592,6 +4429,7 @@ static void PackBodyColors(uint body, uint color, uint count, threadgroup uint *
 }
 
 #if FUSED_SMALL_SOLVE
+
 kernel void SolveSmallWorld(
     device Pose *poses [[buffer(0)]], device BodyIterate *iterates [[buffer(11)]], device const Pose *initial [[buffer(1)]],
     device const Pose *inertial [[buffer(2)]], device const BodyMass *masses [[buffer(4)]],
@@ -4758,6 +4596,7 @@ kernel void FinishIslands(
     device uint *pool [[buffer(26)]], device const uint *groups [[buffer(14)]], constant StepParams &p [[buffer(7)]],
     device const BodyMass *masses [[buffer(4)]], device const uint *quiet [[buffer(21)]],
     device const uint *body_ids [[buffer(13)]], device const ColorWork &color_work [[buffer(25)]],
+    device const Adjacency *incoming [[buffer(17)]],
     device const Joint *joints [[buffer(16)]], device const uint *incidence [[buffer(20)]], uint id [[thread_position_in_grid]]
 ) {
     bool keep = false;
@@ -4784,7 +4623,8 @@ kernel void FinishIslands(
         pool[1] = pool[2] = 1;
         pool[3] = large ? (p.BodyCount + 127) / 128 : 0;
         pool[4] = pool[5] = 1;
-        pool[6] = large ? (p.BodyCount * ContactsPerBody + 63) / 64 : 0;
+        const Adjacency last = incoming[p.BodyCount - 1];
+        pool[6] = large ? (last.Start + last.Count + 63) / 64 : 0;
         pool[7] = pool[8] = 1;
         pool[9] = large ? p.JointCount : 0;
         pool[10] = pool[11] = 1;

@@ -19,10 +19,7 @@ constexpr uint32_t BindingCount = 31;
 constexpr uint32_t BatchSteps = 16;
 constexpr uint64_t BatchBytes = 32 * 1024 * 1024;
 
-
-// The number of colors a sweep dispatches.
-// Coloring is incremental, so last step's count carries over, plus one spare for the contacts a closing scene adds.
-// Counted from the world rather than cached in the solver, so a step stays a pure function of the world it is given.
+// Reserve one additional color for new contacts.
 uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
     uint32_t used = 1;
     for (uint32_t body = 0; body < world.BodyCount(); ++body)
@@ -32,6 +29,9 @@ uint32_t ColorsNeeded(const World &world, const StepSettings &settings) {
 
 constexpr uint32_t BoundedPlanes = 1, MeshPairs = 2, MeshQueries = 4, RestitutionMaterials = 8, FullStepGeometry = 16;
 constexpr uint32_t FullStepBodyLimit = 9;
+// A full SIMD group per native body improves utilization before scalar body threads fill the GPU.
+constexpr uint32_t NativeCollectBodyLimit = 512;
+constexpr uint32_t SerialColorBudgetBodyLimit = 512;
 static_assert(FullStepBodyLimit <= SolveLanes);
 
 uint32_t ColliderFeatures(const World &world) {
@@ -60,8 +60,7 @@ uint32_t ColliderFeatures(const World &world) {
     return features | (full_step_geometry ? FullStepGeometry : 0u);
 }
 
-// The kernel each pass runs, in the order of Solver::Pass.
-// A prefix supplies a #define when one kernel text is compiled more than one way.
+// Pipeline names and compile-time variants follow Solver::Pass order.
 constexpr struct {
     const char *Name;
     std::string_view Prefix;
@@ -100,6 +99,8 @@ constexpr struct {
     {"FinishWaking"},
     {"FollowSensors"},
     {"PrepareStepColors"},
+    {"ReduceStepColors"},
+    {"FinishStepColors"},
     {"CaptureStep"},
     {"CaptureStep", "#define FINISH_WAKING_CAPTURE 1"},
     {"CollectSensorContacts", "#define BOUNDED_PLANES 0\n#define MESH_PAIRS 0\n#define SENSOR_PASS 1\n#define CollectContacts CollectSensorContacts"},
@@ -173,7 +174,7 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
 
 Solver::~Solver() {
     Context.Queue->removeResidencySet(Residency.get());
-    mtl::Drain(Context.Queue.get()); // see mtl::Drain
+    mtl::Drain(Context.Queue.get());
 }
 
 void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t threads, uint32_t lanes, uint64_t indirect, CollectionMode mode) {
@@ -182,7 +183,8 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
     const bool bounds = pass == BoundsPass || pass == SensorBoundsPass || pass == CacheBoundsPass;
     const uint32_t variant = collector ? uint32_t(threads > RadixSimdWidth) + 2 * uint32_t(lanes > 1) :
         bounds                         ? uint32_t(lanes > 1) :
-                                         uint32_t(primal && threads > SolveLanes);
+        primal && threads > SolveLanes ? uint32_t(threads <= WideSolveBodyLimit ? 1 : 2) :
+                                         0;
     auto &selected = Pipelines[mode][pass][variant];
     if (!selected) {
         std::string prefix{Kernels[pass].Prefix};
@@ -193,26 +195,32 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
             prefix += (variant & 1) ? "\n#define BROAD_PHASE_MODE 2" : "\n#define BROAD_PHASE_MODE 1";
             prefix += "\n#define COLLECT_LANES " + std::to_string(lanes);
         }
-        if (primal) prefix += "\n#define SOLVE_BODIES_PER_GROUP " + std::to_string(variant ? SolveBodiesPerGroup : 1);
+        if (primal) {
+            prefix += "\n#define SOLVE_BODIES_PER_GROUP " + std::to_string(FallbackBodiesPerGroup(threads));
+            prefix += "\n#define COMPACT_BODY_WORK " + std::to_string(bool(variant));
+        }
         if (bounds) prefix += "\n#define BOUNDS_LANES " + std::to_string(lanes);
         selected = Context.Pipeline(pass < BoundsPass ? gpu::BroadPhaseSource : gpu::SolveSource, Kernels[pass].Name, prefix, pass == FollowPass);
     }
     MTL::ComputePipelineState *pipeline = selected.get();
-    // Every pass reads the previous pass's writes, so every dispatch takes a barrier.
+    // Each dispatch requires visibility of the preceding dispatch's writes.
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     encoder->setComputePipelineState(pipeline);
+    // Small threadgroups distribute divergent body work across GPU cores.
     const bool per_body = collector || pass == SolvePass || pass == StabilizePass;
     const bool radix = pass == RadixHistogramPass || pass == RadixOffsetsPass || pass == ReduceBoundsPass || pass == ReduceScenePass;
     const bool scan = pass == ScanIncomingPass || pass == ScanIncomingBlocksPass;
     const bool contact = pass == DualPass || pass == RestitutionPass;
-    if ((radix || scan || pass == PrefixColorWorkPass || pass == PrepareSmallWorldPass || pass == SmallBroadPhasePass || ((collector || bounds) && lanes > 1)) && pipeline->threadExecutionWidth() != RadixSimdWidth)
+    if ((radix || scan || pass == PrefixColorWorkPass || pass == ReduceStepColorsPass || pass == FinishStepColorsPass || pass == PrepareSmallWorldPass || pass == SmallBroadPhasePass || ((collector || bounds) && lanes > 1)) && pipeline->threadExecutionWidth() != RadixSimdWidth)
         throw std::runtime_error("GPU scans require 32-lane SIMD groups");
     const uint32_t limit = scan ? RadixBlockSize : per_body ? 8u :
         contact                                             ? 64u :
                                                               pipeline->maxTotalThreadsPerThreadgroup();
     const auto group = pass == SmallBroadPhasePass ? threads : radix ? RadixBlockSize :
                                                                        std::min(threads, limit);
-    if (pass == SolveIslandsPass) {
+    if (pass == ReduceStepColorsPass) {
+        encoder->dispatchThreadgroups({(threads + 127) / 128, 1, 1}, {128, 1, 1});
+    } else if (pass == SolveIslandsPass) {
         if (pipeline->threadExecutionWidth() != SolveLanes || SmallSolveWaves * SolveLanes > pipeline->maxTotalThreadsPerThreadgroup())
             throw std::runtime_error("The island solve requires eight 32-lane SIMD groups");
         encoder->dispatchThreadgroups(indirect, {SmallSolveWaves * SolveLanes, 1, 1});
@@ -230,7 +238,7 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
     else if (pass == QueryPass || pass == SensorQueryPass) encoder->dispatchThreadgroups(indirect ? indirect : QueryScratch.Address(), {32, 1, 1});
     else if (primal) {
         if (pipeline->threadExecutionWidth() != SolveLanes) throw std::runtime_error("The body solve requires 32-lane SIMD groups");
-        const uint32_t bodies_per_group = variant ? SolveBodiesPerGroup : 1;
+        const uint32_t bodies_per_group = FallbackBodiesPerGroup(threads);
         if (indirect) encoder->dispatchThreadgroups(indirect, {SolveLanes, 1, 1});
         else encoder->dispatchThreadgroups({(threads + bodies_per_group - 1) / bodies_per_group, 1, 1}, {SolveLanes, 1, 1});
     } else if (pass == JointDualPass) encoder->dispatchThreadgroups({threads, 1, 1}, {32, 1, 1});
@@ -464,7 +472,6 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
                 .ReportContacts = world.TrackContacts,
             };
 
-            Bind(world, index);
             Encode(encoder, {.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses, .ColliderFeatures = collider_features, .Parameter = index, .GpuColors = index != 0, .Snapshot = snapshot}, world);
         }
         encoder->endEncoding();
@@ -529,16 +536,93 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
     return result;
 }
 
+void Solver::EncodeSolveCommands(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
+    if (!SolveCommands) {
+        auto descriptor = mtl::Make<MTL::IndirectCommandBufferDescriptor>();
+        descriptor->setCommandTypes(MTL::IndirectCommandTypeConcurrentDispatch);
+        descriptor->setInheritBuffers(false);
+        descriptor->setInheritPipelineState(false);
+        descriptor->setMaxKernelBufferBindCount(27);
+        SolveCommands = NS::TransferPtr(Context.Device->newIndirectCommandBuffer(descriptor.get(), BatchSteps * CommandIterationLimit * (MaxSupportedColors + 3), MTL::ResourceStorageModeShared));
+        if (!SolveCommands) throw std::runtime_error("Cannot allocate solve commands");
+        SolveCommandDataBuffer = {Context.Device.get(), BatchSteps};
+        SolveCommandRanges = {Context.Device.get(), BatchSteps * 2};
+        const std::string source = std::string(gpu::SolveCommandDataSource) + gpu::SolveCommandsSource;
+        SolveCommandEncoder = Context.Pipeline(source, "EncodeSolveCommands");
+        if (SolveCommandEncoder->threadExecutionWidth() != SolveLanes) throw std::runtime_error("Solve command encoding requires 32 lanes");
+        Residency->addAllocation(SolveCommands.get());
+        Residency->addAllocation(SolveCommandDataBuffer.Handle.get());
+        Residency->addAllocation(SolveCommandRanges.Handle.get());
+        Residency->commit();
+    }
+    const uint32_t width = FallbackBodiesPerGroup(recording.Bodies);
+    auto &pipeline = CommandPrimalPipelines[uint32_t(width != 1)];
+    if (!pipeline) {
+        const std::string prefix = "#define COMPACT_BODY_WORK 1\n#define SOLVE_BODIES_PER_GROUP " + std::to_string(width);
+        pipeline = Context.Pipeline(gpu::SolveSource, Kernels[SolvePass].Name, prefix, false, true);
+        if (pipeline->threadExecutionWidth() != SolveLanes) throw std::runtime_error("Primal command execution requires 32 lanes");
+        Residency->addAllocation(pipeline.get());
+        Residency->commit();
+    }
+    auto &data = SolveCommandDataBuffer[recording.Parameter];
+    data = {};
+    data.Commands = SolveCommands->gpuResourceID()._impl;
+    data.Pipelines[0] = pipeline->gpuResourceID()._impl;
+    constexpr Pass auxiliary[]{PublishPass, DualPass, JointDualPass};
+    for (uint32_t i = 0; i < 3; ++i) {
+        if (!CommandAuxiliaryPipelines[i]) {
+            CommandAuxiliaryPipelines[i] = Context.Pipeline(gpu::SolveSource, Kernels[auxiliary[i]].Name, Kernels[auxiliary[i]].Prefix, false, true);
+            Residency->addAllocation(CommandAuxiliaryPipelines[i].get());
+            Residency->commit();
+        }
+        data.Pipelines[i + 1] = CommandAuxiliaryPipelines[i]->gpuResourceID()._impl;
+    }
+    data.Buffers[0] = world.Poses.Address();
+    data.Buffers[1] = world.InitialPoses.Address();
+    data.Buffers[2] = world.InertialPoses.Address();
+    data.Buffers[4] = world.Masses.Address();
+    data.Buffers[5] = world.Contacts.Address();
+    data.Buffers[7] = Params.Address() + recording.Parameter * sizeof(StepParams);
+    data.Buffers[10] = world.Displacements.Address();
+    data.Buffers[11] = world.Iterates.Address();
+    data.Buffers[12] = world.Colors.Address();
+    data.Buffers[13] = GeneralIslands.Address() + (IslandHeaderWords + (3 + IslandBodyLimit) * uint64_t(recording.Bodies)) * sizeof(uint32_t);
+    data.Buffers[14] = ColorCursor.Address();
+    data.Buffers[16] = world.Joints.Address();
+    data.Buffers[17] = world.Incoming.Address();
+    data.Buffers[18] = world.IncomingSlots.Address();
+    data.Buffers[20] = world.JointIncidence.Address();
+    data.Buffers[21] = world.Quiet.Address();
+    data.Buffers[25] = GeneralIslands.Address();
+    data.Buffers[26] = ColorScratch.Address();
+    data.Groups = GeneralIslands.Address();
+    data.Range = SolveCommandRanges.Address() + recording.Parameter * 2 * sizeof(uint32_t);
+    data.FirstCommand = recording.Parameter * CommandIterationLimit * (MaxSupportedColors + 3);
+    data.Iterations = recording.Iterations;
+    data.Colors = recording.Colors;
+    Table->setAddress(SolveCommandDataBuffer.Address() + recording.Parameter * sizeof(SolveCommandData), 0);
+    encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
+    encoder->setComputePipelineState(SolveCommandEncoder.get());
+    encoder->dispatchThreadgroups({recording.Iterations, 1, 1}, {SolveLanes, 1, 1});
+    Table->setAddress(world.Poses.Address(), 0);
+}
+
 void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
     const uint32_t bodies = recording.Bodies, joints = recording.Joints;
     const bool compact = bodies > SolveLanes;
     const bool general_islands = compact && recording.Iterations;
+    const bool complete = bodies <= FullStepBodyLimit && !joints && (recording.ColliderFeatures & FullStepGeometry) && !(recording.ColliderFeatures & BoundedPlanes);
+    if (!complete) Bind(world, recording.Parameter);
+    else if (!FollowerRanges.empty()) {
+        Table->setAddress(world.Poses.Address(), 0);
+        Table->setAddress(world.Velocities.Address(), 3);
+    }
     const uint32_t slots = bodies * ContactsPerBody;
     for (const auto range : FollowerRanges) {
         Table->setAddress(Followers.Address() + range.First * sizeof(SensorFollower), 26);
         Dispatch(encoder, FollowPass, range.Count);
     }
-    if (bodies <= FullStepBodyLimit && !joints && (recording.ColliderFeatures & FullStepGeometry) && !(recording.ColliderFeatures & BoundedPlanes)) {
+    if (complete) {
         if (!FullPipeline) {
             FullPipeline = Context.Pipeline(gpu::FullStepSource, "FullStep");
             if (FullPipeline->threadExecutionWidth() != SolveLanes || FullPipeline->maxTotalThreadsPerThreadgroup() < SmallSolveWaves * SolveLanes)
@@ -607,7 +691,12 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     const uint64_t groups = ColorGroups.Address() + recording.Parameter * MaxSupportedColors * 3 * sizeof(uint32_t);
     if (recording.GpuColors) {
         Table->setAddress(groups, 26);
-        Dispatch(encoder, PrepareColorsPass, 32);
+        if (bodies > SerialColorBudgetBodyLimit) {
+            // Each batch slot is independent and all CPU initialization precedes submission.
+            ColorGroups[recording.Parameter * MaxSupportedColors * 3] = 1;
+            Dispatch(encoder, ReduceStepColorsPass, bodies);
+            Dispatch(encoder, FinishStepColorsPass, MaxSupportedColors);
+        } else Dispatch(encoder, PrepareColorsPass, MaxSupportedColors);
     }
     Table->setAddress(world.ContactRefusals.Address(), 26);
 
@@ -674,22 +763,18 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     Table->setAddress(world.Iterates.Address(), 11);
     Table->setAddress(world.NextColors.Address(), 13);
     Table->setAddress(world.ContactEventCounts.Address(), 25);
-    // Collision, and with it every C0, anchor and Jacobian, is taken at the pose the step began from, before WarmStart moves the body to its starting guess.
-    // This is the reference's order, and the only one that expands the Taylor series about the pose the constraint was measured at.
+    // Measure collision geometry before warm starting so C0 and Jacobians use the initial pose.
     constexpr Pass collectors[]{CollectPass, BoundedCollectPass, MeshCollectPass, FullCollectPass};
     const uint32_t geometry_features = recording.ColliderFeatures & (BoundedPlanes | MeshPairs);
     // Shared lanes increase parallelism for mesh queries and small worlds.
-    const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : 1;
+    const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : bodies <= NativeCollectBodyLimit ? 32 :
+                                                                                                                                                                  1;
     const auto collect = [&](Pass pass, bool sensor) {
-        if (!(recording.ColliderFeatures & MeshQueries)) {
-            if (collision_lanes == 1)
-                pass = (recording.ColliderFeatures & BoundedPlanes) ?
-                    (sensor ? NativeBoundedSensorPass : NativeBoundedCollectPass) :
-                    (sensor ? NativeSensorPass : NativeCollectPass);
-            Dispatch(encoder, pass, bodies, collision_lanes);
-            return;
-        }
-        if (uint64_t(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint32_t) + sizeof(QueryArenaHeader) + 48 >= QueryScratchBytes) {
+        if (!(recording.ColliderFeatures & MeshQueries) && bodies > RadixSimdWidth)
+            pass = (recording.ColliderFeatures & BoundedPlanes) ?
+                (sensor ? NativeBoundedSensorPass : NativeBoundedCollectPass) :
+                (sensor ? NativeSensorPass : NativeCollectPass);
+        if (!queued_queries) {
             Dispatch(encoder, pass, bodies, collision_lanes);
             return;
         }
@@ -720,7 +805,6 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Table->setAddress(ColorCursor.Address() + MaxSupportedColors * sizeof(uint32_t), BroadPhaseOrCursorAt);
         Dispatch(encoder, PrepareSmallWorldPass, SolveLanes);
     } else {
-        // Gather each body's contacts-as-B into a contiguous run, so the passes below do not scan the whole pool.
         Table->setAddress(world.BroadPhaseScratch.Address(), BroadPhaseOrCursorAt);
         Dispatch(encoder, ScanIncomingPass, bodies);
         if (bodies > RadixBlockSize) {
@@ -765,6 +849,10 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
             Dispatch(encoder, SolveSmallWorldPass, bodies);
             Table->setAddress(groups, 26);
         }
+    } else if (general_islands && recording.Iterations <= CommandIterationLimit) {
+        EncodeSolveCommands(encoder, recording, world);
+        encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
+        encoder->executeCommandsInBuffer(SolveCommands.get(), SolveCommandRanges.Address() + recording.Parameter * 2 * sizeof(uint32_t));
     } else {
         for (uint32_t iteration = 0; iteration < recording.Iterations; ++iteration) {
             sweep(SolvePass);
@@ -774,19 +862,16 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
     }
     if (general_islands) Table->setAddress(world.NextColors.Address(), 13);
     Table->setAddress(world.ContactEventCounts.Address(), 25);
-    // Velocity is taken from the motion the iterations above produced, before the stabilization sweep, so removing leftover penetration adds no velocity.
+    // Measure velocity before stabilization to exclude penetration correction.
     Dispatch(encoder, FinalizePass, bodies);
-    // Restitution runs as a velocity pass rather than as a row inside the solve. See Restitution for the gapped-contact case that requires it.
-    // It runs before quiet counting, because a body given a rebound this step is not at rest.
     if (recording.ColliderFeatures & RestitutionMaterials)
         for (uint32_t pass = 0; pass < RestitutionPasses; ++pass) {
             Dispatch(encoder, RestitutionPass, slots);
             Dispatch(encoder, ApplyRestitutionPass, bodies);
         }
     sweep(StabilizePass);
-    // Published before the sweep, a body woken by the spread would run a stabilization pass for a step it slept through.
-    // Asleep at Integrate its inertial target is its frozen pose with no gravity in it, while its contact duals still carry the force balancing gravity.
-    // The pass then shifts it out of rest and the body above penetrates it.
+    // Publish quiet counts before neighboring bodies read them.
+    // Capture performs this publication when the sensor pass is skipped.
     if (!recording.Snapshot || OutputFlags[0].Sensors) Dispatch(encoder, FinishWakingPass, bodies);
 
     if (OutputFlags[0].Sensors) {

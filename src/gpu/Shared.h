@@ -1,16 +1,13 @@
-// The engine's GPU vocabulary, compiled by both clang and the Metal compiler from this one text, so host and device layouts cannot drift apart.
-// The spellings are the MSL ones.
-//
-// Conventions from LiteratureReview.md section 1.1: SI units, Y-up right-handed, transforms centered on the center of mass, inertia diagonal in the body frame.
+// Host and device layouts use SI units, right-handed Y-up coordinates and body-frame diagonal inertia.
 
-#ifndef RBP_GPU_SHARED_H // a guard rather than #pragma once, since this text is prepended into MSL as the main file
+#ifndef RBP_GPU_SHARED_H // An include guard supports prepending this header to MSL source.
 #define RBP_GPU_SHARED_H
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
 
-#define GPU_CONSTANT constant constexpr // MSL puts program-scope constants in the constant address space
+#define GPU_CONSTANT constant constexpr
 #else
 #include <cmath>
 #include <cstdint>
@@ -19,41 +16,36 @@ using namespace metal;
 #define GPU_CONSTANT constexpr
 #endif
 
-// One namespace, so common names like Contact, Shape and World do not collide with a host's.
-// Kernels use them unqualified through the using-directive at the bottom of this file.
 namespace rbp {
 
 #ifdef __METAL_VERSION__
-// MSL spells this float4(xyz, w) and simd needs a call, so both sides define one name for the shared text below.
+
 inline float4 MakeFloat4(float3 xyz, float w) { return float4(xyz, w); }
 #else
 using uint = uint32_t;
 using uchar = uint8_t;
 using ulong = uint64_t;
-using float3 = simd::float3; // 16-byte aligned on both sides, so the layouts agree
+using float3 = simd::float3;
 using float4 = simd::float4;
 using simd::cross;
 using simd::dot;
 using simd::length;
 using simd::normalize;
-using std::abs; // the scalar overload, matching MSL's `abs` in the shared text below
+using std::abs;
 
 inline float4 MakeFloat4(float3 xyz, float w) { return simd::make_float4(xyz, w); }
 #endif
 
-// An index into a pool.
-// Pools never move their contents, so an index is a stable handle, and it is the only kind of reference that crosses to the GPU.
+// Pool index; NoIndex is the absent-value sentinel.
 using Index = uint;
 GPU_CONSTANT Index NoIndex = ~0u;
 
 // Orientation is a unit quaternion stored (x, y, z, w).
-// MSL has no quaternion type, so both sides carry the raw four floats and rotate through Rotate() below.
 struct Pose {
     float3 Position;
     float4 Orientation;
 };
 
-// At the origin, with no rotation. Named because a zeroed Pose carries a zero quaternion, which is not a rotation.
 GPU_CONSTANT Pose IdentityPose{{0, 0, 0}, {0, 0, 0, 1}};
 
 struct Velocity {
@@ -75,23 +67,16 @@ struct BodyIterate {
     Displacement Moved;
 };
 
-// Inverse quantities, because the solve divides by them, and zero is exactly infinite: a locked axis, expressed with no branch and no flag.
-// The three motion properties share the mass buffer to keep the argument table compact.
-// They belong to the body rather than to its shape. See World::SetBodyShape.
+// Inverse mass and inertia; zero locks the corresponding degree of freedom.
 struct BodyMass {
-    float3 InvInertiaLocal; // diagonal of the inverse inertia tensor, in the body frame
+    float3 InvInertiaLocal; // Inverse inertia is diagonal in the body frame.
     float InvMass;
-    // The fraction of the world's gravity applied to this body: 1 is all of it, 0 none, and -1 reverses it.
-    // KHR physics calls it motion.gravityFactor.
+    // Gravity multiplier: 1 applies gravity, 0 disables it, and -1 reverses it.
     float GravityScale = 1;
-    // The fraction of linear and angular velocity removed per second, modelling a medium rather than a contact.
-    // Zero by default, so an undamped body matches its closed form.
+    // Fractions of linear and angular velocity removed per second.
     float LinearDamping = 0, AngularDamping = 0;
 };
 
-// Translation and rotation are independent: infinite mass with finite inertia is a body that cannot be pushed and still turns freely.
-// KHR physics rigid bodies Sec. 128 gives that meaning to an explicit mass of zero.
-// Moves is the test for whether the solve touches a body at all, and it is false only when every inverse is zero.
 inline bool Translates(BodyMass mass) { return mass.InvMass > 0; }
 inline bool Turns(BodyMass mass) {
     return mass.InvInertiaLocal.x > 0 || mass.InvInertiaLocal.y > 0 || mass.InvInertiaLocal.z > 0;
@@ -109,7 +94,7 @@ enum ShapeKind : uint {
     ShapeCylinder,
 };
 
-// A collider belongs to Layer and accepts members of Collides. Both sides must accept.
+// Both collision masks must accept the pair.
 struct CollisionMask {
     uint Layer = ~0u, Collides = ~0u;
 };
@@ -118,7 +103,6 @@ inline bool Allows(CollisionMask a, CollisionMask b) {
 }
 inline bool SameMask(CollisionMask a, CollisionMask b) { return a.Layer == b.Layer && a.Collides == b.Collides; }
 
-// Explicit policies follow KHR precedence. GeometricMean is the legacy friction default.
 enum CombineMode : uint { CombineAverage,
                           CombineMinimum,
                           CombineMaximum,
@@ -137,24 +121,17 @@ inline float Combine(float a, float b, uint mode_a, uint mode_b) {
     return sqrt(a * b);
 }
 
-// The most vertices one hull may have.
-// A support search scans all of them, so this bounds the narrowphase's inner loop, and PhysX picks 64 for the same reason.
-// It also fits a vertex index in six bits, so a clipped contact point is named by the two hull vertices that produced it.
+// Hull limits bound support-query and clipping scratch storage.
 GPU_CONSTANT uint MaxHullVertices = 64;
 
-GPU_CONSTANT uint MaxFacePoints = 8; // corners per face, covering a box and most hulls
+GPU_CONSTANT uint MaxFacePoints = 8;
 
-// One face of a cooked hull: its plane, and a run of corners in the face-vertex pool, each an index into the shape's own run of the vertex pool.
-// Wound about the normal and starting at the lowest corner index, so a face is named by its geometry rather than by the order the cook produced it in.
-//
-// Faces are merged in the cook, as Gregorius (GDC 2015) and Jolt both do, because gathering a face at query time needs a height tolerance no value satisfies.
-// A tolerance loose enough for a whole face when the normal is a fraction of a degree off also admits a facet meeting it shallowly.
-// Corners are inline and capped, so the cook samples a wider face around its rim.
+// Cooked hull face with shape-local vertex indices, wound around its outward normal.
 struct HullFace {
     float3 Normal;
     float Offset;
     uint Count;
-    uchar Corner[MaxFacePoints]; // into the shape's own run, which a byte holds at MaxHullVertices
+    uchar Corner[MaxFacePoints];
 };
 
 struct BodyBounds {
@@ -175,6 +152,8 @@ GPU_CONSTANT uint CollisionLanes = 64;
 GPU_CONSTANT uint SolveLanes = 32;
 GPU_CONSTANT uint SolveDof = 6;
 GPU_CONSTANT uint SolveBodiesPerGroup = SolveLanes / SolveDof;
+GPU_CONSTANT uint WideSolveBodyLimit = 512;
+inline uint FallbackBodiesPerGroup(uint bodies) { return bodies <= WideSolveBodyLimit ? 1 : SolveBodiesPerGroup; }
 GPU_CONSTANT uint SmallSolveWaves = 8;
 // Jacobi impulse sweeps distribute the approach speed across a manifold.
 GPU_CONSTANT uint RestitutionPasses = 4;
@@ -213,21 +192,62 @@ inline uint NextBodyCandidate(device BroadPhaseNode *nodes, uint bodies, uint bo
     if (at != NoIndex) atomic_fetch_or_explicit((device atomic_uint *)&nodes[root].Errors, 2u, memory_order_relaxed);
     return best < bodies ? best : NoIndex;
 }
+GPU_CONSTANT uint BodyCandidateCapacity = 4;
+struct BodyCandidateCursor {
+    uint Values[BodyCandidateCapacity];
+    uint Count, At, First;
+};
+
+// Return the next candidate index in ascending order, or NoIndex when exhausted.
+template<uint Mode = 0>
+inline uint NextBodyCandidateBatch(device BroadPhaseNode *nodes, uint bodies, uint body, thread BodyCandidateCursor &cursor) {
+    if (Mode == 1 || (Mode == 0 && bodies <= RadixSimdWidth)) {
+        const uint next = NextBodyCandidate<1>(nodes, bodies, body, cursor.First);
+        cursor.First = next == NoIndex ? bodies : next + 1;
+        return next;
+    }
+    if (cursor.At == cursor.Count) {
+        if (cursor.First >= bodies) return NoIndex;
+        cursor.Count = cursor.At = 0;
+        const uint root = BroadPhaseRoot(bodies);
+        const BodyBounds query = nodes[body].Bounds;
+        uint at = root, from = NoIndex;
+        for (uint visited = 0; at != NoIndex && visited < 4 * bodies; ++visited) {
+            const BroadPhaseNode node = nodes[at];
+            const uint best = cursor.Count == BodyCandidateCapacity ? cursor.Values[BodyCandidateCapacity - 1] : bodies;
+            const bool possible = node.MinBody < best && node.MaxBody >= cursor.First && BoundsOverlap(query, node.Bounds);
+            uint next = node.Parent;
+            if (from == node.Parent && possible) {
+                if (node.Left == NoIndex) {
+                    if (node.MinBody != body && node.MinBody >= cursor.First) {
+                        uint insert = min(cursor.Count, BodyCandidateCapacity - 1);
+                        cursor.Count = min(cursor.Count + 1, BodyCandidateCapacity);
+                        while (insert && cursor.Values[insert - 1] > node.MinBody) {
+                            cursor.Values[insert] = cursor.Values[insert - 1];
+                            --insert;
+                        }
+                        cursor.Values[insert] = node.MinBody;
+                    }
+                } else next = node.Left;
+            } else if (from == node.Left && possible) next = node.Right;
+            from = at;
+            at = next;
+        }
+        if (at != NoIndex) atomic_fetch_or_explicit((device atomic_uint *)&nodes[root].Errors, 2u, memory_order_relaxed);
+        cursor.First = cursor.Count < BodyCandidateCapacity ? bodies : cursor.Values[BodyCandidateCapacity - 1] + 1;
+    }
+    return cursor.At < cursor.Count ? cursor.Values[cursor.At++] : NoIndex;
+}
+
 #endif
 
-// A flat tagged union: each kind reads the fields that apply to it and leaves the rest zero.
-// Box uses HalfExtents.
-// Sphere uses Radius.
-// Capsule uses Radius and HalfExtents.y, the half length of the segment its two caps sit on.
-// A capsule runs along the body's local y and reaches HalfExtents.y + Radius from the centre.
-// Hull uses a run of the world's one vertex pool, in the frame World::AddHull cooked it into.
-// That frame is centred on the centre of mass and turned onto the principal axes, which gives the body a diagonal inertia.
-//
-// A mesh adds a run of triangles and the root of the tree over them.
-// Jolt, Havok and the KHR reference loader all require the same.
-//
-// Compounds are cooked to a flat run of collider leaves in the world's child-index pool.
-// FirstVertex and VertexCount name that run. Authoring depth does not affect GPU traversal.
+// ShapeKind selects the active fields.
+// Boxes use HalfExtents; spheres use Radius; capsules use Radius and Y half-segment length.
+// Cylinder: X radius and Y half-height in HalfExtents; Radius is zero.
+// Plane: dot(Normal, p) < Offset is inside; positive X/Z half-extents bound its footprint.
+// Bounded planes use local Normal (0, +/-1, 0).
+// Hulls use vertex and face ranges; meshes use vertex, triangle and BVH ranges.
+// Compounds: FirstVertex and VertexCount index a flat run of child shape indices.
 struct Shape {
     float3 HalfExtents;
     float3 Normal;
@@ -235,33 +255,26 @@ struct Shape {
     float Radius;
     Index FirstVertex;
     uint VertexCount;
-    Index FirstFace; // a hull's run of the face pool
+    Index FirstFace;
     uint FaceCount;
-    Index FirstTriangle, RootNode; // a mesh's, into the pools below
-    // Unread on the device, and required so removing a shape can return its runs to the pools.
+    Index FirstTriangle, RootNode;
+
     uint TriangleCount, NodeCount;
     uint Kind;
-    // The pose of the shape's own frame within the body frame, which is centred on the centre of mass with the inertia diagonal.
-    // The narrowphase composes body pose with this only where it reads the geometry, so anchors, features and manifold points stay in the body frame.
-    // A contact on an offset shape therefore has anchors carrying the offset.
-    //
-    // Mass properties are the shape's own, about its own centre. See MassProperties.
-    // A body wearing a shape at any other pose needs an explicit mass.
-    // Moving the tensor onto the shifted, turned origin and diagonalizing it is the host's arithmetic.
-    // World::AddBody refuses such a body without one.
+    // Collider-local pose relative to the body's center-of-mass frame.
+    // Non-identity poses on movable bodies require authored body-frame mass properties.
     Pose Local = IdentityPose;
     Material Surface{};
     uint HasMaterial = 0;
     CollisionMask Mask{};
     uint HasFilter = 0;
-    ulong UserData = 0; // opaque collider identity, preserved when shapes are copied
+    ulong UserData = 0;
     uint DoubleSided = 0; // Planes and meshes accept contacts on both sides.
 };
 
 inline bool IsBoundedPlane(Shape shape) { return shape.Kind == ShapePlane && (shape.HalfExtents.x > 0 || shape.HalfExtents.z > 0); }
 inline CollisionMask ResolveFilter(Shape shape, CollisionMask inherited) { return shape.HasFilter ? shape.Mask : inherited; }
 
-// Child indices are pooled independently of shape geometry.
 #ifdef __METAL_VERSION__
 inline Index ChildOf(Shape shape, uint i, device const Index *children) {
 #else
@@ -270,20 +283,13 @@ inline Index ChildOf(Shape shape, uint i, const Index *children) {
     return i < shape.VertexCount ? children[shape.FirstVertex + i] : NoIndex;
 }
 
-// Which of a child's own faces are buried against a sibling, one bit each, and zero for every shape that is not a compound's child.
-// Two coplanar siblings share a face inside the solid: a floor made of two boxes, or a leg's top under a slab.
-// A separating axis is a direction a body can be pushed along, so a face left unmarked here acts as a wall at the join.
-// A mesh's inactive edge marks the same thing.
-//
-// A bit is indexed by the face's own name: BoxFaceIndex below for a box, and the face's place in the shape's run of the face pool for a hull.
-// A face past the thirty-two a word holds is left unmarked, because a wrong mark is worse than the wall.
-// Stored in FirstTriangle, and read through this function rather than by field name.
+// Internal face bits stored in FirstTriangle: box face index, hull face ordinal, or cylinder cap 0/1.
+// Faces beyond the 32-bit mask remain unmarked.
 GPU_CONSTANT uint MaxInternalFaces = 32;
 inline uint InternalFaces(Shape shape) {
     return shape.Kind == ShapeBox || shape.Kind == ShapeHull || shape.Kind == ShapeCylinder ? shape.FirstTriangle : 0u;
 }
 
-// A box's six faces, indexed by axis and then by end, on host and device alike.
 inline uint BoxFaceIndex(uint axis, bool positive) { return 2 * axis + (positive ? 1u : 0u); }
 
 #ifndef __METAL_VERSION__
@@ -291,45 +297,35 @@ inline void SetInternalFaces(Shape &shape, uint mask) { shape.FirstTriangle = ma
 
 #endif
 
-// One triangle of a mesh, by absolute index into the vertex pool, wound so that (B - A) x (C - A) points out of the surface.
-// That winding is the only solidity a mesh carries.
-//
-// An edge is active where the triangle across it folds away, leaving a convex crease a body can strike.
-// Where two triangles meet flat, or fold towards each other, the edge is a seam of the tessellation, and a body sliding over it passes without catching.
-// Computed in the cook, because it never changes.
+// Absolute vertex indices with outward winding (B - A) x (C - A).
+// Active edges mark convex creases; coplanar and concave edges are inactive.
 struct Triangle {
     Index A, B, C;
-    uint ActiveEdges; // bit i is edge i, from corner i to corner (i + 1) % 3
-    // Which of those edges this triangle owns contact points on.
-    // A point exactly on an edge clips inside both triangles, and a single owner keeps it from taking two rows and two duals.
+    uint ActiveEdges; // Bit i represents the edge from corner i to corner (i + 1) % 3.
+    // Owned edges prevent duplicate contact points across adjacent triangles.
     uint OwnedEdges;
     uint BackActiveEdges; // Reverse-winding edge flags retain inactive coplanar edges.
 };
 
-// A node of the tree over a mesh's triangles: the box around everything below it, and either a run of triangles or a pair of children.
-// A leaf has a nonzero count, and an interior node's two children are adjacent, so one index names both.
-// Plain float bounds and a binary tree, rather than the quantized four-wide nodes of LiteratureReview.md section 7.
-// That case is a bandwidth argument, so adopting it needs a measurement.
 struct BvhNode {
     float3 Low, High;
-    Index First; // the first triangle of a leaf, relative to the shape's run, or the left child of a node
-    uint Count; // triangles in a leaf, and zero in an interior node
+    Index First;
+    uint Count;
 };
 
-// Body defaults and sensor state, with conservative summaries for collider filtering.
 struct Filter {
-    uint Layer; // the bits this body belongs to
-    uint Collides; // the bits it collides with
+    uint Layer;
+    uint Collides;
     uint Sensor = 0;
-    // Refreshed before stepping. The union can reject a body pair, never accept a leaf pair.
+    // The union of leaf masks provides conservative body-pair rejection.
     CollisionMask Aggregate{};
-    uint Mixed = 0; // differently filtered leaves cannot unconditionally bury each other's faces
+    uint Mixed = 0; // Different leaf masks prevent unconditional face suppression.
 };
 
-// A body's color word holds its color in the low byte and its contact degree above.
-// One load therefore supplies both the conflict test and the neighbour's coloring priority, which is degree first and index as the tie.
+// Color in the low byte, contact degree in the remaining bits.
 GPU_CONSTANT uint ColorDegreeShift = 8;
 GPU_CONSTANT uint MaxColorDegree = 255;
+
 GPU_CONSTANT uint MaxSupportedColors = 32;
 // Island scratch begins with indirect dispatch arguments, then roots, counts and bounded member lists.
 GPU_CONSTANT uint IslandBodyLimit = SolveLanes;
@@ -340,72 +336,54 @@ GPU_CONSTANT uint IslandWordsPerBody = 4 + IslandBodyLimit;
 
 struct ColorWork {
     uint Counts[MaxSupportedColors], Offsets[MaxSupportedColors + 1], Cursors[MaxSupportedColors];
+
     uint ColoringActive, ColoringChanged;
 };
 inline uint ColorOf(uint word) { return word & 0xFFu; }
-// Degree order applies only between two bodies that have both gone quiet.
-// While either is still moving its degree changes step to step, and colors reshuffled mid-collapse leave conflicted pairs solving Jacobi.
-// The coloring exists to prevent that.
-// Index order is stable under the churn, so it governs the moving regions.
-// The quiet gate is symmetric, so both bodies of a pair select the same rule.
+// Degree breaks priority ties only between quiet bodies; moving bodies use index order.
 inline bool Prioritized(uint other_word, uint other, uint degree, uint body, bool both_quiet) {
     const uint other_degree = other_word >> ColorDegreeShift;
     if (both_quiet && other_degree != degree) return other_degree > degree;
     return other < body;
 }
 
-// Each body has a fixed run of contact slots, so the pool is addressable without an atomic append.
-// One thread fills its own body's run, in a fixed order over the other bodies.
-// The budget is in manifolds, because reduction leaves four points per manifold whatever shape produced it.
-//
-// Every partner is collided whether or not the run is full, and the shallowest contact held is replaced by any deeper one.
-// Going over budget therefore drops the shallowest contact rather than the highest-numbered body.
-// A mesh is deliberately left uncapped, presenting one manifold per triangle, so a body resting across a seam is held by both triangles.
-GPU_CONSTANT uint ManifoldPoints = 4; // Gregorius's four, the count ReduceManifold leaves
+// Fixed per-body contact runs avoid atomic append.
+// Collection visits every candidate and replaces shallower contacts when the run is full.
+GPU_CONSTANT uint ManifoldPoints = 4;
 GPU_CONSTANT uint ManifoldsPerBody = 10;
 GPU_CONSTANT uint ContactsPerBody = ManifoldPoints * ManifoldsPerBody;
 
-// A contact is written by the thread owning the pair, which makes that body A, so the contacts where a body is B are scattered through other bodies' runs.
-// They are gathered once a step into a list per body, and each run is sorted so the order does not depend on thread completion order.
+// Adjacency indexes contacts owned by other bodies, where this body is B.
 struct Adjacency {
     uint Count, Start, Cursor;
 };
 
-// One contact point, in the slot its feature owns.
-// Normal points out of body B towards body A, and the three constraint rows use an orthonormal basis built from it.
-// Row 0 resists penetration and rows 1 and 2 are friction.
-// Row 0's force is at most zero, a contact being able only to push.
-// C0 is the separation at the start of the step.
-// The constraint is a truncated Taylor series about that pose, C = C0 (1 - alpha) + J dq, rather than a gap re-measured every sweep.
+// Normal points from B to A; row 0 has a nonpositive normal dual, rows 1/2 are friction.
+// Contacts linearize about the initial pose: C = C0 (1 - alpha) + J dq.
 struct Contact {
-    float3 AnchorA; // in body A's frame
-    float3 AnchorB; // in body B's frame
-    float3 Normal; // world, out of B towards A
-    float3 PointA, PointB; // fresh geometric points in body frames, independent of retained friction anchors
-    float NominalArea = -1, NominalExtent = 0; // unreduced projected patch; area -1 when reporting was disabled
+    float3 AnchorA;
+    float3 AnchorB;
+    float3 Normal; // The world-space normal points from B to A.
+    float3 PointA, PointB; // Geometric points use body frames independently of retained friction anchors.
+    float NominalArea = -1, NominalExtent = 0; // Unreduced patch area is -1 when reporting is disabled.
     float StiffnessScale = 0; // Pair inertial stiffness is divided among points sharing the normal.
     float3 C0;
-    float3 Lambda; // the force each row is applying, and the dual the solve converges
+    float3 Lambda;
     float3 Penalty;
     float Friction;
     float Restitution;
-    // The closing speed at this point when the step began, with neither restitution nor the threshold folded in.
-    // One displacement per step cannot carry both an approach and a rebound, so the velocity pass decides the bounce rather than the row.
+    // Initial closing speed before restitution or its threshold is applied.
     float Approach;
-    // The normal impulse the restitution pass has applied so far this step, and the amount its last iteration added.
-    // Clamped at zero, so the pass only ever pushes the two apart.
+    // Accumulated normal restitution impulse and the latest iteration's increment.
     float BounceImpulse, BounceDelta;
     Index BodyA, BodyB;
-    uint Feature; // identifies the geometry the point came from, so next step's point inherits its dual
-    // The part of body B's shape it came from: the triangle for a mesh, and NoIndex for a shape of one piece.
-    // A contact is matched on this, Feature and Children together.
+    uint Feature;
+    // Triangle index on B, or NoIndex for non-mesh geometry.
     Index SubShape;
     Index SubShapeA = NoIndex;
-    // Leaf ordinals in the low and high 32 bits, both zero for a shape of one piece.
-    // Leaf 3 against leaf 5 is different geometry from leaf 2 against leaf 5, even when both name the same face and corner.
-    // The warm start needs this to give each leaf its own dual.
+    // Child ordinals occupy the low and high 32 bits and are zero for single colliders.
     ulong Children;
-    uint Stick; // inside the friction cone last step, so its anchors are kept for static friction
+    uint Stick;
     uint Active;
 };
 
@@ -413,9 +391,6 @@ inline ulong ChildPair(uint own, uint other) { return ulong(own) | (ulong(other)
 inline uint OwnChild(ulong children) { return uint(children); }
 inline uint OtherChild(ulong children) { return uint(children >> 32); }
 
-// The frame a contact's three rows resolve in: its normal, then the two tangents friction acts along.
-// The particular tangent pair is arbitrary, but one normal must always give the same pair: a stuck contact's dual is carried in this frame between steps.
-// Shared rather than private to the solve, because reading a contact's force back out as a vector requires the frame it was applied in.
 struct ContactBasis {
     float3 Axis[3];
 };
@@ -427,21 +402,17 @@ inline ContactBasis MakeContactBasis(float3 normal) {
     return {{normal, tangent, cross(normal, tangent)}};
 }
 
-// A contact's change between one step and the next, taken from the match warm starting already performs.
-// This step's points are matched against last step's by feature, so an unmatched new point is added and an unmatched last-step feature is removed.
 enum ContactEventKind : uint {
     ContactAdded,
     ContactPersisted,
     ContactRemoved,
 };
 
-// One such change, named the way the contact itself is named, and deliberately without geometry.
-// A removed contact has none, and for the other two kinds the live contact is one lookup away.
 struct ContactEvent {
     Index BodyA, BodyB;
     uint Feature;
-    Index SubShape; // which triangle of a mesh, and NoIndex for every shape that is one piece
-    ulong Children; // and which leaf of each compound, packed as Contact::Children is
+    Index SubShape;
+    ulong Children;
     uint Kind;
     Index SubShapeA = NoIndex;
 };
@@ -490,23 +461,18 @@ struct StepOutputFlags {
     uint Poses, Sensors;
 };
 
-// A body reports at most one event per slot it filled, plus one per slot it held last step and did not refill, so twice the slot count is an exact bound.
-// Each body's thread writes its own run in slot order, so events need no atomic and no sort to come out identical on every run.
+// At most one event per current point plus one per removed point.
 GPU_CONSTANT uint EventsPerBody = 2 * ContactsPerBody;
 
-// CollectContacts tracks which of last step's slots have been claimed, in one word of bits.
-// Widen the mask before widening the run.
+// One claim bit per contact slot.
 static_assert(ContactsPerBody <= 64, "the claimed-slot mask in CollectContacts is a single ulong");
 
-// The mode of one of a joint's six axes, three linear and three angular, taken in the joint's own frame.
-// Each base axis has one mode. Independent drive rows may act alongside it.
-// Linear and angular are the same row, in metres and newtons against radians and newton metres.
 enum JointAxisMode : uint {
     AxisFree,
     AxisLocked,
-    AxisDriven, // moved towards a relative speed, within a force bound
-    AxisPositioned, // moved towards a relative offset or angle, within the same bound
-    AxisLimited, // free between two stops and held outside them, as a contact's one-sided row
+    AxisDriven,
+    AxisPositioned,
+    AxisLimited,
 };
 
 // An independent drive row, which may act on an axis that also has a limit.
@@ -517,63 +483,43 @@ struct JointDrive {
     float Lambda = 0, Penalty = 1, Began = 0;
 };
 
-// A joint holds two bodies' anchor points together, and where configured the rotation between them as well.
-// Unlike a contact it is re-measured at the current pose every iteration rather than expanded once about the pose the step began from.
-// A body hanging off a joint sweeps an arc the Taylor series does not survive.
-// The start of the step records only the error, which alpha spreads over several steps.
-//
-// The joint carries a frame of its own rather than reusing body B's axes.
-// KHR gives the joint node's world transform as the frame on A and the connected node's as the frame on B.
-// Rest is the two frames coinciding, so frames differing at creation are an initial error the joint closes.
-//
-// The axis modes determine how that rotation resolves into three numbers.
-// Exactly one angular axis off Locked is a hinge: the rotation splits into the twist about that axis and the swing left over. See AngularError.
-// Twist below accumulates that twist across steps.
-// Any other combination has no single axis of rotation, so the whole misalignment stays one rotation vector.
-// Its limits are small by construction, which keeps the log map's seam out of reach.
+// Joints remeasure anchors and frames at every iteration.
+// Exactly one unlocked angular axis uses unwrapped twist and the remaining swing.
+// Other angular configurations use the relative rotation vector.
 struct Joint {
-    float3 AnchorA, AnchorB; // in each body's frame
-    float4 FrameA, FrameB; // and the joint's own frame, likewise
+    float3 AnchorA, AnchorB;
+    float4 FrameA, FrameB;
     float3 C0Linear, C0Angular;
-    // The twist angle a hinge-like joint has turned through since creation, unwrapped against last step's value.
-    // A limit at three half-turns therefore means three half-turns rather than folding into the half turn a quaternion can name.
-    // Initialized against the authored endpoint frames at the first step.
+    // Continuous hinge twist, unwrapped against the previous step.
     float Twist;
-    float3 LambdaLinear, LambdaAngular; // the force and torque each row is applying
+    float3 LambdaLinear, LambdaAngular;
     float3 PenaltyLinear, PenaltyAngular;
-    float3 MotorSpeed; // per angular axis, the relative angular speed a driven one turns towards
-    float3 MotorTarget; // and the relative angle a positioned one turns towards, measured from rest
-    float3 MotorMaxTorque; // and the torque bound for both of those modes
-    float3 LimitLow, LimitHigh; // per angular axis, the angles a limited one turns between, from rest
-    // The same five for the linear axes, in metres and newtons.
-    // Separate fields rather than a shared set, because a joint is routinely both at once and the units never mix.
+    float3 MotorSpeed;
+    float3 MotorTarget;
+    float3 MotorMaxTorque;
+    float3 LimitLow, LimitHigh;
+    // Linear drives and limits, in metres and newtons.
     float3 LinearMotorSpeed, LinearMotorTarget, LinearMotorMaxForce;
     float3 LinearLimitLow, LinearLimitHigh;
-    // The material stiffness of each row.
-    // Infinite makes the row a hard constraint.
-    // Finite makes it a spring, which Sec. 3.4 treats separately: the penalty ramps to this rather than to PenaltyMax, and the row carries no dual.
-    // A spring's force is Eq. 7 on the extension the row currently has, rather than on the error added this step.
-    // Zero is a brake, leaving only the damper below.
+    // Infinite stiffness is hard; finite stiffness is a spring with no dual.
+    // Zero stiffness leaves only damping.
     float3 LinearStiffness, AngularStiffness;
-    // The viscous coefficient of each row, in N s/m and N m s/rad.
-    // Backwards Euler evaluates the viscous force -c times the row's rate at the end of the step, making it -(c/h) times the distance the row moved.
-    // That is a second Eq. 7 force at the known stiffness c/h, acting on the change rather than on the error.
-    // It carries no dual and no ramp, its stiffness already being in closed form. See RowForce.
+    // Viscous coefficients in N s/m and N m s/rad.
+    // Backward Euler contributes stiffness c/h on displacement, without a dual or penalty ramp.
     float3 LinearDamping, AngularDamping;
     Index BodyA, BodyB;
-    uint LinearModes, AngularModes; // three bits per axis, one JointAxisMode each
+    uint LinearModes, AngularModes;
     uint Active;
-    JointDrive Drives[6]{}; // linear XYZ, angular XYZ
+    JointDrive Drives[6]{};
     // A nonzero mask groups a limit's axes into a distance or cone, stored on its first axis.
     uint LinearLimitAxes[3]{}, AngularLimitAxes[3]{};
+
     uint Suppresses;
 };
 
 inline uint AxisMode(uint modes, uint axis) { return (modes >> (3 * axis)) & 7u; }
 
-// The angular axis a joint turns about, or 3 when it has none.
-// One axis off Locked is the hinge case, and every other combination is measured as a single rotation vector.
-// Derived from the modes rather than stored, so changing an axis mode changes this.
+// Return the unique unlocked angular axis, or 3 if its count differs from one.
 inline uint TwistAxis(uint angular_modes) {
     uint found = 3, count = 0;
     for (uint axis = 0; axis < 3; ++axis) {
@@ -584,8 +530,6 @@ inline uint TwistAxis(uint angular_modes) {
     return count == 1 ? found : 3;
 }
 
-// A row with unbounded stiffness is a hard constraint.
-// Only a hard row gets a dual, a stabilized constraint, and a penalty free to ramp past its material stiffness.
 inline bool IsHard(float stiffness) { return isinf(stiffness); }
 
 // The first three words are Metal's indirect threadgroup count.
@@ -611,50 +555,43 @@ struct QueryInputSpec {
 };
 GPU_CONSTANT uint QueryScratchBytes = 32u * 1024u * 1024u;
 
-// Named for the paper's symbols, so the kernels diff against the references.
 struct StepParams {
     float3 Gravity;
     float DeltaTime;
     float Beta;
     float ContactBeta;
-    float Gamma; // the fraction of a penalty carried into the next step
+    float Gamma;
     float PenaltyMin;
     float PenaltyMax;
     float ContactMargin;
-    // The most a pair's contact reach may grow past that margin, or INFINITY for unclamped.
-    // See StepSettings::MaxContactReach.
     float MaxContactReach;
-    float MaxAngularSpeed; // a body spinning faster than this has meaningless contacts
-    float MinBounceSpeed; // impacts slower than this do not bounce. See StepSettings::BounceSpeedFactor.
-    float SleepSpeed; // a body slower than this at every point is a sleep candidate
-    uint SleepSteps; // and sleeps after this many consecutive slow steps
-    float SleepDrift; // provided it also moved less than this over them
+    float MaxAngularSpeed;
+    float MinBounceSpeed; // See StepSettings::BounceSpeedFactor for the threshold scale.
+    float SleepSpeed;
+    uint SleepSteps;
+    float SleepDrift;
     uint BodyCount;
     uint JointCount;
-    // A body with no free color below this keeps its own and solves Jacobi against its neighbour, which the double buffering supports.
     uint MaxColors;
-    uint ReportContacts; // retain unreduced manifold geometry for the host contact stream
+    uint ReportContacts; // Enable unreduced manifold geometry for contact reporting.
 };
 
 inline float4 QuatConjugate(float4 q) { return MakeFloat4(-q.xyz, q.w); }
 
-// The rotation vector (axis times angle) a quaternion represents.
-// q and -q are the same rotation, and flipping to the near side first makes the result the shortest arc.
+// Quaternion logarithm as an axis-angle rotation vector.
 inline float3 RotationVector(float4 q) {
     if (q.w < 0) q = -q;
     const float sine = length(q.xyz);
-    if (sine < 1e-7f) return 2 * q.xyz; // the small-angle limit of the line below
+    if (sine < 1e-7f) return 2 * q.xyz;
     return q.xyz * (2 * atan2(sine, q.w) / sine);
 }
 
-// The quaternion a rotation vector represents.
 inline float4 QuatFromRotationVector(float3 v) {
     const float angle = length(v);
     if (angle < 1e-7f) return normalize(MakeFloat4(0.5f * v, 1));
     return MakeFloat4(v * (sin(0.5f * angle) / angle), cos(0.5f * angle));
 }
 
-// Rotate v by the unit quaternion q, without materializing a matrix.
 inline float3 Rotate(float4 q, float3 v) {
     const float3 axis = q.xyz;
     return v + 2 * cross(axis, cross(axis, v) + q.w * v);
@@ -664,12 +601,10 @@ inline float4 QuatMul(float4 a, float4 b) {
     return MakeFloat4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
 }
 
-// A point in a frame's own space, mapped into the space that frame is posed in, and the inverse.
 inline float3 WorldPoint(Pose pose, float3 local) { return pose.Position + Rotate(pose.Orientation, local); }
 inline float3 LocalPoint(Pose pose, float3 world) { return Rotate(QuatConjugate(pose.Orientation), world - pose.Position); }
 
-// `inner` expressed in the space `outer` is posed in.
-// A shape's Local composed into its body's pose is the pose of the geometry. See World::AddHull.
+// Compose inner into outer's parent frame.
 inline Pose ComposePose(Pose outer, Pose inner) {
     return {WorldPoint(outer, inner.Position), QuatMul(outer.Orientation, inner.Orientation)};
 }
@@ -677,8 +612,8 @@ inline Pose ComposePose(Pose outer, Pose inner) {
 } // namespace rbp
 
 #ifdef __METAL_VERSION__
-// The kernels are compiled with this text prepended and use these names unqualified.
+
 using namespace rbp;
 #endif
 
-#endif // RBP_GPU_SHARED_H
+#endif

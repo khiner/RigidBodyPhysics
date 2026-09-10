@@ -35,8 +35,7 @@ void Drain(MTL4::CommandQueue *queue) {
     auto commands = NS::TransferPtr(device->newCommandBuffer());
     commands->beginCommandBuffer(allocator.get());
     commands->endCommandBuffer();
-    // The drain is a commit of nothing with a feedback handler.
-    // The runtime calls the handler only after the driver has reported the buffer, and a serial queue reports in order.
+    // The serial queue reports earlier commands complete before invoking this feedback handler.
     std::binary_semaphore reported{0};
     auto options = Make<MTL4::CommitOptions>();
     options->addFeedbackHandler([&reported](MTL4::CommitFeedback *) { reported.release(); });
@@ -45,13 +44,10 @@ void Drain(MTL4::CommandQueue *queue) {
     reported.acquire();
 }
 
-NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view source, const char *name, std::string_view prefix, bool safe_math) const {
+NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view source, const char *name, std::string_view prefix, bool safe_math, bool indirect) const {
     const auto text = std::format("{}\n{}\n{}", gpu::SharedSource, prefix, source);
     NS::Error *error{};
-    // RBP_MATH=safe compiles without fast math.
-    // Fast math contracts and reassociates, and does so differently in a differently instrumented build, so two builds of one kernel can disagree by an ulp.
-    // That is invisible in a settling stack and a full turn apart where an impact amplifies it.
-    // Safe math separates a build-to-build divergence from a real defect: agreement under it means the difference is rounding.
+    // RBP_MATH=safe disables fast-math transformations for rounding diagnostics.
     const char *const math = getenv("RBP_MATH");
     auto options = Make<MTL::CompileOptions>();
     if (safe_math || (math != nullptr && std::string_view{math} == "safe")) options->setMathMode(MTL::MathModeSafe);
@@ -63,6 +59,7 @@ NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view sour
     function->setLibrary(library.get());
     auto descriptor = Make<MTL4::ComputePipelineDescriptor>();
     descriptor->setComputeFunctionDescriptor(function.get());
+    if (indirect) descriptor->setSupportIndirectCommandBuffers(MTL4::IndirectCommandBufferSupportStateEnabled);
     auto pipeline = NS::TransferPtr(Compiler->newComputePipelineState(descriptor.get(), nullptr, &error));
     if (!pipeline) throw std::runtime_error(std::format("Pipeline {}: {}", name, Describe(error)));
     return pipeline;

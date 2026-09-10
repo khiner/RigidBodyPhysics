@@ -1,14 +1,9 @@
 #!/bin/bash
-# Build one phase-1 probe and forward the remaining arguments to it.
-#
-#   ./run DispatchChain [iterations] [max_chain] [groups] [work]
-#   ./run VectorMiscompile          # OPT=-O2 ./run VectorMiscompile fails, which is why OPT is -O1
-#
-# -O1 because Homebrew clang 22.1.8 miscompiles vector growth at -O2. See probes/VectorMiscompile.cpp.
+# Run the compiler regression reproducer. Override optimization with OPT.
 
 set -e
 cd "$(dirname "$0")"
-Probe=${1:?usage: ./run <DispatchChain|VectorMiscompile> [args...]}
+Probe=${1:?usage: ./run VectorMiscompile}
 shift
 Llvm=$(brew --prefix llvm)
 mkdir -p build

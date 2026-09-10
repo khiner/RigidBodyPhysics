@@ -1,4 +1,3 @@
-// Reports the size and alignment the Metal compiler gives every shared struct, for a host test to compare against clang's from the same text.
 
 kernel void ReportLayout(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i != 0) return;
@@ -39,6 +38,18 @@ kernel void ReportBroadPhasePairs(
     constant uint &bodies [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
     if (body >= bodies) return;
+    uint order = 0;
     for (uint other = NextBodyCandidate(nodes, bodies, body, 0); other != NoIndex; other = NextBodyCandidate(nodes, bodies, body, other + 1))
-        pairs[body * bodies + other] = 1;
+        pairs[body * bodies + other] = ++order;
+}
+
+kernel void ReportBatchedBroadPhasePairs(
+    device BroadPhaseNode *nodes [[buffer(13)]], device uint *pairs [[buffer(0)]],
+    constant uint &bodies [[buffer(7)]], uint body [[thread_position_in_grid]]
+) {
+    if (body >= bodies) return;
+    BodyCandidateCursor cursor{};
+    uint order = 0;
+    for (uint other = NextBodyCandidateBatch(nodes, bodies, body, cursor); other != NoIndex; other = NextBodyCandidateBatch(nodes, bodies, body, cursor))
+        pairs[body * bodies + other] = ++order;
 }

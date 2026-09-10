@@ -399,6 +399,8 @@ TEST_CASE("advance: joint topology and waking survive batched execution") {
         }
     }
     check(19);
+    check(3, CommandIterationLimit);
+    check(3, CommandIterationLimit + 1);
     check(3);
     for (World *world : {&pair.serial, &pair.batched})
         for (Index joint : bridges) REQUIRE(world->RemoveJoint(joint));
