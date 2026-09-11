@@ -9,6 +9,10 @@
 using namespace rbp;
 
 TEST_CASE("collision: bounded query storage preserves contacts and sensor transitions") {
+    CHECK(QueuedQueriesFit(32));
+    CHECK(QueuedQueriesFit(4'194'284));
+    CHECK_FALSE(QueuedQueriesFit(4'194'285));
+    CHECK_FALSE(QueuedQueriesFit(NoIndex));
     SUBCASE("collision storage: dense mesh queries preserve contacts and sensor transitions") {
         mtl::Context context;
         Solver solver{context};

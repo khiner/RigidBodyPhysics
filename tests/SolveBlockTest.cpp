@@ -60,7 +60,7 @@ kernel void ProbeSolveBlock(device const float2 *input [[buffer(0)]], device flo
     output[matrix * 6 + row] = SolveBlock(H, input[start + 6], row, lane - row);
 }
 )";
-    auto pipeline = context.Pipeline(source, "ProbeSolveBlock");
+    auto pipeline = CompileProbe(context, source, "ProbeSolveBlock");
     RunGpu(context, pipeline.get(), {{0, input.Handle.get()}, {1, output.Handle.get()}}, (Count + 4) / 5);
 
     for (uint32_t matrix = 0; matrix < Count; ++matrix) {
@@ -131,7 +131,7 @@ kernel void ProbeAssembly(device const float2 *input [[buffer(0)]], device float
     output[(matrix * 6 + lane) * 7 + 6] = float2(SolveBlock(H, g, lane, 0), 0);
 }
 )";
-    auto pipeline = context.Pipeline(source, "ProbeAssembly", batched ? "#define BATCHED_ASSEMBLY 1" : "#define BATCHED_ASSEMBLY 0");
+    auto pipeline = CompileProbe(context, source, "ProbeAssembly", batched ? "#define BATCHED_ASSEMBLY 1" : "#define BATCHED_ASSEMBLY 0");
     RunGpu(context, pipeline.get(), {{0, input.Handle.get()}, {1, output.Handle.get()}}, Count);
     const double solution[]{1, -1, 2, -2, 3, -3};
     for (uint32_t matrix = 0; matrix < Count; ++matrix) {

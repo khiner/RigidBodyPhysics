@@ -1,8 +1,8 @@
 #include "metal/Context.h"
 
-#include "GpuSource.h"
+#include "Pipelines.h"
 
-#include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <semaphore>
 #include <stdexcept>
@@ -19,8 +19,13 @@ Context::Context() {
     Device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
     if (!Device) throw std::runtime_error("No Metal device.");
     NS::Error *error{};
-    Compiler = NS::TransferPtr(Device->newCompiler(Make<MTL4::CompilerDescriptor>().get(), &error));
-    if (!Compiler) throw std::runtime_error(std::format("Metal compiler: {}", Describe(error)));
+    const std::filesystem::path directory{NS::Bundle::mainBundle()->resourcePath()->utf8String()};
+    const auto library_path = (directory / "rbp.metallib").string();
+    Library = NS::TransferPtr(Device->newLibrary(NS::String::string(library_path.c_str(), NS::UTF8StringEncoding), &error));
+    if (!Library) throw std::runtime_error(std::format("Metal library {}: {}", library_path, Describe(error)));
+    const auto archive_path = (directory / "rbp.binary.metallib").string();
+    Archive = NS::TransferPtr(Device->newArchive(NS::URL::fileURLWithPath(NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding)), &error));
+    if (!Archive) throw std::runtime_error(std::format("Metal archive {}: {}", archive_path, Describe(error)));
     Queue = NS::TransferPtr(Device->newMTL4CommandQueue(Make<MTL4::CommandQueueDescriptor>().get(), &error));
     if (!Queue) throw std::runtime_error(std::format("Metal queue: {}", Describe(error)));
 }
@@ -44,24 +49,18 @@ void Drain(MTL4::CommandQueue *queue) {
     reported.acquire();
 }
 
-NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(std::string_view source, const char *name, std::string_view prefix, bool safe_math, bool indirect) const {
-    const auto text = std::format("{}\n{}\n{}", gpu::SharedSource, prefix, source);
-    NS::Error *error{};
-    // RBP_MATH=safe disables fast-math transformations for rounding diagnostics.
-    const char *const math = getenv("RBP_MATH");
-    auto options = Make<MTL::CompileOptions>();
-    if (safe_math || (math != nullptr && std::string_view{math} == "safe")) options->setMathMode(MTL::MathModeSafe);
-    auto library = NS::TransferPtr(Device->newLibrary(NS::String::string(text.c_str(), NS::UTF8StringEncoding), options.get(), &error));
-    if (!library) throw std::runtime_error(std::format("Compiling {}: {}", name, Describe(error)));
-
+NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(uint32_t index) const {
+    if (index >= std::size(shaders::Pipelines)) throw std::out_of_range("Invalid solver pipeline");
+    const auto &entry = shaders::Pipelines[index];
     auto function = Make<MTL4::LibraryFunctionDescriptor>();
-    function->setName(NS::String::string(name, NS::UTF8StringEncoding));
-    function->setLibrary(library.get());
+    function->setName(NS::String::string(entry.Name, NS::UTF8StringEncoding));
+    function->setLibrary(Library.get());
     auto descriptor = Make<MTL4::ComputePipelineDescriptor>();
     descriptor->setComputeFunctionDescriptor(function.get());
-    if (indirect) descriptor->setSupportIndirectCommandBuffers(MTL4::IndirectCommandBufferSupportStateEnabled);
-    auto pipeline = NS::TransferPtr(Compiler->newComputePipelineState(descriptor.get(), nullptr, &error));
-    if (!pipeline) throw std::runtime_error(std::format("Pipeline {}: {}", name, Describe(error)));
+    if (entry.Indirect) descriptor->setSupportIndirectCommandBuffers(MTL4::IndirectCommandBufferSupportStateEnabled);
+    NS::Error *error{};
+    auto pipeline = NS::TransferPtr(Archive->newComputePipelineState(descriptor.get(), &error));
+    if (!pipeline) throw std::runtime_error(std::format("Loading pipeline {}: {}", entry.Name, Describe(error)));
     return pipeline;
 }
 } // namespace rbp::mtl

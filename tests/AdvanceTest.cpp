@@ -157,7 +157,10 @@ TEST_CASE("advance: complete states and reports match serial execution across sc
     }
     SUBCASE("advance: small-world schedule changes preserve complete contact and sensor reports") {
         bool hull = false, bounded = false;
+        Shape primitive = UnitBox;
         SUBCASE("box on plane") {}
+        SUBCASE("sphere on plane") { primitive = {.Radius = Half, .Kind = ShapeSphere}; }
+        SUBCASE("capsule on plane") { primitive = {.HalfExtents = {0, Half / 2, 0}, .Radius = Half / 2, .Kind = ShapeCapsule}; }
         SUBCASE("hull on plane") { hull = true; }
         SUBCASE("box on bounded plane") { bounded = true; }
         SUBCASE("hull on bounded plane") { hull = bounded = true; }
@@ -169,7 +172,7 @@ TEST_CASE("advance: complete states and reports match serial execution across sc
             Shape plane = GroundPlane;
             if (bounded) plane.HalfExtents = {3, 0, 3};
             world->AddBody({.Shape = world->AddShape(plane), .Density = 0});
-            const Index shape = hull ? world->AddHull(PrismPoints(8, Half, Half)) : world->AddShape(UnitBox);
+            const Index shape = hull ? world->AddHull(PrismPoints(8, Half, Half)) : world->AddShape(primitive);
             REQUIRE(shape != NoIndex);
             world->AddBody({.Pose = At(float3{0, 0.55f, 0}), .Velocity = {.Linear = {0.125f, -0.25f, 0}}, .Shape = shape, .Restitution = 0.4f});
             world->AddBody({.Pose = At(float3{0, 0.5f, 0}), .Shape = world->AddShape({.Radius = 2, .Kind = ShapeSphere}), .Density = 0, .Sensor = true});

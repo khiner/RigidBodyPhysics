@@ -94,6 +94,10 @@ enum ShapeKind : uint {
     ShapeCylinder,
 };
 
+inline bool FullStepShape(uint kind) {
+    return kind == ShapeBox || kind == ShapePlane || kind == ShapeSphere || kind == ShapeCapsule;
+}
+
 // Both collision masks must accept the pair.
 struct CollisionMask {
     uint Layer = ~0u, Collides = ~0u;
@@ -554,6 +558,9 @@ struct QueryInputSpec {
     uint Offsets[16], Words;
 };
 GPU_CONSTANT uint QueryScratchBytes = 32u * 1024u * 1024u;
+inline bool QueuedQueriesFit(uint bodies) {
+    return ulong(bodies) * (QueryPartitions(bodies) + 1) * sizeof(uint) + sizeof(QueryArenaHeader) + 48 < QueryScratchBytes;
+}
 
 struct StepParams {
     float3 Gravity;
@@ -574,6 +581,7 @@ struct StepParams {
     uint JointCount;
     uint MaxColors;
     uint ReportContacts; // Enable unreduced manifold geometry for contact reporting.
+    uint QueuedQueries;
 };
 
 inline float4 QuatConjugate(float4 q) { return MakeFloat4(-q.xyz, q.w); }

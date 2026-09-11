@@ -17,7 +17,7 @@ std::vector<uint32_t> ReportPairs(const mtl::Context &context, World &world, boo
     mtl::Buffer<uint32_t> pairs{context.Device.get(), bodies * bodies}, count{context.Device.get(), 1};
     std::ranges::fill(pairs.All(), 0u);
     count[0] = bodies;
-    auto pipeline = context.Pipeline(gpu::LayoutSource, batched ? "ReportBatchedBroadPhasePairs" : "ReportBroadPhasePairs");
+    auto pipeline = CompileProbe(context, gpu::LayoutSource, batched ? "ReportBatchedBroadPhasePairs" : "ReportBroadPhasePairs");
     RunGpu(context, pipeline.get(), {{0, pairs.Handle.get()}, {7, count.Handle.get()}, {13, world.BroadPhaseNodes.Handle.get()}}, bodies, std::min(bodies, 32u), false);
     std::vector<uint32_t> result(pairs.All().begin(), pairs.All().end());
     return result;

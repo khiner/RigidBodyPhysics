@@ -1,4 +1,4 @@
-static void EncodeIterationCommand(constant SolveCommandData &s, uint at, uint kind, uint groups, uint color) {
+__attribute__((noinline)) static void EncodeIterationCommand(constant SolveCommandData &s, uint at, uint kind, uint groups, uint color) {
     compute_command command(s.Commands, at);
     command.reset();
     command.set_barrier();

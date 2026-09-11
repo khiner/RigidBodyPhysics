@@ -30,7 +30,7 @@ kernel void CheckDerivatives(device float *out [[buffer(0)]], uint index [[threa
     out[2*index+1] = (plus-minus)/(2*epsilon);
 }
 )";
-    auto pipeline = context.Pipeline(source, "CheckDerivatives");
+    auto pipeline = CompileProbe(context, source, "CheckDerivatives");
     const mtl::Buffer<float> reported{context.Device.get(), 2 * Cases};
     RunGpu(context, pipeline.get(), {{0, reported.Handle.get()}}, Cases, 32, false);
     for (uint32_t i = 0; i < Cases; ++i) {

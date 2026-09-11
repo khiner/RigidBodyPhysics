@@ -28,13 +28,14 @@ TEST_CASE("hull distance agrees with an independent prism distance under rotatio
     }
     std::vector<Query> queries(Count);
     std::vector<double> expected(Count);
+    std::vector<float3> expected_axis(Count, float3{0, 0, 0});
     std::mt19937 random(70553);
     std::uniform_real_distribution<float> offset(-1.7f, 1.7f), unit(-1.f, 1.f);
     for (uint32_t i = 0; i < Count; ++i) {
         auto &query = queries[i];
         query.Position = {offset(random), offset(random), offset(random)};
         query.Orientation = simd::normalize(float4{unit(random), unit(random), unit(random), unit(random)});
-        constexpr float3 aligned[]{{0, 0, 0}, {1, 0, 0}, {1.01f, 0, 0}, {0, 1.4f, 0}, {0, 1.41f, 0}, {0.99f, 1.399f, 0}};
+        constexpr float3 aligned[]{{0, 0, 0}, {1, 0, 0}, {1.01f, 0, 0}, {0, 1.4f, 0}, {0, 1.41f, 0}, {0.99f, 1.399f, 0}, {0.6f, 1.400005f, 0.2f}, {0.6f, -1.400005f, 0.2f}, {0.6f, 1.4f, 0.2f}};
         if (i < std::size(aligned)) {
             query.Position = aligned[i];
             query.Orientation = {0, 0, 0, 1};
@@ -53,6 +54,8 @@ TEST_CASE("hull distance agrees with an independent prism distance under rotatio
         }
         const double axial = std::max(0.0, std::abs(double(query.Position.y)) - double(2 * 0.7f));
         expected[i] = std::hypot(inside ? 0.0 : nearest, axial);
+        if (inside && std::abs(double(query.Position.y)) >= double(2 * 0.7f))
+            expected_axis[i] = Rotate(query.Orientation, float3{0, query.Position.y > 0 ? -1.f : 1.f, 0});
     }
 
     const mtl::Context context;
@@ -71,16 +74,16 @@ kernel void ProbeHullDistance(device const float3 *points [[buffer(0)]], device 
     a.Count = b.Count = 64;
     a.Orientation = b.Orientation = q.Orientation;
     b.Center = Rotate(q.Orientation, q.Position);
-    Mink simplex[4]; uint count = 0; float3 direction; float distance;
-    const bool inside = Gjk(a, b, points, simplex, count, direction, distance, COLLECT_LANES == 1 ? NoIndex : lane);
-    if (lane == 0) output[group] = float4(direction, inside ? 0.f : distance);
+    float3 direction; float distance;
+    const bool valid = ConvexSeparation(a, b, points, direction, distance, COLLECT_LANES == 1 ? NoIndex : lane);
+    if (lane == 0) output[group] = float4(direction, valid ? max(distance, 0.f) : INFINITY);
 }
 )";
     for (uint32_t lanes : {1u, 32u}) {
         CAPTURE(lanes);
         constexpr float Guard = -99999;
         std::ranges::fill(output.All(), float4{Guard, Guard, Guard, Guard});
-        auto pipeline = context.Pipeline(source, "ProbeHullDistance", "#define COLLECT_LANES " + std::to_string(lanes));
+        auto pipeline = CompileProbe(context, source, "ProbeHullDistance", "#define COLLECT_LANES " + std::to_string(lanes));
         RunGpu(context, pipeline.get(), {{0, points.Handle.get()}, {1, input.Handle.get()}, {2, output.Handle.get()}}, Count, lanes);
         double maximum = 0;
         uint32_t worst = 0;
@@ -89,6 +92,10 @@ kernel void ProbeHullDistance(device const float3 *points [[buffer(0)]], device 
             REQUIRE(std::isfinite(value.w));
             REQUIRE(value.w >= 0);
             CHECK(simd::length(float3{value.x, value.y, value.z}) == doctest::Approx(1).epsilon(1e-5));
+            if (simd::length_squared(expected_axis[i]) > 0) {
+                CAPTURE(i);
+                CHECK(simd::dot(float3{value.x, value.y, value.z}, expected_axis[i]) > 0.999f);
+            }
             const double error = std::abs(double(value.w) - expected[i]);
             if (error > maximum) {
                 maximum = error;

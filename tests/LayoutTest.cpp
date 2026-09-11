@@ -1,6 +1,6 @@
 
 #include "Gpu.h"
-#include "GpuSource.h"
+#include "Pipelines.h"
 #include "gpu/Shared.h"
 
 #include <algorithm>
@@ -47,7 +47,12 @@ constexpr Layout HostLayouts[]{
 
 TEST_CASE("shared structs have the same layout on host and device") {
     const mtl::Context context;
-    auto pipeline = context.Pipeline(gpu::LayoutSource, "ReportLayout");
+    for (uint32_t i = 0; i < std::size(shaders::Pipelines); ++i) {
+        CAPTURE(shaders::Pipelines[i].Name);
+        REQUIRE(context.Pipeline(i));
+    }
+    CHECK_THROWS_AS(context.Pipeline(UINT32_MAX), std::out_of_range);
+    auto pipeline = CompileProbe(context, gpu::LayoutSource, "ReportLayout");
 
     constexpr uint32_t Slots = 2 * std::size(HostLayouts);
     const mtl::Buffer<uint32_t> reported{context.Device.get(), Slots};

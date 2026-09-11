@@ -31,7 +31,7 @@ void QueryCylinders(std::span<const Query> queries, std::string_view kernel, Che
         CAPTURE(lanes);
         constexpr float Guard = -99999;
         std::ranges::fill(output.All(), float4{Guard, Guard, Guard, Guard});
-        auto pipeline = context.Pipeline(source, "ProbeCylinderDistance", "#define COLLECT_LANES " + std::to_string(lanes));
+        auto pipeline = CompileProbe(context, source, "ProbeCylinderDistance", "#define COLLECT_LANES " + std::to_string(lanes));
         RunGpu(context, pipeline.get(), {{0, points.Handle.get()}, {1, input.Handle.get()}, {2, output.Handle.get()}}, Count, lanes);
         for (uint32_t i = 0; i < Count; ++i) {
             CAPTURE(i);

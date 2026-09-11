@@ -75,7 +75,7 @@ kernel void FullStep(constant FullStepData &s [[buffer(0)]], uint tid [[thread_i
         const uint first = offsets[color];
         for (uint at = wave; at < offsets[color + 1] - first; at += waves) {
             const uint body = body_ids[first + at];
-            stabilize::SolveBody(s.poses, s.iterates, s.initial, s.inertial, s.masses, s.displacements, s.contacts, s.colors, color, s.joints, s.incoming, s.incoming_slots, s.joint_incidence, s.quiet, p, body, lane);
+            solid::SolveBody(s.poses, s.iterates, s.initial, s.inertial, s.masses, s.displacements, s.contacts, s.colors, color, s.joints, s.incoming, s.incoming_slots, s.joint_incidence, s.quiet, p, body, lane, true);
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }

@@ -5,9 +5,10 @@ Rigid body physics and collision detection for Apple Silicon, using an AVBD solv
 The library supports primitive, convex, triangle-mesh and compound colliders, joints with limits and drives, sleeping, contact reports and sensors.
 Collision detection is discrete and runs at every physics substep.
 
-Build on macOS 26 or later with CMake, Python 3 and Homebrew LLVM:
+Build on macOS 26 or later with CMake, Python 3, Homebrew LLVM and Apple’s Metal Toolchain:
 
 ```sh
+xcodebuild -downloadComponent MetalToolchain
 cmake -S . -B build/cmake
 cmake --build build/cmake -j4
 ctest --test-dir build/cmake --output-on-failure
@@ -25,6 +26,10 @@ Use `World::ResetDynamics` after restoring poses and velocities to restart a sim
 Copy observer data that must remain valid after the callback returns.
 
 For embedding, add this directory with CMake's `add_subdirectory` and link the `rbp` target.
+Call `rbp_copy_shaders(app_target)` for each executable that uses RBP.
+This packages the compiled Metal library and GPU archive beside the executable or in its app bundle’s Resources directory.
+Solver shaders compile during the build for the local Mac’s GPU and load directly from the archive at runtime.
+Set `RBP_SAFE_MATH=ON` for builds that disable fast shader math during numerical diagnosis.
 Set `RBP_TOOLS=OFF` to omit standalone tools and tests.
 Set `RBP_METAL_CPP_IMPL=OFF` if the host already supplies metal-cpp's implementation translation unit.
 

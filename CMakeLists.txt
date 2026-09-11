@@ -35,38 +35,7 @@ endif()
 option(RBP_METAL_CPP_IMPL "Compile the metal-cpp private implementation into rbp" ON)
 option(RBP_TOOLS "Build the engine's scene and bench tools and its tests" ${RBP_STANDALONE})
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-set(GeneratedFullStep ${CMAKE_CURRENT_BINARY_DIR}/gen/FullStep.metal)
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FullStep.py
-        --source ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu --compiler ${CMAKE_CXX_COMPILER}
-        --output ${GeneratedFullStep}
-    COMMAND_ERROR_IS_FATAL ANY
-)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FullStep.py
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/FullStep.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/FullStepData.h
-)
-set(GpuSources
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Shared.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/SolveCommandData.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/SolveCommands.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Layout.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/BroadPhase.metal
-    ${GeneratedFullStep}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Solve.metal
-)
-set(GeneratedGpuSource ${CMAKE_CURRENT_BINARY_DIR}/gen/GpuSource.h)
-set(EmbeddedText "// Generated from src/gpu by CMake. Do not edit.\n#pragma once\n\nnamespace gpu {\n")
-foreach(Path IN LISTS GpuSources)
-    get_filename_component(Name "${Path}" NAME_WE)
-    file(READ "${Path}" Text)
-    string(APPEND EmbeddedText "constexpr auto ${Name}Source = R\"MSL(\n${Text})MSL\";\n\n")
-endforeach()
-string(APPEND EmbeddedText "} // namespace gpu\n")
-file(GENERATE OUTPUT ${GeneratedGpuSource} CONTENT "${EmbeddedText}")
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GpuSources})
+include(cmake/Shaders.cmake)
 
 add_library(rbp STATIC
     src/metal/Context.cpp
@@ -78,7 +47,6 @@ add_library(rbp STATIC
 if(RBP_METAL_CPP_IMPL)
     target_sources(rbp PRIVATE src/metal/MetalCppImpl.cpp)
 endif()
-target_sources(rbp PRIVATE ${GeneratedGpuSource})
 # Preserve the embedding workaround for the compiler issue reproduced by probes/VectorMiscompile.cpp.
 target_compile_options(rbp PRIVATE -O1)
 target_compile_features(rbp PUBLIC cxx_std_23)
@@ -90,6 +58,7 @@ if(RBP_TOOLS)
     foreach(Tool IN ITEMS Scenes Bench Replay)
         add_executable(Rbp${Tool} tools/${Tool}.cpp)
         target_link_libraries(Rbp${Tool} PRIVATE rbp)
+        rbp_copy_shaders(Rbp${Tool})
         target_compile_options(Rbp${Tool} PRIVATE -O1)
     endforeach()
     target_include_directories(RbpScenes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

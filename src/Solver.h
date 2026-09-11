@@ -1,9 +1,11 @@
 #pragma once
 
+#include "Pipelines.h"
 #include "World.h"
 #include "gpu/FullStepData.h"
 #include "gpu/SolveCommandData.h"
 
+#include <array>
 #include <functional>
 
 namespace rbp {
@@ -66,75 +68,8 @@ private:
         bool GpuColors = false, Snapshot = false;
     };
 
-    enum Pass : uint32_t {
-        ReduceBoundsPass,
-        ReduceScenePass,
-        MortonPass,
-        RadixHistogramPass,
-        RadixOffsetsPass,
-        RadixScatterPass,
-        BuildTreePass,
-        RefitTreePass,
-        RefreshTreePass,
-        SmallBroadPhasePass,
-        BoundsPass,
-        SensorBoundsPass,
-        CollectPass,
-        ScanIncomingPass,
-        ScanIncomingBlocksPass,
-        OffsetIncomingPass,
-        FillIncomingPass,
-        SortIncomingPass,
-        PrepareJointsPass,
-        WarmStartPass,
-        ColorPass,
-        PublishColorPass,
-        SolvePass,
-        PublishPass,
-        DualPass,
-        JointDualPass,
-        FinalizePass,
-        RestitutionPass,
-        ApplyRestitutionPass,
-        StabilizePass,
-        FinishPosesPass,
-        FinishWakingPass,
-        FollowPass,
-        PrepareColorsPass,
-        ReduceStepColorsPass,
-        FinishStepColorsPass,
-        CapturePass,
-        FinishCapturePass,
-        SensorPass,
-        BoundedCollectPass,
-        BoundedSensorPass,
-        MeshCollectPass,
-        MeshSensorPass,
-        FullCollectPass,
-        FullSensorPass,
-        ResetQueryPass,
-        QueryPass,
-        SensorQueryPass,
-        CountColorWorkPass,
-        PrefixColorWorkPass,
-        FillColorWorkPass,
-        SolveSmallWorldPass,
-        ResetQueryReusePass,
-        CheckQueryInputsPass,
-        CheckQueryGeometryPass,
-        CacheBoundsPass,
-        InitializeIslandsPass,
-        UnionIslandsPass,
-        PackIslandsPass,
-        FinishIslandsPass,
-        SolveIslandsPass,
-        PrepareSmallWorldPass,
-        NativeCollectPass,
-        NativeSensorPass,
-        NativeBoundedCollectPass,
-        NativeBoundedSensorPass,
-        PassCount,
-    };
+    using Pass = shaders::Pass;
+    using enum shaders::Pass;
 
     struct OutputLayout {
         uint64_t Initial{}, Poses{}, Velocities{}, Contacts{}, RemovedContacts{}, Sensors{}, Counts{}, Completion{}, Stride{};
@@ -142,6 +77,7 @@ private:
     struct FollowerRange {
         uint32_t First, Count;
     };
+    MTL::ComputePipelineState *Pipeline(uint32_t index);
     void PrepareFollowers(World &, std::span<const SensorFollower>);
     void Bind(World &, uint32_t parameter);
     void Encode(MTL4::ComputeCommandEncoder *, const Recording &, World &);
@@ -149,14 +85,12 @@ private:
     enum CollectionMode : uint32_t {
         Direct,
         Prepare,
-        Queued,
-        Recompute,
-        CollectionModeCount
+        Queued
     };
     void Dispatch(MTL4::ComputeCommandEncoder *, Pass, uint32_t threads, uint32_t lanes = 1, uint64_t indirect = 0, CollectionMode = Direct);
 
     const mtl::Context &Context;
-    NS::SharedPtr<MTL::ComputePipelineState> Pipelines[CollectionModeCount][PassCount][4];
+    std::array<NS::SharedPtr<MTL::ComputePipelineState>, std::size(shaders::Pipelines)> Pipelines;
     mtl::Buffer<uint32_t> SensorQueries, QueryScratch, QueryInputSnapshot;
     mtl::Buffer<QueryInputSpec> QueryInputs;
     NS::SharedPtr<MTL4::ArgumentTable> Table;
@@ -173,9 +107,7 @@ private:
     mtl::Buffer<StepOutputFlags> OutputFlags;
     mtl::Buffer<uint8_t> Outputs;
     mtl::Buffer<FullStepData> FullData;
-    NS::SharedPtr<MTL::ComputePipelineState> FullPipeline;
     NS::SharedPtr<MTL::IndirectCommandBuffer> SolveCommands;
-    NS::SharedPtr<MTL::ComputePipelineState> SolveCommandEncoder, CommandPrimalPipelines[2], CommandAuxiliaryPipelines[3];
     mtl::Buffer<SolveCommandData> SolveCommandDataBuffer;
     mtl::Buffer<uint32_t> SolveCommandRanges;
     OutputLayout Layout;
