@@ -16,7 +16,20 @@ if(NOT GpuArchitectureCompiled OR NOT GpuArchitectureStatus EQUAL 0)
     message(FATAL_ERROR "Cannot detect the local Metal GPU architecture: ${GpuArchitectureErrors}${GpuArchitecture}")
 endif()
 string(STRIP "${GpuArchitecture}" GpuArchitecture)
-message(STATUS "RBP GPU architecture: ${GpuArchitecture}")
+# Virtual machines report GPU architectures the Metal toolchain cannot translate ahead of time.
+# An empty pipeline script exercises the translator lookup without compiling any shader.
+set(ProbeDir ${CMAKE_CURRENT_BINARY_DIR}/gpu-architecture-probe)
+file(WRITE ${ProbeDir}/empty.mtlp-json "{\"libraries\":{\"paths\":[]},\"pipelines\":{\"compute_pipelines\":[]}}\n")
+execute_process(COMMAND ${Xcrun} metal-tt -target air64-apple-macos26.0 -arch ${GpuArchitecture}
+    ${ProbeDir}/empty.mtlp-json -o ${ProbeDir}/empty.metallib
+    RESULT_VARIABLE TranslatorStatus OUTPUT_QUIET ERROR_QUIET)
+if(TranslatorStatus EQUAL 0)
+    set(BuildArchive ON)
+    message(STATUS "RBP GPU architecture: ${GpuArchitecture}")
+else()
+    set(BuildArchive OFF)
+    message(STATUS "RBP GPU architecture: ${GpuArchitecture} has no ahead-of-time translator, pipelines compile at runtime")
+endif()
 set(ShaderDir ${CMAKE_CURRENT_BINARY_DIR}/gen)
 set(ShaderArgs)
 if(RBP_SAFE_MATH)
@@ -40,18 +53,22 @@ endforeach()
 add_custom_command(OUTPUT ${ShaderDir}/rbp.metallib
     COMMAND ${Xcrun} metallib ${ShaderAir} -o ${ShaderDir}/rbp.metallib
     DEPENDS ${ShaderAir} VERBATIM)
-file(GENERATE OUTPUT ${ShaderDir}/ArchiveTarget.txt CONTENT "${GpuArchitecture}\n")
-add_custom_command(OUTPUT ${ShaderDir}/rbp.binary.metallib
-    COMMAND ${Xcrun} metal-tt -target air64-apple-macos26.0 -arch ${GpuArchitecture}
-        -L ${ShaderDir} ${ShaderDir}/rbp.mtlp-json -o ${ShaderDir}/rbp.binary.metallib
-    WORKING_DIRECTORY ${ShaderDir}
-    DEPENDS ${ShaderDir}/rbp.metallib ${ShaderDir}/rbp.mtlp-json ${ShaderDir}/ArchiveTarget.txt VERBATIM)
-add_custom_target(rbp_shaders DEPENDS ${ShaderDir}/rbp.binary.metallib)
-set_property(TARGET rbp_shaders PROPERTY RBP_SHADER_DIR ${ShaderDir})
+set(ShaderFiles ${ShaderDir}/rbp.metallib)
+if(BuildArchive)
+    file(GENERATE OUTPUT ${ShaderDir}/ArchiveTarget.txt CONTENT "${GpuArchitecture}\n")
+    add_custom_command(OUTPUT ${ShaderDir}/rbp.binary.metallib
+        COMMAND ${Xcrun} metal-tt -target air64-apple-macos26.0 -arch ${GpuArchitecture}
+            -L ${ShaderDir} ${ShaderDir}/rbp.mtlp-json -o ${ShaderDir}/rbp.binary.metallib
+        WORKING_DIRECTORY ${ShaderDir}
+        DEPENDS ${ShaderDir}/rbp.metallib ${ShaderDir}/rbp.mtlp-json ${ShaderDir}/ArchiveTarget.txt VERBATIM)
+    list(APPEND ShaderFiles ${ShaderDir}/rbp.binary.metallib)
+endif()
+add_custom_target(rbp_shaders DEPENDS ${ShaderFiles})
+set_property(TARGET rbp_shaders PROPERTY RBP_SHADER_FILES ${ShaderFiles})
 
-# Copy both compiled assets next to an executable, or into an app's Resources directory.
+# Copy the compiled assets next to an executable, or into an app's Resources directory.
 function(rbp_copy_shaders target)
-    get_target_property(dir rbp_shaders RBP_SHADER_DIR)
+    get_target_property(files rbp_shaders RBP_SHADER_FILES)
     get_target_property(bundle ${target} MACOSX_BUNDLE)
     if(bundle)
         set(destination "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources")
@@ -62,9 +79,9 @@ function(rbp_copy_shaders target)
     if(NOT CMAKE_GENERATOR MATCHES "Ninja")
         add_dependencies(${target} rbp_shaders)
     endif()
-    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${dir}/rbp.metallib ${dir}/rbp.binary.metallib)
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${files})
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${destination}
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dir}/rbp.metallib ${dir}/rbp.binary.metallib ${destination}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${files} ${destination}
         VERBATIM)
 endfunction()

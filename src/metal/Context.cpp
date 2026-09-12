@@ -23,9 +23,15 @@ Context::Context() {
     const auto library_path = (directory / "rbp.metallib").string();
     Library = NS::TransferPtr(Device->newLibrary(NS::String::string(library_path.c_str(), NS::UTF8StringEncoding), &error));
     if (!Library) throw std::runtime_error(std::format("Metal library {}: {}", library_path, Describe(error)));
+    // The build packages an archive only when the Metal toolchain translates shaders for the local GPU ahead of time.
     const auto archive_path = (directory / "rbp.binary.metallib").string();
-    Archive = NS::TransferPtr(Device->newArchive(NS::URL::fileURLWithPath(NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding)), &error));
-    if (!Archive) throw std::runtime_error(std::format("Metal archive {}: {}", archive_path, Describe(error)));
+    if (std::filesystem::exists(archive_path)) {
+        Archive = NS::TransferPtr(Device->newArchive(NS::URL::fileURLWithPath(NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding)), &error));
+        if (!Archive) throw std::runtime_error(std::format("Metal archive {}: {}", archive_path, Describe(error)));
+    } else {
+        Compiler = NS::TransferPtr(Device->newCompiler(Make<MTL4::CompilerDescriptor>().get(), &error));
+        if (!Compiler) throw std::runtime_error(std::format("Metal compiler: {}", Describe(error)));
+    }
     Queue = NS::TransferPtr(Device->newMTL4CommandQueue(Make<MTL4::CommandQueueDescriptor>().get(), &error));
     if (!Queue) throw std::runtime_error(std::format("Metal queue: {}", Describe(error)));
 }
@@ -59,8 +65,8 @@ NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(uint32_t index) const
     descriptor->setComputeFunctionDescriptor(function.get());
     if (entry.Indirect) descriptor->setSupportIndirectCommandBuffers(MTL4::IndirectCommandBufferSupportStateEnabled);
     NS::Error *error{};
-    auto pipeline = NS::TransferPtr(Archive->newComputePipelineState(descriptor.get(), &error));
-    if (!pipeline) throw std::runtime_error(std::format("Loading pipeline {}: {}", entry.Name, Describe(error)));
+    auto pipeline = NS::TransferPtr(Archive ? Archive->newComputePipelineState(descriptor.get(), &error) : Compiler->newComputePipelineState(descriptor.get(), nullptr, &error));
+    if (!pipeline) throw std::runtime_error(std::format("Pipeline {}: {}", entry.Name, Describe(error)));
     return pipeline;
 }
 } // namespace rbp::mtl

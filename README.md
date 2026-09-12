@@ -29,6 +29,7 @@ For embedding, add this directory with CMake's `add_subdirectory` and link the `
 Call `rbp_copy_shaders(app_target)` for each executable that uses RBP.
 This packages the compiled Metal library and GPU archive beside the executable or in its app bundle’s Resources directory.
 Solver shaders compile during the build for the local Mac’s GPU and load directly from the archive at runtime.
+When the Metal toolchain has no ahead-of-time translator for the local GPU, as on virtual machines, the build packages only the library and pipelines compile from it at runtime.
 Set `RBP_SAFE_MATH=ON` for builds that disable fast shader math during numerical diagnosis.
 Set `RBP_TOOLS=OFF` to omit standalone tools and tests.
 Set `RBP_METAL_CPP_IMPL=OFF` if the host already supplies metal-cpp's implementation translation unit.
