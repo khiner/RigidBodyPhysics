@@ -184,7 +184,7 @@ struct StepSnapshot {
 struct World {
     explicit World(const mtl::Context &, WorldLimits = {});
     World(World &&) noexcept = default;
-    World &operator=(World &&) noexcept = default;
+    World &operator=(World &&) noexcept;
     // The world owns its residency set and drains its queued resources on destruction.
     ~World();
 
@@ -314,7 +314,6 @@ struct World {
 
 private:
     friend struct Solver;
-    template<typename T> void MakeBuffer(mtl::Buffer<T> &, uint32_t capacity);
     void EnsureSensorBuffers();
     void RefreshFilters();
     // Variable-length geometry runs with reusable gaps.

@@ -1,4 +1,5 @@
 #include "Solver.h"
+#include "metal/AutoreleasePool.h"
 
 #include <algorithm>
 #include <bit>
@@ -59,13 +60,14 @@ uint32_t ColliderFeatures(const World &world) {
 } // namespace
 
 Solver::Solver(const mtl::Context &context) : Context(context) {
+    const mtl::AutoreleasePool pool;
     NS::Error *error{};
     auto descriptor = mtl::Make<MTL4::ArgumentTableDescriptor>();
     descriptor->setMaxBufferBindCount(BindingCount);
-    Table = NS::TransferPtr(context.Device->newArgumentTable(descriptor.get(), &error));
-    Allocator = NS::TransferPtr(context.Device->newCommandAllocator());
-    Commands = NS::TransferPtr(context.Device->newCommandBuffer());
-    Done = NS::TransferPtr(context.Device->newSharedEvent());
+    auto table = NS::TransferPtr(context.Device->newArgumentTable(descriptor.get(), &error));
+    auto allocator = NS::TransferPtr(context.Device->newCommandAllocator());
+    auto commands = NS::TransferPtr(context.Device->newCommandBuffer());
+    auto done = NS::TransferPtr(context.Device->newSharedEvent());
 
     Params = {context.Device.get(), BatchSteps};
     ColorGroups = {context.Device.get(), BatchSteps * MaxSupportedColors * 3};
@@ -75,22 +77,29 @@ Solver::Solver(const mtl::Context &context) : Context(context) {
     FullData = {context.Device.get(), BatchSteps};
     ColorCursor = {context.Device.get(), SolveCursorCount + 2};
     for (uint32_t cursor = 0; cursor < SolveCursorCount; ++cursor) ColorCursor[cursor] = cursor;
-    Residency = NS::TransferPtr(context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
-    Residency->addAllocation(Params.Handle.get());
-    Residency->addAllocation(ColorGroups.Handle.get());
-    Residency->addAllocation(SmallIslands.Handle.get());
-    Residency->addAllocation(ColorScratch.Handle.get());
-    Residency->addAllocation(OutputFlags.Handle.get());
-    Residency->addAllocation(FullData.Handle.get());
-    Residency->addAllocation(ColorCursor.Handle.get());
-    Residency->commit();
-    Residency->requestResidency();
-    context.Queue->addResidencySet(Residency.get());
+    auto residency = NS::TransferPtr(context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
+    residency->addAllocation(Params.Handle.get());
+    residency->addAllocation(ColorGroups.Handle.get());
+    residency->addAllocation(SmallIslands.Handle.get());
+    residency->addAllocation(ColorScratch.Handle.get());
+    residency->addAllocation(OutputFlags.Handle.get());
+    residency->addAllocation(FullData.Handle.get());
+    residency->addAllocation(ColorCursor.Handle.get());
+    residency->commit();
+    residency->requestResidency();
+    context.Queue->addResidencySet(residency.get());
+    Table = std::move(table);
+    Allocator = std::move(allocator);
+    Commands = std::move(commands);
+    Done = std::move(done);
+    Residency = std::move(residency);
 }
 
 Solver::~Solver() {
+    const mtl::AutoreleasePool pool;
     Context.Queue->removeResidencySet(Residency.get());
     mtl::Drain(Context.Queue.get());
+    mtl::AutoreleasePool::Release(SolveCommands, Residency, Done, Commands, Allocator, Table, Pipelines);
 }
 
 MTL::ComputePipelineState *Solver::Pipeline(uint32_t index) {
@@ -254,6 +263,7 @@ void Solver::Bind(World &world, uint32_t parameter) {
 }
 
 AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32_t substeps, std::span<const SensorFollower> followers, const std::function<void(const StepResult &)> &observer) {
+    const mtl::AutoreleasePool pool;
     if (Advancing) throw std::logic_error("Advance cannot be reentered from its observer");
     if (substeps == 0 || world.BodyCount() == 0) return {};
     struct Scope {
@@ -315,6 +325,7 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
     }
     AdvanceResult result;
     while (result.Steps < substeps && world.BodyCount() != 0) {
+        const mtl::AutoreleasePool batch_pool;
         const uint32_t first_bodies = world.BodyCount();
         uint32_t later_bodies = first_bodies;
         while (later_bodies && !world.LiveBodies[later_bodies - 1]) --later_bodies;
@@ -362,6 +373,16 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
         Allocator->reset();
         Commands->beginCommandBuffer(Allocator.get());
         auto *encoder = Commands->computeCommandEncoder();
+        struct Recording {
+            MTL4::ComputeCommandEncoder *Encoder;
+            MTL4::CommandBuffer *Commands;
+            void End() {
+                if (!Encoder) return;
+                std::exchange(Encoder, nullptr)->endEncoding();
+                Commands->endCommandBuffer();
+            }
+            ~Recording() { End(); }
+        } recording{encoder, Commands.get()};
         encoder->setArgumentTable(Table.get());
         for (uint32_t index = 0; index < count; ++index) {
             const uint32_t bodies = index == 0 ? first_bodies : later_bodies;
@@ -390,8 +411,7 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
 
             Encode(encoder, {.Bodies = bodies, .Joints = joints, .Iterations = settings.Iterations, .Colors = colors, .ColoringPasses = settings.ColoringPasses, .ColliderFeatures = collider_features, .Parameter = index, .GpuColors = index != 0, .Snapshot = snapshot}, world);
         }
-        encoder->endEncoding();
-        Commands->endCommandBuffer();
+        recording.End();
         const MTL4::CommandBuffer *list[]{Commands.get()};
         Context.Queue->commit(list, 1);
         Context.Queue->signalEvent(Done.get(), ++Signal);

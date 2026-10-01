@@ -1,10 +1,12 @@
 #include "World.h"
+#include "metal/AutoreleasePool.h"
 
 #include "Hull.h"
 #include "Mesh.h"
 
 #include <algorithm>
 #include <bit>
+#include <memory>
 #include <numbers>
 #include <stdexcept>
 #include <utility>
@@ -255,57 +257,59 @@ bool World::OffsetNeedsAuthoredMass(Index shape, const BodyMass &mass, bool auth
     return at.x != 0 || at.y != 0 || at.z != 0 || turn.x != 0 || turn.y != 0 || turn.z != 0;
 }
 
-template<typename T> void World::MakeBuffer(mtl::Buffer<T> &buffer, uint32_t capacity) {
-    buffer = {Queue->device(), capacity};
+namespace {
+template<typename T> void MakeBuffer(mtl::Buffer<T> &buffer, uint32_t capacity, MTL::Device *device, MTL::ResidencySet *residency) {
+    buffer = {device, capacity};
     std::ranges::fill(buffer.All(), T{});
-    Residency->addAllocation(buffer.Handle.get());
+    residency->addAllocation(buffer.Handle.get());
 }
+} // namespace
 
-World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Queue) {
+World::World(const mtl::Context &context, WorldLimits limits) {
+    const mtl::AutoreleasePool pool;
+    auto queue = context.Queue;
     auto *device = context.Device.get();
     // Metal 4 requires explicit residency for every resource a shader can reach.
     NS::Error *error{};
-    Residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
+    auto residency = NS::TransferPtr(device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
 
-    MakeBuffer(Poses, limits.Bodies);
-    MakeBuffer(Velocities, limits.Bodies);
-    MakeBuffer(Masses, limits.Bodies);
-    MakeBuffer(BodyShapes, limits.Bodies);
-    MakeBuffer(Shapes, limits.Shapes);
-    MakeBuffer(ShapeVertices, limits.ShapeVertices);
-    MakeBuffer(HullFaces, limits.HullFaces);
-    MakeBuffer(Triangles, limits.Triangles);
-    MakeBuffer(BvhNodes, limits.BvhNodes);
-    MakeBuffer(Materials, limits.Bodies);
-    MakeBuffer(CompoundChildren, limits.CompoundChildren);
-    MakeBuffer(Filters, limits.Bodies);
-    MakeBuffer(Jointed, limits.Bodies + 1 + 2 * limits.Joints);
-    MakeBuffer(JointIncidence, limits.Bodies + 1 + 2 * limits.Joints);
-    MakeBuffer(Bounds, limits.Bodies);
-    MakeBuffer(BoundsReductions, RadixBlocks(limits.Bodies) + 1);
-    MakeBuffer(BroadPhaseNodes, 2 * limits.Bodies);
-    MakeBuffer(BroadPhaseKeys, 2 * limits.Bodies);
-    MakeBuffer(BroadPhaseScratch, limits.Bodies + RadixBlocks(limits.Bodies) * RadixBins);
-    MakeBuffer(InitialPoses, limits.Bodies);
-    MakeBuffer(Displacements, limits.Bodies);
-    MakeBuffer(InertialPoses, limits.Bodies);
-    MakeBuffer(PreviousVelocities, limits.Bodies);
-    MakeBuffer(Iterates, limits.Bodies);
-    MakeBuffer(RestPoses, limits.Bodies);
-    MakeBuffer(Quiet, limits.Bodies);
-    MakeBuffer(NextQuiet, limits.Bodies);
-    MakeBuffer(Colors, limits.Bodies);
-    MakeBuffer(NextColors, limits.Bodies);
-    MakeBuffer(Contacts, limits.Bodies * ContactsPerBody);
-    MakeBuffer(Incoming, limits.Bodies);
-    MakeBuffer(IncomingSlots, limits.Bodies * ContactsPerBody);
-    MakeBuffer(ContactEvents, limits.Bodies * EventsPerBody);
-    MakeBuffer(ContactEventCounts, limits.Bodies);
-    MakeBuffer(ContactRefusals, limits.Bodies);
-    MakeBuffer(Joints, limits.Joints);
-    Residency->commit();
-    Residency->requestResidency();
-    Queue->addResidencySet(Residency.get());
+    const auto make_buffer = [&](auto &buffer, uint32_t capacity) { MakeBuffer(buffer, capacity, device, residency.get()); };
+    make_buffer(Poses, limits.Bodies);
+    make_buffer(Velocities, limits.Bodies);
+    make_buffer(Masses, limits.Bodies);
+    make_buffer(BodyShapes, limits.Bodies);
+    make_buffer(Shapes, limits.Shapes);
+    make_buffer(ShapeVertices, limits.ShapeVertices);
+    make_buffer(HullFaces, limits.HullFaces);
+    make_buffer(Triangles, limits.Triangles);
+    make_buffer(BvhNodes, limits.BvhNodes);
+    make_buffer(Materials, limits.Bodies);
+    make_buffer(CompoundChildren, limits.CompoundChildren);
+    make_buffer(Filters, limits.Bodies);
+    make_buffer(Jointed, limits.Bodies + 1 + 2 * limits.Joints);
+    make_buffer(JointIncidence, limits.Bodies + 1 + 2 * limits.Joints);
+    make_buffer(Bounds, limits.Bodies);
+    make_buffer(BoundsReductions, RadixBlocks(limits.Bodies) + 1);
+    make_buffer(BroadPhaseNodes, 2 * limits.Bodies);
+    make_buffer(BroadPhaseKeys, 2 * limits.Bodies);
+    make_buffer(BroadPhaseScratch, limits.Bodies + RadixBlocks(limits.Bodies) * RadixBins);
+    make_buffer(InitialPoses, limits.Bodies);
+    make_buffer(Displacements, limits.Bodies);
+    make_buffer(InertialPoses, limits.Bodies);
+    make_buffer(PreviousVelocities, limits.Bodies);
+    make_buffer(Iterates, limits.Bodies);
+    make_buffer(RestPoses, limits.Bodies);
+    make_buffer(Quiet, limits.Bodies);
+    make_buffer(NextQuiet, limits.Bodies);
+    make_buffer(Colors, limits.Bodies);
+    make_buffer(NextColors, limits.Bodies);
+    make_buffer(Contacts, limits.Bodies * ContactsPerBody);
+    make_buffer(Incoming, limits.Bodies);
+    make_buffer(IncomingSlots, limits.Bodies * ContactsPerBody);
+    make_buffer(ContactEvents, limits.Bodies * EventsPerBody);
+    make_buffer(ContactEventCounts, limits.Bodies);
+    make_buffer(ContactRefusals, limits.Bodies);
+    make_buffer(Joints, limits.Joints);
 
     std::ranges::fill(Jointed.All().first(limits.Bodies + 1), limits.Bodies + 1);
     std::ranges::fill(JointIncidence.All().first(limits.Bodies + 1), limits.Bodies + 1);
@@ -321,13 +325,28 @@ World::World(const mtl::Context &context, WorldLimits limits) : Queue(context.Qu
     LiveShapes.assign(limits.Shapes, 0);
     WeldedShapes.assign(limits.Bodies, NoIndex);
     Spawns.assign(limits.Bodies, 0);
+    residency->commit();
+    residency->requestResidency();
+    queue->addResidencySet(residency.get());
+    Queue = std::move(queue);
+    Residency = std::move(residency);
 }
 
 World::~World() {
+    const mtl::AutoreleasePool pool;
     if (Queue && Residency) {
         Queue->removeResidencySet(Residency.get());
         mtl::Drain(Queue.get());
     }
+    mtl::AutoreleasePool::Release(Queue, Residency);
+}
+
+World &World::operator=(World &&other) noexcept {
+    if (this != &other) {
+        this->~World();
+        std::construct_at(this, std::move(other));
+    }
+    return *this;
 }
 
 Index World::RunPool::Take(uint32_t count) {
@@ -475,9 +494,10 @@ void World::RefreshFilters() {
 }
 
 void World::EnsureSensorBuffers() {
+    const mtl::AutoreleasePool pool;
     if (SensorContacts.Handle) return;
-    MakeBuffer(SensorContacts, Poses.Capacity * ContactsPerBody);
-    MakeBuffer(SensorRefusals, Poses.Capacity);
+    MakeBuffer(SensorContacts, Poses.Capacity * ContactsPerBody, Queue->device(), Residency.get());
+    MakeBuffer(SensorRefusals, Poses.Capacity, Queue->device(), Residency.get());
     Residency->commit();
 }
 

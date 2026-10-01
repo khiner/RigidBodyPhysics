@@ -1,4 +1,5 @@
 #include "metal/Context.h"
+#include "metal/AutoreleasePool.h"
 
 #include "Pipelines.h"
 
@@ -7,6 +8,7 @@
 #include <semaphore>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 std::string Describe(NS::Error *error) {
@@ -16,31 +18,41 @@ std::string Describe(NS::Error *error) {
 
 namespace rbp::mtl {
 Context::Context() {
-    Device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
-    if (!Device) throw std::runtime_error("No Metal device.");
+    const AutoreleasePool pool;
+    auto device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+    if (!device) throw std::runtime_error("No Metal device.");
     NS::Error *error{};
     const std::filesystem::path directory{NS::Bundle::mainBundle()->resourcePath()->utf8String()};
     const auto library_path = (directory / "rbp.metallib").string();
-    Library = NS::TransferPtr(Device->newLibrary(NS::String::string(library_path.c_str(), NS::UTF8StringEncoding), &error));
-    if (!Library) throw std::runtime_error(std::format("Metal library {}: {}", library_path, Describe(error)));
+    auto library = NS::TransferPtr(device->newLibrary(NS::String::string(library_path.c_str(), NS::UTF8StringEncoding), &error));
+    if (!library) throw std::runtime_error(std::format("Metal library {}: {}", library_path, Describe(error)));
     // The build packages an archive only when the Metal toolchain translates shaders for the local GPU ahead of time.
+    NS::SharedPtr<MTL4::Archive> archive;
+    NS::SharedPtr<MTL4::Compiler> compiler;
     const auto archive_path = (directory / "rbp.binary.metallib").string();
     if (std::filesystem::exists(archive_path)) {
-        Archive = NS::TransferPtr(Device->newArchive(NS::URL::fileURLWithPath(NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding)), &error));
-        if (!Archive) throw std::runtime_error(std::format("Metal archive {}: {}", archive_path, Describe(error)));
+        archive = NS::TransferPtr(device->newArchive(NS::URL::fileURLWithPath(NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding)), &error));
+        if (!archive) throw std::runtime_error(std::format("Metal archive {}: {}", archive_path, Describe(error)));
     } else {
-        Compiler = NS::TransferPtr(Device->newCompiler(Make<MTL4::CompilerDescriptor>().get(), &error));
-        if (!Compiler) throw std::runtime_error(std::format("Metal compiler: {}", Describe(error)));
+        compiler = NS::TransferPtr(device->newCompiler(Make<MTL4::CompilerDescriptor>().get(), &error));
+        if (!compiler) throw std::runtime_error(std::format("Metal compiler: {}", Describe(error)));
     }
-    Queue = NS::TransferPtr(Device->newMTL4CommandQueue(Make<MTL4::CommandQueueDescriptor>().get(), &error));
-    if (!Queue) throw std::runtime_error(std::format("Metal queue: {}", Describe(error)));
+    auto queue = NS::TransferPtr(device->newMTL4CommandQueue(Make<MTL4::CommandQueueDescriptor>().get(), &error));
+    if (!queue) throw std::runtime_error(std::format("Metal queue: {}", Describe(error)));
+    Device = std::move(device);
+    Library = std::move(library);
+    Archive = std::move(archive);
+    Compiler = std::move(compiler);
+    Queue = std::move(queue);
 }
 
 Context::~Context() {
     if (Queue) Drain(Queue.get());
+    AutoreleasePool::Release(Compiler, Archive, Library, Queue, Device);
 }
 
 void Drain(MTL4::CommandQueue *queue) {
+    const AutoreleasePool pool;
     auto *device = queue->device();
     auto allocator = NS::TransferPtr(device->newCommandAllocator());
     auto commands = NS::TransferPtr(device->newCommandBuffer());
@@ -56,6 +68,7 @@ void Drain(MTL4::CommandQueue *queue) {
 }
 
 NS::SharedPtr<MTL::ComputePipelineState> Context::Pipeline(uint32_t index) const {
+    const AutoreleasePool pool;
     if (index >= std::size(shaders::Pipelines)) throw std::out_of_range("Invalid solver pipeline");
     const auto &entry = shaders::Pipelines[index];
     auto function = Make<MTL4::LibraryFunctionDescriptor>();

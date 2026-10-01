@@ -1,11 +1,14 @@
 #pragma once
 
+#include "AutoreleasePool.h"
+
 #include <Metal/Metal.hpp>
 
 #include <cstdint>
 #include <format>
 #include <span>
 #include <stdexcept>
+#include <utility>
 
 namespace rbp::mtl {
 // Fixed-capacity shared storage exposes the same bytes to host and device.
@@ -14,8 +17,23 @@ template<typename T> struct Buffer {
     uint32_t Capacity{};
 
     Buffer() = default;
-    Buffer(MTL::Device *device, uint32_t capacity)
-        : Handle(NS::TransferPtr(device->newBuffer(capacity * sizeof(T), MTL::ResourceStorageModeShared))), Capacity(capacity), Mapped(static_cast<T *>(Handle->contents())) {}
+    Buffer(const Buffer &) = default;
+    Buffer(Buffer &&) noexcept = default;
+    Buffer &operator=(Buffer other) noexcept {
+        const AutoreleasePool pool;
+        Handle = std::move(other.Handle);
+        Capacity = other.Capacity;
+        Mapped = other.Mapped;
+        return *this;
+    }
+    ~Buffer() {
+        if (Handle) AutoreleasePool::Release(Handle);
+    }
+    Buffer(MTL::Device *device, uint32_t capacity) : Capacity(capacity) {
+        const AutoreleasePool pool;
+        Handle = NS::TransferPtr(device->newBuffer(capacity * sizeof(T), MTL::ResourceStorageModeShared));
+        Mapped = static_cast<T *>(Handle->contents());
+    }
 
     T *Data() const { return Handle ? Mapped : nullptr; }
     std::span<T> All() const { return {Data(), Capacity}; }
