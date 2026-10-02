@@ -391,6 +391,17 @@ struct Contact {
     uint Active;
 };
 
+// Raw collision geometry before AVBD's contact-slot reduction or solver state.
+// Points and normal use world coordinates; positive gap means separation.
+struct GeometryContact {
+    float3 PointA, PointB, Normal;
+    float Gap, Friction, Restitution;
+    Index BodyA, BodyB;
+    uint Feature;
+    Index SubShapeA, SubShapeB;
+    ulong Children;
+};
+
 inline ulong ChildPair(uint own, uint other) { return ulong(own) | (ulong(other) << 32); }
 inline uint OwnChild(ulong children) { return uint(children); }
 inline uint OtherChild(ulong children) { return uint(children >> 32); }
@@ -582,6 +593,8 @@ struct StepParams {
     uint MaxColors;
     uint ReportContacts; // Enable unreduced manifold geometry for contact reporting.
     uint QueuedQueries;
+    uint GeometryOnly; // Collect geometry without touching AVBD contacts or history.
+    uint GeometryCapacity;
 };
 
 inline float4 QuatConjugate(float4 q) { return MakeFloat4(-q.xyz, q.w); }

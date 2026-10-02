@@ -63,9 +63,12 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     entries = json.loads((args.source / "Pipelines.json").read_text())
-    sources = {name: (args.source / (name + ".metal")).read_text() for name in ["Solve", "BroadPhase", "SolveCommands"]}
+    sources = {name: (args.source / (name + ".metal")).read_text() for name in ["Solve", "BroadPhase", "SolveCommands", "Ji", "JiScene"]}
     sources["FullStep"] = generate(args.source, args.compiler)
     sources["SolveCommands"] = (args.source / "SolveCommandData.h").read_text() + sources["SolveCommands"]
+    sources["Ji"] = (args.source / "JiData.h").read_text() + sources["Ji"]
+    sources["JiScene"] = ((args.source / "JiData.h").read_text()
+                          + (args.source / "JiContactIdentity.h").read_text() + sources["JiScene"])
     shared = (args.source / "Shared.h").read_text()
     pipelines, compile_commands, groups = [], [], {}
     indices = [[[65535] * 4 for _ in entries] for _ in range(3)]
@@ -97,7 +100,7 @@ def main():
                 if kind == "solve":
                     defines["SOLVE_BODIES_PER_GROUP"] = 5 if variant else 1
                 name = f'{entry["pass_name"]}_{mode}_{variant}'
-                indirect = entry["pass_name"] in ["SolvePass", "PublishPass", "DualPass", "JointDualPass"]
+                indirect = entry.get("indirect", False) or entry["pass_name"] in ["SolvePass", "PublishPass", "DualPass", "JointDualPass"]
                 indices[mode][p][variant] = add(name, entry["kernel"], entry["source"], defines, entry.get("safe_math", False), indirect)
 
     for name in ["FullStep", "EncodeSolveCommands"]:

@@ -1,0 +1,7 @@
+# Method and literature map
+
+The implementation follows [Ji et al. 2025](https://doi.org/10.1109/ICRA55743.2025.11128665) and its [Lee et al. 2023](https://doi.org/10.1109/ICRA48891.2023.10161052) SubADMM antecedent. They motivate body/contact-parallel GPU work and the paper iteration schedule. [PhysicsModel.md](PhysicsModel.md) labels local collision, integration and stabilization choices where the available method description leaves details unspecified.
+
+[Le Lidec et al. 2024](https://arxiv.org/abs/2304.06372) and [Carpentier et al. 2024](https://arxiv.org/abs/2405.17020) distinguish the nonassociated Coulomb law from convex cone subproblems. The optional CPU frictional reference solves and audits the original law on frozen contact rows. It is an independent local reference, not the Ji CUDA implementation. The research PDF archive and source/hash manifest live in `~/Docs/Research/RigidBodyPhysics/Papers/`; experimental continuation and alternative-solver comparisons are preserved in Git history.
+
+For the eventual audio application, [Kaufman et al. 2008](https://www.cs.ubc.ca/labs/sensorimotor/projects/sp_sigasia08/KSJP08.pdf), [Zheng and James 2011](https://www.cs.cornell.edu/projects/Sound/mc/), and [massless interface CMS 2021](https://arxiv.org/abs/2111.07693) address contact coherence, modal deformation, force ambiguity and interface flexibility. Rigid-body equation checks alone do not establish spatial modal forces or sound fidelity.

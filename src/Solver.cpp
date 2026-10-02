@@ -6,6 +6,8 @@
 #include <cstring>
 #include <exception>
 #include <numeric>
+#include <semaphore>
+#include <string>
 
 namespace rbp {
 
@@ -123,7 +125,7 @@ void Solver::Dispatch(MTL4::ComputeCommandEncoder *encoder, Pass pass, uint32_t 
     const bool native = pass == NativeCollectPass;
     const bool collector = pass == CollectPass || pass == SensorPass || pass == ScalarCollectPass || native;
     const bool primal = pass == SolvePass;
-    const bool bounds = pass == BoundsPass || pass == SensorBoundsPass;
+    const bool bounds = pass == BoundsPass || pass == GeometryBoundsPass || pass == SensorBoundsPass;
     const uint32_t variant = native && threads <= RadixSimdWidth ? 0 :
         collector                                                ? uint32_t(native) + 2 * uint32_t(lanes > 1) :
         bounds                                                   ? uint32_t(lanes > 1) :
@@ -224,6 +226,154 @@ void Solver::PrepareFollowers(World &world, std::span<const SensorFollower> foll
 
 void Solver::Step(World &world, const StepSettings &settings) { Advance(world, settings, 1); }
 
+void Solver::PrepareQueries(World &world, uint32_t collider_features) {
+    if (!(collider_features & MeshQueries)) return;
+    bool residency_changed = false;
+    if (!QueryScratch.Handle) {
+        residency_changed = true;
+        QueryScratch = {Context.Device.get(), QueryScratchBytes / sizeof(uint32_t)};
+        QueryInputs = {Context.Device.get(), 1};
+        QueryInputs[0] = {};
+        auto &solid = *reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data());
+        solid = {};
+        solid.Bytes = QueryScratchBytes;
+        Residency->addAllocation(QueryScratch.Handle.get());
+        Residency->addAllocation(QueryInputs.Handle.get());
+    }
+    QueryInputSpec spec{};
+    const uint32_t bodies = world.BodyCount();
+    const uint64_t bytes[]{uint64_t(bodies) * sizeof(Pose), uint64_t(bodies) * sizeof(Velocity), uint64_t(bodies) * sizeof(BodyMass), uint64_t(bodies) * sizeof(Index), uint64_t(world.ShapeCount()) * sizeof(Shape), uint64_t(bodies) * sizeof(Material), uint64_t(bodies) * sizeof(Filter), uint64_t(world.Jointed.Capacity) * sizeof(Index), uint64_t(world.ShapeVertices.Capacity) * sizeof(float3), uint64_t(world.HullFaces.Capacity) * sizeof(HullFace), uint64_t(world.Triangles.Capacity) * sizeof(Triangle), uint64_t(world.BvhNodes.Capacity) * sizeof(BvhNode), uint64_t(world.CompoundChildren.Capacity) * sizeof(Index), sizeof(StepParams), uint64_t(bodies) * sizeof(uint32_t), uint64_t(bodies) * ContactsPerBody * 8 * sizeof(uint32_t)};
+    uint64_t words = 0;
+    for (uint32_t at = 0; at < 16; ++at) {
+        if (bytes[at] / 4 > UINT32_MAX - words) throw std::length_error("query input snapshot is too large");
+        spec.Offsets[at] = uint32_t(words);
+        words += bytes[at] / 4;
+    }
+    spec.Words = uint32_t(words);
+    if (spec.Words > QueryInputSnapshot.Capacity) {
+        residency_changed = true;
+        if (QueryInputSnapshot.Handle) Residency->removeAllocation(QueryInputSnapshot.Handle.get());
+        QueryInputSnapshot = {Context.Device.get(), spec.Words};
+        std::fill_n(QueryInputSnapshot.Data(), spec.Words, 0u);
+        Residency->addAllocation(QueryInputSnapshot.Handle.get());
+        reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
+    }
+    if (std::memcmp(&QueryInputs[0], &spec, sizeof(QueryInputSpec)) != 0)
+        reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
+    QueryInputs[0] = spec;
+    // Geometry is immutable until this call returns, including across submissions.
+    reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->GeometryChecked = 0;
+    if (residency_changed) Residency->commit();
+}
+
+Solver::GeometryOutput Solver::EncodeGeometry(MTL4::ComputeCommandEncoder *encoder, World &world, const StepSettings &settings, uint32_t capacity) {
+    if (Advancing) throw std::logic_error("Collision collection cannot reenter this solver");
+    if (!encoder) throw std::invalid_argument("Geometry collection requires a compute encoder");
+    if (!capacity) throw std::invalid_argument("Geometry contact capacity must be positive");
+    if (!world.BodyCount()) throw std::invalid_argument("Geometry encoding requires at least one body");
+    Advancing = true;
+    try {
+        world.RefreshFilters();
+        const uint32_t features = ColliderFeatures(world);
+        PrepareQueries(world, features);
+        if (GeometryContacts.Capacity < capacity) {
+            if (GeometryContacts.Handle) Residency->removeAllocation(GeometryContacts.Handle.get());
+            GeometryContacts = {Context.Device.get(), capacity};
+            Residency->addAllocation(GeometryContacts.Handle.get());
+            Residency->commit();
+        }
+        if (!GeometryCount.Handle) {
+            GeometryCount = {Context.Device.get(), 1};
+            Residency->addAllocation(GeometryCount.Handle.get());
+            Residency->commit();
+        }
+        GeometryCount[0] = 0;
+        const uint32_t bodies = world.BodyCount();
+        Params[0] = {
+            .Gravity = settings.Gravity,
+            .DeltaTime = settings.DeltaTime,
+            .ContactMargin = settings.ContactMargin,
+            .MaxContactReach = settings.MaxContactReach,
+            .BodyCount = bodies,
+            .JointCount = world.JointCount(),
+            .QueuedQueries = bool(features & MeshQueries) && QueuedQueriesFit(bodies),
+            .GeometryOnly = 1,
+            .GeometryCapacity = capacity,
+        };
+        Bind(world, 0);
+        Table->setAddress(GeometryContacts.Address(), 12);
+        Table->setAddress(GeometryCount.Address(), 16);
+        encoder->setArgumentTable(Table.get());
+        EncodeCollision(encoder, {.Bodies = bodies, .ColliderFeatures = features}, world);
+        PendingGeometry = &world;
+        PendingGeometryBodies = bodies;
+        PendingGeometryCapacity = capacity;
+        return {GeometryContacts.Address(), GeometryCount.Address(), capacity};
+    } catch (...) {
+        CancelGeometry();
+        throw;
+    }
+}
+
+std::span<const GeometryContact> Solver::FinishGeometry(World &world) {
+    if (!Advancing || PendingGeometry != &world || world.BodyCount() != PendingGeometryBodies)
+        throw std::logic_error("Geometry completion does not match its encoding");
+    const uint32_t bodies = PendingGeometryBodies;
+    const uint32_t capacity = PendingGeometryCapacity;
+    CancelGeometry();
+    const BroadPhaseNode root = world.BroadPhaseNodes[BroadPhaseRoot(bodies)];
+    if (root.Ready != (bodies <= RadixSimdWidth ? 0u : 2u) || root.Errors)
+        throw std::runtime_error("GPU broad phase did not complete");
+    if (GeometryCount[0] > capacity)
+        throw std::overflow_error("Geometry contact capacity exceeded; no contacts were accepted for Ji stepping");
+    return GeometryContacts.All().first(GeometryCount[0]);
+}
+
+void Solver::CancelGeometry() {
+    PendingGeometry = nullptr;
+    PendingGeometryBodies = 0;
+    PendingGeometryCapacity = 0;
+    Advancing = false;
+}
+
+std::span<const GeometryContact> Solver::CollectGeometry(World &world, const StepSettings &settings, uint32_t capacity) {
+    if (Advancing) throw std::logic_error("Collision collection cannot reenter this solver");
+    if (!capacity) throw std::invalid_argument("Geometry contact capacity must be positive");
+    if (!world.BodyCount()) return {};
+    Allocator->reset();
+    Commands->beginCommandBuffer(Allocator.get());
+    auto *encoder = Commands->computeCommandEncoder();
+    try {
+        EncodeGeometry(encoder, world, settings, capacity);
+    } catch (...) {
+        encoder->endEncoding();
+        Commands->endCommandBuffer();
+        throw;
+    }
+    encoder->endEncoding();
+    Commands->endCommandBuffer();
+    std::binary_semaphore done{0};
+    std::string gpu_error;
+    auto options = mtl::Make<MTL4::CommitOptions>();
+    options->addFeedbackHandler([&](MTL4::CommitFeedback *feedback) {
+        if (NS::Error *error = feedback->error()) gpu_error = error->localizedDescription()->utf8String();
+        done.release();
+    });
+    const MTL4::CommandBuffer *list[]{Commands.get()};
+    try {
+        Context.Queue->commit(list, 1, options.get());
+    } catch (...) {
+        CancelGeometry();
+        throw;
+    }
+    done.acquire();
+    if (!gpu_error.empty()) {
+        CancelGeometry();
+        throw std::runtime_error("Geometry collection failed: " + gpu_error);
+    }
+    return FinishGeometry(world);
+}
+
 void Solver::Bind(World &world, uint32_t parameter) {
     const uint64_t bindings[]{
         world.Poses.Address(),
@@ -285,44 +435,7 @@ AdvanceResult Solver::Advance(World &world, const StepSettings &settings, uint32
     PrepareFollowers(world, followers);
     const uint32_t joints = world.JointCount();
     const uint32_t collider_features = ColliderFeatures(world);
-    if (collider_features & MeshQueries) {
-        bool residency_changed = false;
-        if (!QueryScratch.Handle) {
-            residency_changed = true;
-            QueryScratch = {Context.Device.get(), QueryScratchBytes / sizeof(uint32_t)};
-            QueryInputs = {Context.Device.get(), 1};
-            QueryInputs[0] = {};
-            auto &solid = *reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data());
-            solid = {};
-            solid.Bytes = QueryScratchBytes;
-            Residency->addAllocation(QueryScratch.Handle.get());
-            Residency->addAllocation(QueryInputs.Handle.get());
-        }
-        QueryInputSpec spec{};
-        const uint32_t bodies = world.BodyCount();
-        const uint64_t bytes[]{uint64_t(bodies) * sizeof(Pose), uint64_t(bodies) * sizeof(Velocity), uint64_t(bodies) * sizeof(BodyMass), uint64_t(bodies) * sizeof(Index), uint64_t(world.ShapeCount()) * sizeof(Shape), uint64_t(bodies) * sizeof(Material), uint64_t(bodies) * sizeof(Filter), uint64_t(world.Jointed.Capacity) * sizeof(Index), uint64_t(world.ShapeVertices.Capacity) * sizeof(float3), uint64_t(world.HullFaces.Capacity) * sizeof(HullFace), uint64_t(world.Triangles.Capacity) * sizeof(Triangle), uint64_t(world.BvhNodes.Capacity) * sizeof(BvhNode), uint64_t(world.CompoundChildren.Capacity) * sizeof(Index), sizeof(StepParams), uint64_t(bodies) * sizeof(uint32_t), uint64_t(bodies) * ContactsPerBody * 8 * sizeof(uint32_t)};
-        uint64_t words = 0;
-        for (uint32_t at = 0; at < 16; ++at) {
-            if (bytes[at] / 4 > UINT32_MAX - words) throw std::length_error("query input snapshot is too large");
-            spec.Offsets[at] = uint32_t(words);
-            words += bytes[at] / 4;
-        }
-        spec.Words = uint32_t(words);
-        if (spec.Words > QueryInputSnapshot.Capacity) {
-            residency_changed = true;
-            if (QueryInputSnapshot.Handle) Residency->removeAllocation(QueryInputSnapshot.Handle.get());
-            QueryInputSnapshot = {Context.Device.get(), spec.Words};
-            std::fill_n(QueryInputSnapshot.Data(), spec.Words, 0u);
-            Residency->addAllocation(QueryInputSnapshot.Handle.get());
-            reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
-        }
-        if (std::memcmp(&QueryInputs[0], &spec, sizeof(QueryInputSpec)) != 0)
-            reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->Valid = 0;
-        QueryInputs[0] = spec;
-        // Geometry is immutable until this Advance returns, including across submissions.
-        reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->GeometryChecked = 0;
-        if (residency_changed) Residency->commit();
-    }
+    PrepareQueries(world, collider_features);
     AdvanceResult result;
     while (result.Steps < substeps && world.BodyCount() != 0) {
         const mtl::AutoreleasePool batch_pool;
@@ -532,6 +645,99 @@ void Solver::EncodeSolveCommands(MTL4::ComputeCommandEncoder *encoder, const Rec
     Table->setAddress(world.Poses.Address(), 0);
 }
 
+void Solver::EncodeCollect(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world, bool sensor) {
+    const uint32_t bodies = recording.Bodies;
+    const bool queued_queries = Params[recording.Parameter].QueuedQueries;
+    const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes :
+                                     bodies <= NativeCollectBodyLimit ? 32 : 1;
+    Pass pass = sensor ? SensorPass : CollectPass;
+    if (!sensor && !(recording.ColliderFeatures & MeshQueries))
+        pass = bodies > NativeCollectBodyLimit && !(recording.ColliderFeatures & BoundedPlanes) ? ScalarCollectPass : NativeCollectPass;
+    const uint32_t lanes = sensor ? CollisionLanes : collision_lanes;
+    if (!queued_queries) {
+        Dispatch(encoder, pass, bodies, lanes);
+        return;
+    }
+    // Retain solid geometry while sensors use separate scratch storage.
+    const uint64_t query_address = sensor ? SensorQueries.Address() : QueryScratch.Address();
+    Table->setAddress(query_address, 11);
+    if (!sensor) {
+        Table->setAddress(QueryInputSnapshot.Address(), 18);
+        Table->setAddress(QueryInputs.Address(), 9);
+        Dispatch(encoder, CheckQueryInputsPass, 1, 1, query_address + offsetof(QueryArenaHeader, InputX));
+        Dispatch(encoder, CheckQueryGeometryPass, 1, 1, query_address + offsetof(QueryArenaHeader, GeometryX));
+        Table->setAddress(world.IncomingSlots.Address(), 18);
+        Table->setAddress(world.PreviousVelocities.Address(), 9);
+    }
+    Dispatch(encoder, ResetQueryPass, bodies);
+    Dispatch(encoder, pass, bodies, lanes, 0, Prepare);
+    Dispatch(encoder, QueryPass, 1, 1, query_address);
+    Dispatch(encoder, pass, bodies, 1, 0, Queued);
+    // Recompute queries that exceed arena capacity.
+    Dispatch(encoder, pass, bodies, lanes);
+    Table->setAddress(world.Iterates.Address(), 11);
+}
+
+void Solver::EncodeCollision(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
+    const uint32_t bodies = recording.Bodies;
+    const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
+    const bool queued_queries = Params[recording.Parameter].QueuedQueries;
+    if (queued_queries) {
+        Table->setAddress(QueryScratch.Address(), 11);
+        Table->setAddress(QueryInputs.Address(), 9);
+        Table->setAddress(QueryInputSnapshot.Address(), 18);
+        Dispatch(encoder, ResetQueryReusePass, 1);
+    }
+    Dispatch(encoder, Params[recording.Parameter].GeometryOnly ? GeometryBoundsPass : BoundsPass, bodies, bounds_lanes);
+    if (queued_queries) {
+        Table->setAddress(world.Iterates.Address(), 11);
+        Table->setAddress(world.PreviousVelocities.Address(), 9);
+        Table->setAddress(world.IncomingSlots.Address(), 18);
+    }
+    if (bodies <= RadixBlockSize) {
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, SmallBroadPhasePass, std::bit_ceil(std::max(RadixSimdWidth, bodies)));
+    } else if (recording.Parameter && Params[recording.Parameter - 1].BodyCount == bodies) {
+        // Rebuild at each submission boundary; within it the same body slots retain a valid topology.
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, RefreshTreePass, bodies);
+        Dispatch(encoder, RefitTreePass, bodies);
+    } else {
+        const uint32_t blocks = RadixBlocks(bodies);
+        Table->setAddress(world.BoundsReductions.Address(), 13);
+        Dispatch(encoder, ReduceBoundsPass, blocks * RadixBlockSize);
+        Dispatch(encoder, ReduceScenePass, RadixBlockSize);
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 10);
+        Dispatch(encoder, MortonPass, bodies);
+        Table->setAddress(world.BroadPhaseScratch.Address(), 9);
+        for (uint32_t digit = 0; digit < 4; ++digit) {
+            const uint64_t input = world.BroadPhaseKeys.Address() + (digit % 2) * bodies * sizeof(MortonKey);
+            const uint64_t output = world.BroadPhaseKeys.Address() + ((digit + 1) % 2) * bodies * sizeof(MortonKey);
+            Table->setAddress(input, 11);
+            Table->setAddress(output, 13);
+            Table->setAddress(ColorCursor.Address() + digit * sizeof(uint32_t), 25);
+            Dispatch(encoder, RadixHistogramPass, blocks * RadixBlockSize);
+            Dispatch(encoder, RadixOffsetsPass, RadixBlockSize);
+            Dispatch(encoder, RadixScatterPass, bodies);
+        }
+        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
+        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        Dispatch(encoder, BuildTreePass, bodies);
+        Dispatch(encoder, RefitTreePass, bodies);
+    }
+    Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
+    Table->setAddress(world.PreviousVelocities.Address(), 9);
+    Table->setAddress(world.Materials.Address(), 10);
+    Table->setAddress(world.Iterates.Address(), 11);
+    Table->setAddress(world.NextColors.Address(), 13);
+    Table->setAddress(world.ContactEventCounts.Address(), 25);
+    // Measure collision geometry before warm starting so C0 and Jacobians use the initial pose.
+    // Shared lanes increase parallelism for mesh queries and small worlds.
+    EncodeCollect(encoder, recording, world, false);
+}
+
 void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
     const uint32_t bodies = recording.Bodies, joints = recording.Joints;
     const bool compact = bodies > SolveLanes;
@@ -632,92 +838,7 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Dispatch(encoder, stabilize ? FinishPosesPass : PublishPass, bodies, 1, general_islands && !stabilize ? GeneralIslands.Address() + IslandPublishAt * sizeof(uint32_t) : 0);
     };
 
-    const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
-    const bool queued_queries = Params[recording.Parameter].QueuedQueries;
-    if (queued_queries) {
-        Table->setAddress(QueryScratch.Address(), 11);
-        Table->setAddress(QueryInputs.Address(), 9);
-        Table->setAddress(QueryInputSnapshot.Address(), 18);
-        Dispatch(encoder, ResetQueryReusePass, 1);
-    }
-    Dispatch(encoder, BoundsPass, bodies, bounds_lanes);
-    if (queued_queries) {
-        Table->setAddress(world.Iterates.Address(), 11);
-        Table->setAddress(world.PreviousVelocities.Address(), 9);
-        Table->setAddress(world.IncomingSlots.Address(), 18);
-    }
-    if (bodies <= RadixBlockSize) {
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
-        Dispatch(encoder, SmallBroadPhasePass, std::bit_ceil(std::max(RadixSimdWidth, bodies)));
-    } else if (recording.Parameter && Params[recording.Parameter - 1].BodyCount == bodies) {
-        // Rebuild at each submission boundary; within it the same body slots retain a valid topology.
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
-        Dispatch(encoder, RefreshTreePass, bodies);
-        Dispatch(encoder, RefitTreePass, bodies);
-    } else {
-        const uint32_t blocks = RadixBlocks(bodies);
-        Table->setAddress(world.BoundsReductions.Address(), 13);
-        Dispatch(encoder, ReduceBoundsPass, blocks * RadixBlockSize);
-        Dispatch(encoder, ReduceScenePass, RadixBlockSize);
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 10);
-        Dispatch(encoder, MortonPass, bodies);
-        Table->setAddress(world.BroadPhaseScratch.Address(), 9);
-        for (uint32_t digit = 0; digit < 4; ++digit) {
-            const uint64_t input = world.BroadPhaseKeys.Address() + (digit % 2) * bodies * sizeof(MortonKey);
-            const uint64_t output = world.BroadPhaseKeys.Address() + ((digit + 1) % 2) * bodies * sizeof(MortonKey);
-            Table->setAddress(input, 11);
-            Table->setAddress(output, 13);
-            Table->setAddress(ColorCursor.Address() + digit * sizeof(uint32_t), 25);
-            Dispatch(encoder, RadixHistogramPass, blocks * RadixBlockSize);
-            Dispatch(encoder, RadixOffsetsPass, RadixBlockSize);
-            Dispatch(encoder, RadixScatterPass, bodies);
-        }
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
-        Dispatch(encoder, BuildTreePass, bodies);
-        Dispatch(encoder, RefitTreePass, bodies);
-    }
-    Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
-    Table->setAddress(world.PreviousVelocities.Address(), 9);
-    Table->setAddress(world.Materials.Address(), 10);
-    Table->setAddress(world.Iterates.Address(), 11);
-    Table->setAddress(world.NextColors.Address(), 13);
-    Table->setAddress(world.ContactEventCounts.Address(), 25);
-    // Measure collision geometry before warm starting so C0 and Jacobians use the initial pose.
-    // Shared lanes increase parallelism for mesh queries and small worlds.
-    const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes : bodies <= NativeCollectBodyLimit ? 32 :
-                                                                                                                                                                  1;
-    const auto collect = [&](bool sensor) {
-        Pass pass = sensor ? SensorPass : CollectPass;
-        if (!sensor && !(recording.ColliderFeatures & MeshQueries))
-            pass = bodies > NativeCollectBodyLimit && !(recording.ColliderFeatures & BoundedPlanes) ? ScalarCollectPass : NativeCollectPass;
-        const uint32_t lanes = sensor ? CollisionLanes : collision_lanes;
-        if (!queued_queries) {
-            Dispatch(encoder, pass, bodies, lanes);
-            return;
-        }
-        // Retain solid geometry while sensors use separate scratch storage.
-        const uint64_t query_address = sensor ? SensorQueries.Address() : QueryScratch.Address();
-        Table->setAddress(query_address, 11);
-        if (!sensor) {
-            Table->setAddress(QueryInputSnapshot.Address(), 18);
-            Table->setAddress(QueryInputs.Address(), 9);
-            Dispatch(encoder, CheckQueryInputsPass, 1, 1, query_address + offsetof(QueryArenaHeader, InputX));
-            Dispatch(encoder, CheckQueryGeometryPass, 1, 1, query_address + offsetof(QueryArenaHeader, GeometryX));
-            Table->setAddress(world.IncomingSlots.Address(), 18);
-            Table->setAddress(world.PreviousVelocities.Address(), 9);
-        }
-        Dispatch(encoder, ResetQueryPass, bodies);
-        Dispatch(encoder, pass, bodies, lanes, 0, Prepare);
-        Dispatch(encoder, QueryPass, 1, 1, query_address);
-        Dispatch(encoder, pass, bodies, 1, 0, Queued);
-        // Recompute queries that exceed arena capacity.
-        Dispatch(encoder, pass, bodies, lanes);
-        Table->setAddress(world.Iterates.Address(), 11);
-    };
-    collect(false);
+    EncodeCollision(encoder, recording, world);
     if (bodies <= SolveLanes) {
         Table->setAddress(world.JointIncidence.Address(), 20);
         Table->setAddress(world.Displacements.Address(), 10);
@@ -801,13 +922,13 @@ void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recor
         Table->setAddress(world.Materials.Address(), 10);
         Table->setAddress(world.Bounds.Address(), BroadPhaseOrCursorAt);
         // Sensors query the final poses, after solving and stabilization.
-        Dispatch(encoder, SensorBoundsPass, bodies, bounds_lanes);
+        Dispatch(encoder, SensorBoundsPass, bodies, bodies <= RadixSimdWidth ? RadixSimdWidth : 1);
         Table->setAddress(world.BroadPhaseNodes.Address(), 13);
         Dispatch(encoder, RefreshTreePass, bodies);
         if (bodies > RadixSimdWidth) Dispatch(encoder, RefitTreePass, bodies);
         Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
         Table->setAddress(world.NextColors.Address(), 13);
-        collect(true);
+        EncodeCollect(encoder, recording, world, true);
     }
 
     if (recording.Snapshot) {

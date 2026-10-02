@@ -17,6 +17,8 @@ kernel void FullStep(constant FullStepData &s [[buffer(0)]], uint tid [[thread_i
     threadgroup GeometryManifold geometries[SmallSolveWaves];
     threadgroup ContactHistory history[SmallSolveWaves];
     threadgroup bool measure_cached[SmallSolveWaves];
+    // FullStep always uses AVBD collection (GeometryOnly=0). Its geometry-output
+    // arguments are unreachable; Metal's offline translator rejects null device pointers.
     solid::BuildBodyBounds(s.poses, s.body_shapes, s.shapes, s.bounds, s.initial, s.inertial, s.velocities, s.masses, s.incoming, s.quiet, s.compound_children, s.hull_vertices, s.bvh_nodes, p, tid);
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (tid < p.BodyCount) {
@@ -25,7 +27,7 @@ kernel void FullStep(constant FullStepData &s [[buffer(0)]], uint tid [[thread_i
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     for (uint body = wave; body < p.BodyCount; body += waves) {
-        solid::CollectContacts(s.islands, s.contacts, s.poses, s.masses, s.body_shapes, s.shapes, s.materials, s.compound_children, s.velocities, s.filters, s.jointed_to, s.contact_events, s.contact_event_counts, s.contact_refusals, s.hull_vertices, s.mesh_triangles, s.bvh_nodes, s.hull_faces, s.quiet, s.nodes, s.incoming, p, body, lane, &geometries[wave], history[wave], measure_cached[wave]);
+        solid::CollectContacts(s.islands, s.contacts, s.poses, s.masses, s.body_shapes, s.shapes, s.materials, s.compound_children, s.velocities, s.filters, s.jointed_to, reinterpret_cast<device GeometryContact *>(s.contacts), reinterpret_cast<device atomic_uint *>(s.islands), s.contact_events, s.contact_event_counts, s.contact_refusals, s.hull_vertices, s.mesh_triangles, s.bvh_nodes, s.hull_faces, s.quiet, s.nodes, s.incoming, p, body, lane, &geometries[wave], history[wave], measure_cached[wave]);
         simdgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
@@ -92,7 +94,7 @@ kernel void FullStep(constant FullStepData &s [[buffer(0)]], uint tid [[thread_i
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         for (uint body = wave; body < p.BodyCount; body += waves) {
-            sensor::CollectContacts(s.islands, s.sensors, s.poses, s.masses, s.body_shapes, s.shapes, s.materials, s.compound_children, s.velocities, s.filters, s.jointed_to, s.contact_events, s.contact_event_counts, s.sensor_refusals, s.hull_vertices, s.mesh_triangles, s.bvh_nodes, s.hull_faces, s.quiet, s.nodes, s.incoming, p, body, lane, &geometries[wave], history[wave], measure_cached[wave]);
+            sensor::CollectContacts(s.islands, s.sensors, s.poses, s.masses, s.body_shapes, s.shapes, s.materials, s.compound_children, s.velocities, s.filters, s.jointed_to, reinterpret_cast<device GeometryContact *>(s.sensors), reinterpret_cast<device atomic_uint *>(s.islands), s.contact_events, s.contact_event_counts, s.sensor_refusals, s.hull_vertices, s.mesh_triangles, s.bvh_nodes, s.hull_faces, s.quiet, s.nodes, s.incoming, p, body, lane, &geometries[wave], history[wave], measure_cached[wave]);
             simdgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);

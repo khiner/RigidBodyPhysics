@@ -55,6 +55,21 @@ struct Solver {
     ~Solver();
 
     void Step(World &, const StepSettings & = {});
+    struct GeometryOutput {
+        uint64_t ContactsAddress, CountAddress;
+        uint32_t Capacity;
+    };
+    // Encode collision into a caller-owned command buffer. The caller must
+    // complete that buffer before FinishGeometry; the returned GPU addresses
+    // remain owned by this solver until then.
+    GeometryOutput EncodeGeometry(MTL4::ComputeCommandEncoder *, World &, const StepSettings &, uint32_t capacity);
+    std::span<const GeometryContact> FinishGeometry(World &);
+    // Release a recording after a failed command submission/completion.
+    void CancelGeometry();
+    // Discover geometry at current poses without advancing AVBD state. The span
+    // remains valid until the next collection or destruction of this solver.
+    // Throws if capacity is insufficient; no contact is silently truncated.
+    std::span<const GeometryContact> CollectGeometry(World &, const StepSettings &, uint32_t capacity);
     // DeltaTime applies to each substep.
     // Followers update before each substep.
     // Observer spans are immutable and valid only during the callback.
@@ -80,6 +95,9 @@ private:
     MTL::ComputePipelineState *Pipeline(uint32_t index);
     void PrepareFollowers(World &, std::span<const SensorFollower>);
     void Bind(World &, uint32_t parameter);
+    void PrepareQueries(World &, uint32_t collider_features);
+    void EncodeCollision(MTL4::ComputeCommandEncoder *, const Recording &, World &);
+    void EncodeCollect(MTL4::ComputeCommandEncoder *, const Recording &, World &, bool sensor);
     void Encode(MTL4::ComputeCommandEncoder *, const Recording &, World &);
     void EncodeSolveCommands(MTL4::ComputeCommandEncoder *, const Recording &, World &);
     enum CollectionMode : uint32_t {
@@ -92,6 +110,8 @@ private:
     const mtl::Context &Context;
     std::array<NS::SharedPtr<MTL::ComputePipelineState>, std::size(shaders::Pipelines)> Pipelines;
     mtl::Buffer<uint32_t> SensorQueries, QueryScratch, QueryInputSnapshot;
+    mtl::Buffer<GeometryContact> GeometryContacts;
+    mtl::Buffer<uint32_t> GeometryCount;
     mtl::Buffer<QueryInputSpec> QueryInputs;
     NS::SharedPtr<MTL4::ArgumentTable> Table;
     NS::SharedPtr<MTL4::CommandAllocator> Allocator;
@@ -113,6 +133,8 @@ private:
     OutputLayout Layout;
     uint64_t Signal{};
     bool Advancing = false;
+    World *PendingGeometry = nullptr;
+    uint32_t PendingGeometryBodies = 0, PendingGeometryCapacity = 0;
 };
 
 } // namespace rbp

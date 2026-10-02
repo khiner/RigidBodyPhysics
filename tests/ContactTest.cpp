@@ -2,6 +2,7 @@
 #include "Solver.h"
 
 #include <doctest/doctest.h>
+#include <semaphore>
 
 using namespace rbp;
 
@@ -17,6 +18,33 @@ struct Reporting {
     }
 };
 } // namespace
+
+TEST_CASE_FIXTURE(Reporting, "geometry collection retains a shallow rotated box overlap") {
+    // Minimal captured hand-pile regression: these boxes overlap by >20 micrometres.
+    // Keep the actual poses; a full articulated scene and a second SAT implementation
+    // are unnecessary to detect this previously missing pair.
+    const Index cube = world.AddShape({.HalfExtents = {0.075f, 0.075f, 0.075f}, .Kind = ShapeBox});
+    const Index a = world.AddBody({
+        .Pose = {{-0.2545965016f, 0.3753733039f, 0.1150867268f},
+                 {0.0025463090f, -0.0009681065f, -0.0001322666f, 0.9999962449f}},
+        .Shape = cube, .Density = 0.5f});
+    const Index b = world.AddBody({
+        .Pose = {{-0.2549225986f, 0.3749794066f, 0.2654695511f},
+                 {0.0007183106f, -0.0000419523f, -0.0006794247f, 0.9999995232f}},
+        .Shape = cube, .Density = 0.5f});
+    const auto contacts = solver.CollectGeometry(world, {.DeltaTime = 0.004f,
+        .ContactMargin = 0, .MaxContactReach = 0.05f}, 16);
+    REQUIRE(!contacts.empty());
+    float deepest = 0;
+    for (const auto &contact : contacts) {
+        CHECK(((contact.BodyA == a && contact.BodyB == b) ||
+               (contact.BodyA == b && contact.BodyB == a)));
+        CHECK(std::abs(length(contact.Normal) - 1) < 1e-5f);
+        CHECK(std::abs(dot(contact.PointA - contact.PointB, contact.Normal) - contact.Gap) < 1e-5f);
+        deepest = std::min(deepest, contact.Gap);
+    }
+    CHECK(deepest < -2e-5f);
+}
 
 TEST_CASE_FIXTURE(Reporting, "reporting: support and impact forces account for momentum") {
     SUBCASE("reporting: sleeping support includes patch geometry when reporting starts late") {
@@ -125,6 +153,139 @@ TEST_CASE_FIXTURE(Reporting, "reporting: support and impact forces account for m
         CHECK(length(angular_impulse - momentum) < 0.01f * length(momentum));
         CHECK(length(momentum) > 0.1f);
     }
+}
+
+TEST_CASE_FIXTURE(Reporting, "geometry collection shares collision features without AVBD stepping or contact caps") {
+    const Index floor = Floor();
+    const Index box = Box({0, 0.49f, 0});
+    const Pose pose = world.Poses[box];
+    const Velocity velocity = world.Velocities[box];
+    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 0};
+    const auto raw = solver.CollectGeometry(world, settings, 16);
+    REQUIRE(raw.size() == 4);
+    const std::vector<GeometryContact> features(raw.begin(), raw.end());
+    for (const GeometryContact &contact : raw) {
+        CHECK(contact.BodyA == box);
+        CHECK(contact.BodyB == floor);
+        CHECK(contact.Normal.y == doctest::Approx(1));
+        CHECK(contact.Gap == doctest::Approx(-0.01f).epsilon(1e-4));
+    }
+    CHECK(length(world.Poses[box].Position - pose.Position) == 0);
+    CHECK(length(world.Poses[box].Orientation - pose.Orientation) == 0);
+    CHECK(length(world.Velocities[box].Linear - velocity.Linear) == 0);
+    CHECK_FALSE(world.Contacts[box * ContactsPerBody].Active);
+    CHECK_THROWS_AS(solver.CollectGeometry(world, settings, 2), std::overflow_error);
+    solver.Step(world, {.Gravity = {0, 0, 0}, .ContactMargin = 0, .Iterations = 0});
+    for (uint32_t i = 0; i < 4; ++i) {
+        const Contact &contact = world.Contacts[box * ContactsPerBody + i];
+        CHECK(contact.Active);
+        bool matched = false;
+        for (const GeometryContact &feature : features)
+            matched |= feature.Feature == contact.Feature && feature.BodyA == contact.BodyA &&
+                       feature.BodyB == contact.BodyB &&
+                       length(feature.PointA - WorldPoint(pose, contact.PointA)) < 1e-5f &&
+                       length(feature.PointB - WorldPoint(world.Poses[floor], contact.PointB)) < 1e-5f;
+        CHECK(matched);
+    }
+}
+
+TEST_CASE_FIXTURE(Reporting, "geometry collection can be encoded into a caller-owned Metal command buffer") {
+    Floor();
+    Box({0, 0.49f, 0});
+    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 0};
+    const auto direct = solver.CollectGeometry(world, settings, 16);
+    REQUIRE(direct.size() == 4);
+    const std::vector<GeometryContact> expected(direct.begin(), direct.end());
+
+    auto allocator = NS::TransferPtr(context.Device->newCommandAllocator());
+    auto commands = NS::TransferPtr(context.Device->newCommandBuffer());
+    commands->beginCommandBuffer(allocator.get());
+    auto *encoder = commands->computeCommandEncoder();
+    const Solver::GeometryOutput output = solver.EncodeGeometry(encoder, world, settings, 16);
+    CHECK(output.ContactsAddress != 0);
+    CHECK(output.CountAddress != 0);
+    CHECK(output.Capacity == 16);
+    encoder->endEncoding();
+    commands->endCommandBuffer();
+    std::binary_semaphore done{0};
+    auto options = mtl::Make<MTL4::CommitOptions>();
+    options->addFeedbackHandler([&](MTL4::CommitFeedback *) { done.release(); });
+    const MTL4::CommandBuffer *list[]{commands.get()};
+    context.Queue->commit(list, 1, options.get());
+    done.acquire();
+    const auto encoded = solver.FinishGeometry(world);
+    REQUIRE(encoded.size() == expected.size());
+    for (const GeometryContact &feature : encoded) {
+        bool matched = false;
+        for (const GeometryContact &reference : expected)
+            matched |= reference.BodyA == feature.BodyA && reference.BodyB == feature.BodyB &&
+                       reference.Feature == feature.Feature &&
+                       length(reference.PointA - feature.PointA) < 1e-5f &&
+                       length(reference.PointB - feature.PointB) < 1e-5f;
+        CHECK(matched);
+    }
+}
+
+TEST_CASE_FIXTURE(Reporting, "geometry collection reports contacts beyond AVBD's per-body slot count") {
+    for (uint32_t i = 0; i < 12; ++i) Floor();
+    const Index box = Box({0, 0.49f, 0});
+    const auto features = solver.CollectGeometry(world, {.Gravity = {0, 0, 0}, .ContactMargin = 0}, 64);
+    REQUIRE(features.size() == 48);
+    CHECK(features.size() > ContactsPerBody);
+    for (const GeometryContact &feature : features) CHECK(feature.BodyA == box);
+    CHECK_THROWS_AS(solver.CollectGeometry(world, {.Gravity = {0, 0, 0}, .ContactMargin = 0}, 40), std::overflow_error);
+}
+
+TEST_CASE_FIXTURE(Reporting, "geometry collection preserves AVBD features for hulls meshes and compounds") {
+    Index moving = NoIndex;
+    SUBCASE("hull on plane") {
+        Floor();
+        const Index hull = world.AddHull(PrismPoints(8, 1, Half));
+        REQUIRE(hull != NoIndex);
+        moving = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = hull});
+    }
+    SUBCASE("box on triangle mesh") {
+        const std::vector<float3> vertices{float3{-2, 0, -2}, float3{2, 0, -2},
+                                            float3{2, 0, 2}, float3{-2, 0, 2}};
+        const Index mesh = world.AddMesh(vertices, std::vector<uint32_t>{0, 2, 1, 0, 3, 2});
+        REQUIRE(mesh != NoIndex);
+        world.AddBody({.Shape = mesh, .Density = 0});
+        moving = Box({0, Half - 1e-4f, 0});
+    }
+    SUBCASE("compound box on plane") {
+        Floor();
+        Shape left = UnitBox, right = UnitBox;
+        left.Local = At(float3{-1, 0, 0});
+        right.Local = At(float3{1, 0, 0});
+        const Index compound = world.AddCompound(std::vector<Index>{world.AddShape(left), world.AddShape(right)});
+        REQUIRE(compound != NoIndex);
+        moving = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = compound});
+    }
+    REQUIRE(moving != NoIndex);
+    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 0, .Iterations = 0};
+    const auto raw = solver.CollectGeometry(world, settings, 128);
+    REQUIRE_FALSE(raw.empty());
+    const std::vector<GeometryContact> features(raw.begin(), raw.end());
+    solver.Step(world, settings);
+    uint32_t adapted = 0;
+    for (uint32_t slot = 0; slot < ContactsPerBody; ++slot) {
+        const Contact &contact = world.Contacts[moving * ContactsPerBody + slot];
+        if (!contact.Active) break;
+        ++adapted;
+        bool matched = false;
+        for (const GeometryContact &feature : features) {
+            if (feature.BodyA != contact.BodyA || feature.BodyB != contact.BodyB ||
+                feature.Feature != contact.Feature || feature.Children != contact.Children ||
+                feature.SubShapeA != contact.SubShapeA || feature.SubShapeB != contact.SubShape) continue;
+            const float3 a = WorldPoint(world.Poses[contact.BodyA], contact.PointA);
+            const float3 b = WorldPoint(world.Poses[contact.BodyB], contact.PointB);
+            matched |= length(a - feature.PointA) < 1e-4f && length(b - feature.PointB) < 1e-4f &&
+                       length(contact.Normal - feature.Normal) < 1e-4f;
+        }
+        CHECK(matched);
+    }
+    CHECK(adapted > 0);
+    CHECK(features.size() >= adapted);
 }
 
 TEST_CASE_FIXTURE(Reporting, "reporting: patch geometry survives manifold reduction") {

@@ -55,6 +55,11 @@ target_include_directories(rbp SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib/met
 target_link_libraries(rbp PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 
 if(RBP_TOOLS)
+    enable_testing()
+    add_subdirectory(src/ji)
+endif()
+
+if(RBP_TOOLS)
     foreach(Tool IN ITEMS Scenes Bench Replay)
         add_executable(Rbp${Tool} tools/${Tool}.cpp)
         target_link_libraries(Rbp${Tool} PRIVATE rbp)
@@ -64,6 +69,5 @@ if(RBP_TOOLS)
     target_include_directories(RbpScenes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_include_directories(RbpBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
-    enable_testing()
     add_subdirectory(tests)
 endif()

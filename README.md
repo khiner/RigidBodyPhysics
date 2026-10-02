@@ -5,10 +5,13 @@ Rigid body physics and collision detection for Apple Silicon, using an AVBD solv
 The library supports primitive, convex, triangle-mesh and compound colliders, joints with limits and drives, sleeping, contact reports and sensors.
 Collision detection is discrete and runs at every physics substep.
 
+An independent [Metal reproduction of Ji et al.'s GPU SubADMM rigid-body solver](docs/ji/README.md) uses one SubADMM scene solver. Its documentation distinguishes paper fidelity, mechanics validation, measured performance and known changing-contact failures.
+
 Build on macOS 26 or later with CMake, Python 3, Homebrew LLVM and Apple’s Metal Toolchain:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
+git submodule update --init --recursive
 cmake -S . -B build/cmake
 cmake --build build/cmake -j4
 ctest --test-dir build/cmake --output-on-failure

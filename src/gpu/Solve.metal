@@ -646,9 +646,10 @@ static uint ClipAgainst(
             ++kept;
         }
         if (from_inside == to_inside || kept == limit) continue;
-        // Interior cuts receive new identities; endpoint cuts retain the endpoint identity.
+        // A cut near the retained inside endpoint is redundant. A cut near the
+        // discarded outside endpoint is the only representative of that sliver.
         const float at = in_from / (in_from - in_to);
-        if (at <= 1e-4f || at >= 1 - 1e-4f) continue;
+        if ((from_inside && at <= 1e-4f) || (to_inside && at >= 1 - 1e-4f)) continue;
         out[kept] = from + (to - from) * at;
         out_names[kept] = (names[i] & names[next]) | plane;
         ++kept;
@@ -2421,7 +2422,9 @@ static GeometryManifold QueryGeometry(
             FaceCorners(incident, incident_axis, incident_side, poly);
             for (uint i = 0; i < 4; ++i) names[i] = (1u << i) | (1u << ((i + 3) % 4));
             uint poly_count = 4;
-            const float clip_tolerance = 1e-5f * max(1.f, length(reference.Center) + length(reference.Half));
+            // Keep world-space roundoff slack near eight FP32 ulps without
+            // admitting visibly off-face witnesses in scenes away from origin.
+            const float clip_tolerance = 1e-6f * max(1.f, length(reference.Center) + length(reference.Half));
             for (uint edge = 0; edge < 2; ++edge) {
                 const uint side_axis = (best_axis + 1 + edge) % 3;
                 for (uint s = 0; s < 2; ++s) {
@@ -2527,6 +2530,7 @@ static void CollectManifold(
     uint body, uint other, uint own_leaf, uint target_leaf, bool cached_pair,
     const thread Shape &body_shape, const thread Shape &other_body_shape,
     device const Material *materials, device Contact *slots, device uint *contact_refusals,
+    device GeometryContact *geometry_contacts, device atomic_uint *geometry_count,
     constant StepParams &p, thread uint &count, thread uint *inherited,
     COLLECT_STORAGE const ContactHistory &history
 ) {
@@ -2563,6 +2567,24 @@ static void CollectManifold(
 #if !SENSOR_PASS
         const float3 anchor_a = LocalPoint(pose, points_here[i]);
         const float3 anchor_b = LocalPoint(target_pose, points_there[i]);
+        if (p.GeometryOnly) {
+            const Material material_a = shape.HasMaterial ? shape.Surface : (body_shape.HasMaterial ? body_shape.Surface : materials[body]);
+            const Material material_b = target.HasMaterial ? target.Surface : (other_body_shape.HasMaterial ? other_body_shape.Surface : materials[other]);
+            const float3 relative_velocity = (own_velocity.Linear + cross(own_velocity.Angular, points_here[i] - pose.Position)) -
+                (other_velocity.Linear + cross(other_velocity.Angular, points_there[i] - target_pose.Position));
+            const bool resting = length(relative_velocity - normal * dot(relative_velocity, normal)) < 1e-3f;
+            const float friction = Combine(resting ? material_a.StaticFriction : material_a.DynamicFriction,
+                resting ? material_b.StaticFriction : material_b.DynamicFriction,
+                material_a.FrictionCombine, material_b.FrictionCombine);
+            const float restitution = Combine(material_a.Restitution, material_b.Restitution,
+                material_a.RestitutionCombine, material_b.RestitutionCombine);
+            const uint at = atomic_fetch_add_explicit(geometry_count, 1u, memory_order_relaxed);
+            if (at < p.GeometryCapacity)
+                geometry_contacts[at] = {points_here[i], points_there[i], normal,
+                    dot(normal, points_here[i] - points_there[i]), friction, restitution,
+                    body, other, features[i], sub_shape_a, sub_shape, children};
+            continue;
+        }
         // The first matching geometric contact retains ownership.
         bool held = false;
         for (uint k = 0; k < count && siblings && !held; ++k)
@@ -2666,6 +2688,7 @@ kernel void CollectContacts(
     device const Index *compound_children [[buffer(15)]],
     device const Velocity *velocities [[buffer(3)]],
     device const Filter *filters [[buffer(19)]], device const Index *jointed_to [[buffer(20)]],
+    device GeometryContact *geometry_contacts [[buffer(12)]], device atomic_uint *geometry_count [[buffer(16)]],
     device ContactEvent *contact_events [[buffer(24)]], device uint *contact_event_counts [[buffer(25)]],
     device uint *contact_refusals [[buffer(26)]], device const float3 *hull_vertices [[buffer(27)]],
     device const Triangle *mesh_triangles [[buffer(28)]], device const BvhNode *bvh_nodes [[buffer(29)]],
@@ -2734,6 +2757,9 @@ kernel void CollectContacts(
     uint inherited[ContactsPerBody];
 
     COLLECT_STORAGE ContactHistory history;
+    if (p.GeometryOnly) {
+        if (lane == 0) history.was_feature[0] = NoIndex;
+    } else {
     // One SIMD group copies the dense history run without changing its sentinel.
 #if COLLECT_LANES >= 32
     if (lane < 32) {
@@ -2756,11 +2782,12 @@ kernel void CollectContacts(
         }
     }
 #endif
+    }
     if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     const Index shape_index = body_shapes[body];
     if (shape_index == NoIndex || shapes[shape_index].Kind == ShapePlane) {
-        if (!PREPARE_QUERIES && lane == 0) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
+        if (!PREPARE_QUERIES && lane == 0 && !p.GeometryOnly) EndUnclaimed(events, contact_event_counts, body, claimed, reported, history.was_feature, history.was_other, history.was_sub, history.was_sub_a, history.was_children);
         return;
     }
     const Shape body_shape = shapes[shape_index];
@@ -2778,7 +2805,7 @@ kernel void CollectContacts(
 #if SENSOR_PASS
     const bool frozen = false;
 #else
-    const bool frozen = Frozen(masses[body], velocities[body], quiet[body], p);
+    const bool frozen = !p.GeometryOnly && Frozen(masses[body], velocities[body], quiet[body], p);
 #endif
     if (frozen && lane == 0) {
         for (uint j = 0; j < ContactsPerBody; ++j) {
@@ -2824,7 +2851,7 @@ kernel void CollectContacts(
                         const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
 
                         const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
-                        CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                        CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, geometry_contacts, geometry_count, p, count, inherited, history);
                     }
                 }
             }
@@ -3084,7 +3111,7 @@ kernel void CollectContacts(
                                 if (lane == 0) {
                                     for (uint query_at = 0; query_at < min(uint(COLLECT_LANES), mesh_pair ? own_count - own_base : manifolds - batch); ++query_at) {
                                         const GeometryManifold geometry = geometries[query_at];
-                                        CollectManifold(geometry, query, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, p, count, inherited, history);
+                                        CollectManifold(geometry, query, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, geometry_contacts, geometry_count, p, count, inherited, history);
                                     }
                                 }
 #endif
@@ -3100,6 +3127,7 @@ kernel void CollectContacts(
 #endif
 
     if (PREPARE_QUERIES) return;
+    if (p.GeometryOnly) return;
 #if !SENSOR_PASS && COLLECT_LANES >= 32
     threadgroup_barrier(mem_flags::mem_device);
     if (lane >= 32) return;
