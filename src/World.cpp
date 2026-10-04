@@ -164,6 +164,8 @@ bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
     return true;
 }
 
+// Compares only pieces whose bounds touch, swept along x.
+// A buried face lies within the opposing face up to the tolerance and the normals' tilt, so the bounds grow by both.
 std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces, std::span<const CollisionMask> filters = {}) {
     float scale = 1e-6f;
     for (const auto &piece : pieces)
@@ -171,17 +173,41 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
             for (const float3 corner : face.Corner) scale = std::max(scale, simd::length(corner) + face.Radius);
 
     const float tolerance = 1e-5f * scale;
-    std::vector<uint32_t> masks(pieces.size(), 0);
+    // Opposing normals within the dot-product threshold tilt by at most 0.0045 radians.
+    const float margin = tolerance + 0.005f * scale;
+    struct Bounds {
+        float3 Min, Max;
+    };
+    std::vector<Bounds> bounds(pieces.size(), Bounds{float3{INFINITY, INFINITY, INFINITY}, float3{-INFINITY, -INFINITY, -INFINITY}});
     for (size_t i = 0; i < pieces.size(); ++i)
-        for (size_t j = 0; j < pieces.size(); ++j) {
-            if (j == i || (!filters.empty() && !SameMask(filters[i], filters[j]))) continue;
-            for (const ShapeFace &mine : pieces[i])
-                for (const ShapeFace &theirs : pieces[j]) {
-                    if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue;
-                    if (std::abs(mine.Offset + theirs.Offset) > tolerance) continue;
-                    if (Within(mine, theirs, tolerance)) masks[i] |= 1u << mine.Index;
-                }
+        for (const ShapeFace &face : pieces[i])
+            for (const float3 corner : face.Corner) {
+                bounds[i].Min = simd::min(bounds[i].Min, corner - face.Radius - margin);
+                bounds[i].Max = simd::max(bounds[i].Max, corner + face.Radius + margin);
+            }
+    std::vector<uint32_t> order(pieces.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::ranges::sort(order, {}, [&](uint32_t i) { return bounds[i].Min.x; });
+
+    std::vector<uint32_t> masks(pieces.size(), 0);
+    const auto bury = [&](uint32_t i, uint32_t j) {
+        if (!filters.empty() && !SameMask(filters[i], filters[j])) return;
+        for (const ShapeFace &mine : pieces[i])
+            for (const ShapeFace &theirs : pieces[j]) {
+                if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue;
+                if (std::abs(mine.Offset + theirs.Offset) > tolerance) continue;
+                if (Within(mine, theirs, tolerance)) masks[i] |= 1u << mine.Index;
+            }
+    };
+    for (uint32_t a = 0; a < order.size(); ++a) {
+        const auto i = order[a];
+        for (uint32_t b = a + 1; b < order.size() && bounds[order[b]].Min.x <= bounds[i].Max.x; ++b) {
+            const auto j = order[b];
+            if (bounds[j].Min.y > bounds[i].Max.y || bounds[i].Min.y > bounds[j].Max.y || bounds[j].Min.z > bounds[i].Max.z || bounds[i].Min.z > bounds[j].Max.z) continue;
+            bury(i, j);
+            bury(j, i);
         }
+    }
     return masks;
 }
 } // namespace
@@ -431,8 +457,8 @@ void World::ReclaimBodies() {
 }
 
 // Host removals can invalidate incoming adjacency, so scan contact storage directly.
-void World::EndContacts(Index body) {
-    EndSensorOverlaps(body);
+void World::EndContacts(std::span<const uint8_t> removed, std::span<const Index> bodies) {
+    EndSensorOverlaps(removed);
     const auto end = [this](Contact &contact) {
         if (TrackContacts)
             Changes.push_back({
@@ -447,18 +473,20 @@ void World::EndContacts(Index body) {
             });
         contact.Active = false;
     };
-    for (uint32_t i = 0; i < ContactsPerBody; ++i) {
-        Contact &contact = Contacts[body * ContactsPerBody + i];
-        if (!contact.Active) break;
-        end(contact);
+    for (const Index body : bodies) {
+        for (uint32_t i = 0; i < ContactsPerBody; ++i) {
+            Contact &contact = Contacts[body * ContactsPerBody + i];
+            if (!contact.Active) break;
+            end(contact);
+        }
     }
     for (Index owner = 0; owner < NumBodies; ++owner) {
-        if (owner == body) continue;
+        if (removed[owner]) continue;
         const auto run = Contacts.All().subspan(owner * ContactsPerBody, ContactsPerBody);
         uint32_t count = 0;
         while (count < ContactsPerBody && run[count].Active) ++count;
         for (uint32_t i = 0; i < count;) {
-            if (run[i].BodyB != body) {
+            if (!removed[run[i].BodyB]) {
                 ++i;
                 continue;
             }
@@ -501,19 +529,19 @@ void World::EnsureSensorBuffers() {
     Residency->commit();
 }
 
-void World::EndSensorOverlaps(Index body) {
+void World::EndSensorOverlaps(std::span<const uint8_t> removed) {
     if (!SensorContacts.Handle) return;
     std::erase_if(SensorOverlaps, [&](const SensorOverlap &pair) {
-        if (pair.A.Slot != body && pair.B.Slot != body) return false;
+        if (!removed[pair.A.Slot] && !removed[pair.B.Slot]) return false;
         if (TrackSensors) SensorChanges.push_back({pair, false});
         return true;
     });
     for (Index owner = 0; owner < NumBodies; ++owner) {
         const auto run = SensorContacts.All().subspan(owner * ContactsPerBody, ContactsPerBody);
-        const auto removed = std::ranges::remove_if(run, [body](const Contact &contact) {
-            return !contact.Active || contact.BodyA == body || contact.BodyB == body;
+        const auto ended = std::ranges::remove_if(run, [&](const Contact &contact) {
+            return !contact.Active || removed[contact.BodyA] || removed[contact.BodyB];
         });
-        for (Contact &contact : removed) contact.Active = 0;
+        for (Contact &contact : ended) contact.Active = 0;
     }
 }
 
@@ -991,23 +1019,38 @@ void World::RebuildJointed() {
 
 bool World::RemoveBody(Index body) {
     if (!Alive(body)) return false;
-    Wake(body);
+    RemoveBodies({&body, 1});
+    return true;
+}
+
+void World::RemoveBodies(std::span<const Index> bodies) {
+    std::vector<uint8_t> removed(NumBodies, 0);
+    std::vector<Index> live;
+    live.reserve(bodies.size());
+    for (const Index body : bodies) {
+        if (!Alive(body) || removed[body]) continue;
+        removed[body] = 1;
+        live.push_back(body);
+        // Wake before clearing the contact runs it traverses.
+        Wake(body);
+    }
+    if (live.empty()) return;
 
     bool removed_joints = false;
     for (Index joint = 0; joint < NumJoints; ++joint) {
         const Joint &held = Joints[joint];
-        if (held.Active && (held.BodyA == body || held.BodyB == body)) removed_joints |= RetireJoint(joint);
+        if (held.Active && (removed[held.BodyA] || removed[held.BodyB])) removed_joints |= RetireJoint(joint);
     }
     if (removed_joints) RebuildJointed();
-    // Wake before clearing the contact runs it traverses.
-    EndContacts(body);
-    DropWeld(body);
-    BodyShapes[body] = NoIndex;
-    Masses[body] = StaticMass;
-    Velocities[body] = {};
-    LiveBodies[body] = 0;
-    RetiredBodies.push_back(body);
-    return true;
+    EndContacts(removed, live);
+    for (const Index body : live) {
+        DropWeld(body);
+        BodyShapes[body] = NoIndex;
+        Masses[body] = StaticMass;
+        Velocities[body] = {};
+        LiveBodies[body] = 0;
+        RetiredBodies.push_back(body);
+    }
 }
 
 bool World::RetireJoint(Index joint) {
@@ -1029,21 +1072,37 @@ bool World::RemoveJoint(Index joint) {
 
 bool World::RemoveShape(Index shape) {
     if (shape >= NumShapes || !LiveShapes[shape]) return false;
-    for (Index body = 0; body < NumBodies; ++body)
-        if (LiveBodies[body] && BodyShapes[body] == shape) return false;
+    RemoveShapes({&shape, 1});
+    return !LiveShapes[shape];
+}
 
+void World::RemoveShapes(std::span<const Index> shapes) {
+    std::vector<uint8_t> marked(NumShapes, 0);
+    bool any = false;
+    for (const Index shape : shapes) {
+        if (shape >= NumShapes || !LiveShapes[shape]) continue;
+        marked[shape] = 1;
+        any = true;
+    }
+    if (!any) return;
+    // A shape a body or another compound holds stays.
+    for (Index body = 0; body < NumBodies; ++body)
+        if (LiveBodies[body] && BodyShapes[body] < NumShapes) marked[BodyShapes[body]] = 0;
     for (Index other = 0; other < NumShapes; ++other) {
         if (!LiveShapes[other] || Shapes[other].Kind != ShapeCompound) continue;
         const Shape parent = Shapes[other];
         for (uint32_t i = 0; i < parent.VertexCount; ++i) {
             const Index child = ChildOf(parent, i, CompoundChildren.All().data());
             if (child == NoIndex) break;
-            if (child == shape) return false;
+            if (child < NumShapes) marked[child] = 0;
         }
     }
-    ReleaseShape(shape);
+    for (const Index shape : shapes) {
+        if (shape >= NumShapes || !marked[shape] || !LiveShapes[shape]) continue;
+        marked[shape] = 0;
+        ReleaseShape(shape);
+    }
     TrimTail(NumShapes, FreeShapes, [this](Index at) { return LiveShapes[at] != 0; });
-    return true;
 }
 
 bool World::SetBodyShape(Index body, Index shape, float density, std::optional<AuthoredMass> authored) {
@@ -1056,7 +1115,9 @@ bool World::SetBodyShape(Index body, Index shape, float density, std::optional<A
         return false;
     }
     Wake(body);
-    EndContacts(body);
+    std::vector<uint8_t> removed(NumBodies, 0);
+    removed[body] = 1;
+    EndContacts(removed, {&body, 1});
 
     if (shape != WeldedShapes[body]) DropWeld(body);
     BodyShapes[body] = shape;
@@ -1065,6 +1126,15 @@ bool World::SetBodyShape(Index body, Index shape, float density, std::optional<A
     mass.LinearDamping = held.LinearDamping;
     mass.AngularDamping = held.AngularDamping;
     Masses[body] = mass;
+    return true;
+}
+
+bool World::SetBodyMass(Index body, const BodyMass &mass) {
+    if (!Alive(body)) return false;
+    Masses[body] = mass;
+    // A moving body sheds the welded copy it held while resting.
+    if (Moves(mass)) DropWeld(body);
+    Wake(body);
     return true;
 }
 

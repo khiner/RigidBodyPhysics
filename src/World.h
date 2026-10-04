@@ -210,18 +210,25 @@ struct World {
     // Removal returns false for an inactive index.
     // Raw indices do not carry generations; callers must track their lifetime.
     bool RemoveBody(Index);
+    // Removes the live bodies in one pass over joints and contact storage.
+    void RemoveBodies(std::span<const Index>);
     bool RemoveJoint(Index);
     // Replace an active joint's configuration and reset its solver history.
     bool SetJoint(Index, const JointDesc &);
 
     bool RemoveShape(Index);
+    // Removes each live shape that no body and no other compound holds, checking every shape in one pass.
+    void RemoveShapes(std::span<const Index>);
     // Replace geometry while preserving identity, pose and motion properties.
     // Recompute mass from density unless authored mass is supplied.
     bool SetBodyShape(Index body, Index shape, float density = 1000, std::optional<AuthoredMass> mass = {});
+    // Replace a body's mass properties and wake it, so a static body can start moving in place.
+    bool SetBodyMass(Index body, const BodyMass &);
     bool Alive(Index body) const { return body < NumBodies && LiveBodies[body]; }
 
     // Mark internal faces between stationary boxes or hulls with identical effective masks.
-    // Every call recomputes welding and stores masks on private shape copies.
+    // Every call recomputes welding over the bodies whose bounds touch, and stores masks on private shape copies.
+    // Only a body whose mask changed takes the new mask and wakes.
     // Repeat after topology, shape or motion changes.
     // Compounds weld during cooking.
     uint32_t WeldStatic();
@@ -333,11 +340,12 @@ private:
     Index CopyShape(Shape);
 
     void DropWeld(Index body);
-    void EndContacts(Index body);
+    // Ends the contacts and sensor overlaps of the bodies marked removed, listed in `bodies`.
+    void EndContacts(std::span<const uint8_t> removed, std::span<const Index> bodies);
 
     void DrainContactEvents(float delta_time, const StepSnapshot &);
     void UpdateSensorOverlaps(const StepSnapshot &);
-    void EndSensorOverlaps(Index);
+    void EndSensorOverlaps(std::span<const uint8_t> removed);
     void ReleaseShape(Index);
 
     void RebuildJointed();

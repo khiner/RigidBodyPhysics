@@ -34,6 +34,31 @@ build/cmake/tests/RbpTests --test-case='advance:*'
 build/cmake/tests/RbpTests --test-case='joints:*'
 ```
 
+## AVBD collection under GPU contention
+
+On 2026-10-04, collision-only repetitions of captured MotionProperties and WaterWheel
+worlds reproduced extra retained contacts at `05a86a0` despite identical queued query
+records and manifold results. The duplicates divided inertial stiffness among too many
+points. Queued collection now places a device barrier after each manifold and before
+the first manifold can inspect slots carried through frozen compaction. Lane zero
+retains ownership; all lanes participate in barriers. The GeometryOnly branches and
+the clipping changes from `e237ea7` remain intact.
+
+The fixed collector passed 16,000 collision-only repetitions across eight concurrent
+processes. MeshEditor headless validation used 16 queued jobs and eight workers: four
+copies each of MotionProperties and WaterWheel, plus eight glTF sample models. All
+eight physics videos matched fresh solo renders with `script/VideosEquivalent`, and
+both solo renders matched the videos committed at MeshEditor `356b386a7`. The complete
+library suite passed 62 cases. Its parallel duplicate-triangle welding test is bounded
+contract coverage; it also passed before the fix, so retain the captured-world and
+video checks when validating this scheduling-dependent failure.
+
+The production queued collector uses one lane per threadgroup. A `mem_none` barrier
+control also passed the collision probe, so these results do not distinguish a
+device-visibility defect from a compiler scheduling issue. The observed failure is
+localized to queued welding; the barriers eliminate it in the captured-world and
+video checks above.
+
 ## Benchmarks
 
 `RbpBench` runs all default scenes when no names are supplied.

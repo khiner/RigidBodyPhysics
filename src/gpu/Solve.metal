@@ -2833,26 +2833,28 @@ kernel void CollectContacts(
     }
     if (COLLECT_LANES > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
 #if QUEUED_QUERIES
-    if (lane == 0) {
-        for (uint part = 0; part < QueryPartitions(p.BodyCount); ++part) {
-            for (Index context_at = query_pool[QueryHeadOffset(p.BodyCount, body, part)]; context_at != NoIndex; context_at = query_batches[context_at].Next) {
-                device const QueryBatch &batch = query_batches[context_at];
-                device const QueryContext &context = query_contexts[batch.Context];
-                for (uint word = 0; word < 2; ++word) {
-                    uint present = batch.Present[word];
-                    while (present) {
-                        const uint query_at = batch.First + 32 * word + ctz(present);
-                        present &= present - 1;
-                        const QueuedQuery record = query_records[query_at];
-                        const GeometryQuery q = context.Query;
-                        const Index other = context.Other;
-                        const uint own_leaf = context.OwnLeaf, target_leaf = context.TargetLeaf;
-                        const Shape other_body_shape = shapes[body_shapes[other]];
-                        const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
+    // Frozen compaction also writes slots that the first queued manifold can inspect.
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint part = 0; part < QueryPartitions(p.BodyCount); ++part) {
+        for (Index context_at = query_pool[QueryHeadOffset(p.BodyCount, body, part)]; context_at != NoIndex; context_at = query_batches[context_at].Next) {
+            device const QueryBatch &batch = query_batches[context_at];
+            device const QueryContext &context = query_contexts[batch.Context];
+            for (uint word = 0; word < 2; ++word) {
+                uint present = batch.Present[word];
+                while (present) {
+                    const uint query_at = batch.First + 32 * word + ctz(present);
+                    present &= present - 1;
+                    const QueuedQuery record = query_records[query_at];
+                    const GeometryQuery q = context.Query;
+                    const Index other = context.Other;
+                    const uint own_leaf = context.OwnLeaf, target_leaf = context.TargetLeaf;
+                    const Shape other_body_shape = shapes[body_shapes[other]];
+                    const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
 
-                        const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
-                        CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, geometry_contacts, geometry_count, p, count, inherited, history);
-                    }
+                    const GeometryManifold geometry = QueryResults(query_pool)[record.Result];
+                    if (lane == 0) CollectManifold(geometry, q, body, other, own_leaf, target_leaf, cached_pair, body_shape, other_body_shape, materials, slots, contact_refusals, geometry_contacts, geometry_count, p, count, inherited, history);
+                    // Publish retained slots before the next manifold reads them for welding.
+                    threadgroup_barrier(mem_flags::mem_device);
                 }
             }
         }

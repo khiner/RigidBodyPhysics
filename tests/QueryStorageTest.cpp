@@ -2,6 +2,7 @@
 #include "Solver.h"
 
 #include <array>
+#include <future>
 #include <vector>
 
 #include <doctest/doctest.h>
@@ -173,4 +174,41 @@ TEST_CASE("collision: bounded query storage preserves contacts and sensor transi
             CHECK(world.BodyCount() == 2);
         }
     }
+}
+
+TEST_CASE("collision: queued welding remains stable across concurrent worlds") {
+    const auto run = [] {
+        const mtl::AutoreleasePool pool;
+        const mtl::Context context;
+        Solver solver{context};
+        World world{context, {.Bodies = 10, .Shapes = 3, .Joints = 1,
+            .ShapeVertices = 11, .HullFaces = 6, .Triangles = 2, .BvhNodes = 4, .CompoundChildren = 1}};
+        const std::array points{float3{-20, 0, -20}, float3{0, 0, 20}, float3{20, 0, -20}};
+        const std::array<uint32_t, 6> triangles{0, 1, 2, 0, 1, 2};
+        world.AddBody({.Shape = world.AddMesh(points, triangles), .Density = 0});
+        const Index box_shape = world.AddShape(UnitBox), hull = world.AddHull(CubeCorners(1));
+        std::array<Index, 9> boxes;
+        for (uint32_t i = 0; i < boxes.size(); ++i) {
+            boxes[i] = world.AddBody({.Pose = At(float3{float(i) * 2 - 8, Half, 0}),
+                .Shape = i % 2 ? hull : box_shape});
+            if (boxes[i] == NoIndex) throw std::runtime_error("Cannot construct queued welding world");
+        }
+        const StepSettings settings{.Gravity = {0, 0, 0}, .Iterations = 0,
+            .ContactMargin = 1e-3f, .MaxContactReach = 0, .SleepSteps = ~0u};
+        for (uint32_t step = 0; step < 2000; ++step) {
+            // Force fresh queries while keeping every box exactly supported by both copies.
+            for (uint32_t i = 0; i < boxes.size(); ++i)
+                world.Poses[boxes[i]].Position.x = float(i) * 2 - 8 + (step % 2 ? 0.25f : -0.25f);
+            solver.Step(world, settings);
+            for (Index box : boxes) {
+                uint32_t count = 0;
+                while (count < ContactsPerBody && world.Contacts[box * ContactsPerBody + count].Active) ++count;
+                if (count != ManifoldPoints || world.ContactRefusals[box]) return step + 1;
+            }
+        }
+        return 0u;
+    };
+    std::array<std::future<uint32_t>, 4> workers;
+    for (auto &worker : workers) worker = std::async(std::launch::async, run);
+    for (auto &worker : workers) CHECK(worker.get() == 0);
 }
