@@ -901,7 +901,7 @@ Index World::AddBody(const BodyDesc &desc) {
     Quiet[index] = 0;
     RestPoses[index] = desc.Pose;
     Materials[index] = desc.Surface.value_or(Material{desc.Friction, desc.Friction, desc.Restitution, CombineGeometricMean, CombineMaximum});
-    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor};
+    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor, .GeometryActive = desc.GeometryActive};
     if (index + 1 == NumBodies) {
         Jointed[index + 1] = Jointed[index];
         JointIncidence[index + 1] = JointIncidence[index];
@@ -1135,6 +1135,51 @@ bool World::SetBodyMass(Index body, const BodyMass &mass) {
     // A moving body sheds the welded copy it held while resting.
     if (Moves(mass)) DropWeld(body);
     Wake(body);
+    return true;
+}
+
+bool World::SetGeometryActive(Index body, bool active) {
+    if (!Alive(body)) return false;
+    Filters[body].GeometryActive = active;
+    return true;
+}
+
+bool World::SetMeshVertices(Index index, std::span<const float3> points) {
+    if (index >= NumShapes || !LiveShapes[index]) return false;
+    const Shape &shape = Shapes[index];
+    if (shape.Kind != ShapeMesh || points.size() != shape.VertexCount ||
+        uint64_t(shape.FirstVertex) + shape.VertexCount > ShapeVertices.Capacity ||
+        uint64_t(shape.FirstTriangle) + shape.TriangleCount > Triangles.Capacity ||
+        uint64_t(shape.RootNode) + shape.NodeCount > BvhNodes.Capacity) return false;
+    // Validate/refit scratch before touching shared buffers. Input may alias the
+    // current vertices, and refit uses mesh-local indices without recooking.
+    std::vector<float3> vertices(points.begin(), points.end());
+    const auto current_triangles = Triangles.All().subspan(shape.FirstTriangle, shape.TriangleCount);
+    const auto current_nodes = BvhNodes.All().subspan(shape.RootNode, shape.NodeCount);
+    std::vector<Triangle> triangles(current_triangles.begin(), current_triangles.end());
+    std::vector<BvhNode> nodes(current_nodes.begin(), current_nodes.end());
+    for (auto &triangle : triangles) {
+        for (Index *vertex : {&triangle.A, &triangle.B, &triangle.C}) {
+            if (*vertex < shape.FirstVertex || *vertex - shape.FirstVertex >= shape.VertexCount) return false;
+            *vertex -= shape.FirstVertex;
+        }
+    }
+    if (!RefitMesh(vertices, triangles, nodes)) return false;
+    for (auto &triangle : triangles) {
+        triangle.A += shape.FirstVertex;
+        triangle.B += shape.FirstVertex;
+        triangle.C += shape.FirstVertex;
+    }
+    std::ranges::copy(vertices, ShapeVertices.All().begin() + shape.FirstVertex);
+    std::ranges::copy(triangles, current_triangles.begin());
+    std::ranges::copy(nodes, current_nodes.begin());
+    for (Index body = 0; body < NumBodies; ++body) if (Alive(body)) {
+        const Index held = BodyShapes[body];
+        bool affected = held == index;
+        if (held < NumShapes && Shapes[held].Kind == ShapeCompound)
+            for (uint32_t child = 0; child < Shapes[held].VertexCount; ++child) affected |= Child(held, child) == index;
+        if (affected) Wake(body);
+    }
     return true;
 }
 

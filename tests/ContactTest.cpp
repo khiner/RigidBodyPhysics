@@ -46,6 +46,80 @@ TEST_CASE_FIXTURE(Reporting, "geometry collection retains a shallow rotated box 
     CHECK(deepest < -2e-5f);
 }
 
+TEST_CASE_FIXTURE(Reporting, "geometry activity includes stationary pairs without adding AVBD mobility") {
+    const Index cube = world.AddShape(UnitBox);
+    const Index a = world.AddBody({.Shape = cube, .Density = 0});
+    const Index b = world.AddBody({.Pose = At(float3{0, .99f, 0}), .Shape = cube, .Density = 0});
+    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 0};
+    CHECK(solver.CollectGeometry(world, settings, 16).empty());
+    REQUIRE(world.SetGeometryActive(b, true));
+    const auto raw = solver.CollectGeometry(world, settings, 16);
+    REQUIRE(raw.size() == 4);
+    for (const auto &contact : raw) {
+        CHECK(contact.BodyA == b);CHECK(contact.BodyB == a);
+        CHECK(contact.Gap == doctest::Approx(-.01f).epsilon(1e-4));
+    }
+    REQUIRE(world.SetGeometryActive(a, true));
+    CHECK(solver.CollectGeometry(world, settings, 16).size() == 4);
+    solver.Step(world, settings);
+    CHECK_FALSE(world.Contacts[a * ContactsPerBody].Active);
+    CHECK_FALSE(world.Contacts[b * ContactsPerBody].Active);
+    CHECK_FALSE(Moves(world.Masses[a]));CHECK_FALSE(Moves(world.Masses[b]));
+    CHECK(length(world.Poses[a].Position) == 0);
+    CHECK(world.Poses[b].Position.y == .99f);
+    REQUIRE(world.SetGeometryActive(a, false));REQUIRE(world.SetGeometryActive(b, false));
+    CHECK(solver.CollectGeometry(world, settings, 16).empty());
+}
+
+TEST_CASE_FIXTURE(Reporting, "stationary deforming mesh geometry refreshes contacts and preserves features") {
+    const std::vector<uint32_t> indices{0, 1, 2, 0, 2, 3};
+    const float3 lower_points[]{{-.15f, 0, -2}, {-.15f, 0, 2}, {.15f, 0, 2}, {.15f, 0, -2}};
+    const float3 upper_points[]{{-2, 0, -.15f}, {2, 0, -.15f}, {2, 0, .15f}, {-2, 0, .15f}};
+    const Index lower = world.AddMesh(lower_points, indices), upper = world.AddMesh(upper_points, indices);
+    REQUIRE(lower != NoIndex);REQUIRE(upper != NoIndex);
+    world.Shapes[lower].DoubleSided = world.Shapes[upper].DoubleSided = true;
+    const Index a = world.AddBody({.Shape = lower, .Density = 0});
+    const Index b = world.AddBody({.Pose = At(float3{0, .01f, 0}), .Shape = upper, .Density = 0, .GeometryActive = true});
+    const auto aid = world.IdOf(a), bid = world.IdOf(b);
+    const Pose pose = world.Poses[b];
+    const Shape shape = world.Shapes[upper];
+    const auto vertices = world.ShapeVertices.All().subspan(shape.FirstVertex, shape.VertexCount);
+    const std::vector<float3> rest(vertices.begin(), vertices.end());
+    auto deformed = rest;
+    for (auto &point : deformed) point.y -= .01f;
+    // ConvexManifold admits gap < ContactMargin. Coincident zero-thickness
+    // surfaces therefore need a positive discovery margin, not penetration.
+    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 1e-5f, .MaxContactReach = 0};
+    CHECK(solver.CollectGeometry(world, settings, 32).empty());
+    REQUIRE(world.SetMeshVertices(upper, deformed));
+    const auto raw = solver.CollectGeometry(world, settings, 32);
+    REQUIRE(raw.size() >= 3);
+    const std::vector<GeometryContact> contacts(raw.begin(), raw.end());
+    for (const auto &contact : contacts) {
+        CHECK(contact.BodyA == b);CHECK(contact.BodyB == a);
+        CHECK(std::abs(contact.Gap) < 1e-6f);
+        CHECK(std::abs(contact.PointA.y) < 1e-6f);CHECK(std::abs(contact.PointB.y) < 1e-6f);
+        CHECK(length(contact.Normal) == doctest::Approx(1));
+    }
+    CHECK_THROWS_AS(solver.CollectGeometry(world, settings, 1), std::overflow_error);
+    CHECK(world.IdOf(a) == aid);CHECK(world.IdOf(b) == bid);
+    CHECK(length(world.Poses[b].Position - pose.Position) == 0);
+    CHECK(length(world.Velocities[b].Linear) == 0);
+    CHECK_FALSE(world.Contacts[b * ContactsPerBody].Active);
+    REQUIRE(world.SetMeshVertices(upper, rest));
+    CHECK(solver.CollectGeometry(world, settings, 32).empty());
+    REQUIRE(world.SetMeshVertices(upper, deformed));
+    const auto repeated = solver.CollectGeometry(world, settings, 32);
+    REQUIRE(repeated.size() == contacts.size());
+    for (const auto &contact : repeated) {
+        bool found = false;
+        for (const auto &before : contacts) found |= contact.Feature == before.Feature &&
+            contact.SubShapeA == before.SubShapeA && contact.SubShapeB == before.SubShapeB &&
+            length(contact.PointA - before.PointA) < 1e-6f && length(contact.PointB - before.PointB) < 1e-6f;
+        CHECK(found);
+    }
+}
+
 TEST_CASE_FIXTURE(Reporting, "reporting: support and impact forces account for momentum") {
     SUBCASE("reporting: sleeping support includes patch geometry when reporting starts late") {
         Floor();

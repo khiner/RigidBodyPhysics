@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <limits>
 
 namespace rbp {
 
@@ -12,10 +13,58 @@ constexpr uint32_t LeafSize = 4;
 // Treat folds below one degree as coplanar to suppress contacts on tessellation edges.
 constexpr float ActiveEdgeSine = 0.0175f;
 
-float3 Normal(const std::vector<float3> &points, const Triangle &triangle) {
+float3 Normal(std::span<const float3> points, const Triangle &triangle) {
     const float3 turn = cross(points[triangle.B] - points[triangle.A], points[triangle.C] - points[triangle.A]);
     const float area = length(turn);
     return area > 0 ? turn / area : float3{0, 0, 0};
+}
+
+// Geometry-dependent feature flags are shared by cooking and fixed-topology
+// updates. Ownership is assigned only during cooking and survives deformation.
+bool ClassifyEdges(std::span<const float3> points, std::span<Triangle> triangles, bool assign_ownership) {
+    std::map<std::pair<Index, Index>, std::vector<uint32_t>> along;
+    for (uint32_t t = 0; t < triangles.size(); ++t) {
+        const Triangle &triangle = triangles[t];
+        const Index corner[3]{triangle.A, triangle.B, triangle.C};
+        for (uint32_t e = 0; e < 3; ++e) {
+            const Index from = corner[e], to = corner[(e + 1) % 3];
+            along[{std::min(from, to), std::max(from, to)}].push_back(t);
+        }
+    }
+    for (uint32_t t = 0; t < triangles.size(); ++t) {
+        Triangle &triangle = triangles[t];
+        triangle.ActiveEdges = triangle.BackActiveEdges = 0;
+        if (assign_ownership) triangle.OwnedEdges = 0;
+        const Index corner[3]{triangle.A, triangle.B, triangle.C};
+        const float3 normal = Normal(points, triangle);
+        for (uint32_t e = 0; e < 3; ++e) {
+            const Index from = corner[e], to = corner[(e + 1) % 3];
+            const auto &shared = along[{std::min(from, to), std::max(from, to)}];
+            // Boundary and nonmanifold edges remain active.
+            bool active = shared.size() != 2;
+            bool back_active = active;
+            for (const uint32_t other : shared) {
+                if (other == t) continue;
+                const Triangle &neighbour = triangles[other];
+                // The adjacent triangle lies behind this plane at a convex crease.
+                for (const Index far : {neighbour.A, neighbour.B, neighbour.C}) {
+                    if (far == from || far == to) continue;
+                    const float3 offset = points[far] - points[from];
+                    const float span = length(offset);
+                    const float projection = dot(normal, offset);
+                    if (!std::isfinite(span) || !std::isfinite(projection)) return false;
+                    if (span > 0 && projection / span < -ActiveEdgeSine) active = true;
+                    if (span > 0 && projection / span > ActiveEdgeSine) back_active = true;
+                }
+            }
+            if (active) triangle.ActiveEdges |= 1u << e;
+            if (back_active) triangle.BackActiveEdges |= 1u << e;
+            // The lower triangle index owns contacts on a shared edge.
+            if (assign_ownership && (shared.size() != 2 || t == std::min(shared[0], shared[1]))) triangle.OwnedEdges |= 1u << e;
+        }
+    }
+
+    return true;
 }
 
 uint32_t Build(std::vector<Triangle> &triangles, const std::vector<float3> &points, std::vector<BvhNode> &nodes, uint32_t first, uint32_t count, uint32_t depth = 0) {
@@ -164,46 +213,64 @@ CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> in
         triangle.C = where[triangle.C];
     }
 
-    std::map<std::pair<Index, Index>, std::vector<uint32_t>> along;
-    for (uint32_t t = 0; t < cooked.Triangles.size(); ++t) {
-        const Triangle &triangle = cooked.Triangles[t];
-        const Index corner[3]{triangle.A, triangle.B, triangle.C};
-        for (uint32_t e = 0; e < 3; ++e) {
-            const Index from = corner[e], to = corner[(e + 1) % 3];
-            along[{std::min(from, to), std::max(from, to)}].push_back(t);
-        }
-    }
-    for (uint32_t t = 0; t < cooked.Triangles.size(); ++t) {
-        Triangle &triangle = cooked.Triangles[t];
-        const Index corner[3]{triangle.A, triangle.B, triangle.C};
-        const float3 normal = Normal(cooked.Vertices, triangle);
-        for (uint32_t e = 0; e < 3; ++e) {
-            const Index from = corner[e], to = corner[(e + 1) % 3];
-            const auto &shared = along[{std::min(from, to), std::max(from, to)}];
-            // Boundary and nonmanifold edges remain active.
-            bool active = shared.size() != 2;
-            bool back_active = active;
-            for (const uint32_t other : shared) {
-                if (other == t) continue;
-                const Triangle &neighbour = cooked.Triangles[other];
-                // The adjacent triangle lies behind this plane at a convex crease.
-                for (const Index far : {neighbour.A, neighbour.B, neighbour.C}) {
-                    if (far == from || far == to) continue;
-                    const float3 offset = cooked.Vertices[far] - cooked.Vertices[from];
-                    const float span = length(offset);
-                    if (span > 0 && dot(normal, offset) / span < -ActiveEdgeSine) active = true;
-                    if (span > 0 && dot(normal, offset) / span > ActiveEdgeSine) back_active = true;
-                }
-            }
-            if (active) triangle.ActiveEdges |= 1u << e;
-            if (back_active) triangle.BackActiveEdges |= 1u << e;
-            // The lower triangle index owns contacts on a shared edge.
-            if (shared.size() != 2 || t == std::min(shared[0], shared[1])) triangle.OwnedEdges |= 1u << e;
-        }
-    }
+    if (!ClassifyEdges(cooked.Vertices, cooked.Triangles, true)) return {};
 
     Build(cooked.Triangles, cooked.Vertices, cooked.Nodes, 0, cooked.Triangles.size());
     return cooked;
+}
+
+bool RefitMesh(std::span<const float3> points, std::span<Triangle> triangles, std::span<BvhNode> nodes) {
+    if (points.empty() || triangles.empty() || nodes.empty() ||
+        points.size() > std::numeric_limits<uint32_t>::max() ||
+        triangles.size() > std::numeric_limits<uint32_t>::max() || nodes.size() > std::numeric_limits<uint32_t>::max()) return false;
+    for (const float3 point : points)
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return false;
+    for (const Triangle &triangle : triangles) {
+        if (triangle.A >= points.size() || triangle.B >= points.size() || triangle.C >= points.size()) return false;
+        const float area = length(cross(points[triangle.B] - points[triangle.A], points[triangle.C] - points[triangle.A]));
+        if (!(area > 0) || !std::isfinite(area)) return false;
+    }
+    // No live metadata changes until every range, tree edge and arithmetic
+    // operation succeeds. Scratch also makes allocation failure atomic.
+    std::vector<Triangle> updated_triangles(triangles.begin(), triangles.end());
+    std::vector<BvhNode> updated_nodes(nodes.begin(), nodes.end());
+    std::vector<uint8_t> covered(triangles.size());
+    const auto visit = [&](auto &&self, uint32_t at, uint32_t depth) -> uint64_t {
+        if (at >= nodes.size() || depth >= 32) return 0;
+        BvhNode &node = updated_nodes[at];
+        if (node.Count) {
+            if (node.Count > LeafSize || uint64_t(node.First) + node.Count > triangles.size()) return 0;
+            node.Low = float3{INFINITY, INFINITY, INFINITY};node.High = -node.Low;
+            for (uint32_t i = node.First; i < node.First + node.Count; ++i) {
+                if (covered[i]++) return 0;
+                const Triangle &triangle = triangles[i];
+                for (Index corner : {triangle.A, triangle.B, triangle.C}) {
+                    node.Low = simd::min(node.Low, points[corner]);node.High = simd::max(node.High, points[corner]);
+                }
+            }
+            return uint64_t(at) + 1;
+        }
+        // Preorder topology: the left subtree follows its parent and the right
+        // child starts immediately after the complete left subtree.
+        if (node.First <= uint64_t(at) + 1 || node.First >= nodes.size()) return 0;
+        if (self(self, at + 1, depth + 1) != node.First) return 0;
+        const uint64_t end = self(self, node.First, depth + 1);
+        if (!end) return 0;
+        node.Low = simd::min(updated_nodes[at + 1].Low, updated_nodes[node.First].Low);
+        node.High = simd::max(updated_nodes[at + 1].High, updated_nodes[node.First].High);
+        return end;
+    };
+    if (visit(visit, 0, 0) != nodes.size() ||
+        !std::ranges::all_of(covered, [](uint8_t count) { return count == 1; }) ||
+        !ClassifyEdges(points, updated_triangles, false)) return false;
+    for (std::size_t i = 0; i < triangles.size(); ++i) {
+        triangles[i].ActiveEdges = updated_triangles[i].ActiveEdges;
+        triangles[i].BackActiveEdges = updated_triangles[i].BackActiveEdges;
+    }
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        nodes[i].Low = updated_nodes[i].Low;nodes[i].High = updated_nodes[i].High;
+    }
+    return true;
 }
 
 } // namespace rbp

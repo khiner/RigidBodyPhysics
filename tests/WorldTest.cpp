@@ -3,6 +3,8 @@
 #include "Shapes.h"
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <numbers>
 #include <utility>
 #include <vector>
@@ -26,6 +28,62 @@ Index AddQuadMesh(World &world, Pose local = IdentityPose) {
     return world.AddMesh(points, indices, local);
 }
 } // namespace
+
+TEST_CASE_FIXTURE(OneWorld, "world: fixed topology mesh updates preserve shared identity and reject atomically") {
+    const Index mesh = AddQuadMesh(world);
+    REQUIRE(mesh != NoIndex);
+    const Shape shape = world.Shapes[mesh];
+    const Index first = world.AddBody({.Shape = mesh, .Density = 0, .GeometryActive = true});
+    const Index second = world.AddBody({.Pose = At(float3{3, 0, 0}), .Shape = mesh, .Density = 0});
+    const auto first_id = world.IdOf(first), second_id = world.IdOf(second);
+    const auto first_pose = world.Poses[first], second_pose = world.Poses[second];
+    const auto first_mass = world.Masses[first], second_mass = world.Masses[second];
+    const auto vertices = world.ShapeVertices.All().subspan(shape.FirstVertex, shape.VertexCount);
+    const auto triangles = world.Triangles.All().subspan(shape.FirstTriangle, shape.TriangleCount);
+    const auto nodes = world.BvhNodes.All().subspan(shape.RootNode, shape.NodeCount);
+    const std::vector<Triangle> topology(triangles.begin(), triangles.end());
+    const std::vector<BvhNode> tree(nodes.begin(), nodes.end());
+    std::vector<float3> deformed(vertices.begin(), vertices.end());
+    for (auto &point : deformed) point.y = 0.2f * point.x;
+    world.Quiet[first] = world.Quiet[second] = 100;
+    REQUIRE(world.SetMeshVertices(mesh, deformed));
+    CHECK(world.Quiet[first] == 0);
+    CHECK(world.Quiet[second] == 0);
+    CHECK(world.IdOf(first) == first_id);
+    CHECK(world.IdOf(second) == second_id);
+    CHECK(std::memcmp(&shape, &world.Shapes[mesh], sizeof(Shape)) == 0);
+    CHECK(std::memcmp(&first_pose, &world.Poses[first], sizeof(Pose)) == 0);
+    CHECK(std::memcmp(&second_pose, &world.Poses[second], sizeof(Pose)) == 0);
+    CHECK(std::memcmp(&first_mass, &world.Masses[first], sizeof(BodyMass)) == 0);
+    CHECK(std::memcmp(&second_mass, &world.Masses[second], sizeof(BodyMass)) == 0);
+    for (std::size_t i = 0; i < vertices.size(); ++i) CHECK(simd::all(vertices[i] == deformed[i]));
+    for (std::size_t i = 0; i < triangles.size(); ++i) {
+        CHECK(triangles[i].A == topology[i].A);CHECK(triangles[i].B == topology[i].B);
+        CHECK(triangles[i].C == topology[i].C);CHECK(triangles[i].OwnedEdges == topology[i].OwnedEdges);
+    }
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        CHECK(nodes[i].First == tree[i].First);CHECK(nodes[i].Count == tree[i].Count);
+    }
+    CHECK(nodes[0].Low.y == doctest::Approx(-.2f));
+    CHECK(nodes[0].High.y == doctest::Approx(.2f));
+    const std::vector<Triangle> accepted_triangles(triangles.begin(), triangles.end());
+    const std::vector<BvhNode> accepted_nodes(nodes.begin(), nodes.end());
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        auto bad = deformed;
+        if (invalid == 0) bad.pop_back();
+        if (invalid == 1) bad.back().x = std::numeric_limits<float>::quiet_NaN();
+        if (invalid == 2) bad[topology[0].C - shape.FirstVertex] = bad[topology[0].A - shape.FirstVertex];
+        CHECK_FALSE(world.SetMeshVertices(invalid == 3 ? NoIndex : mesh, bad));
+        CHECK(std::memcmp(vertices.data(), deformed.data(), vertices.size_bytes()) == 0);
+        CHECK(std::memcmp(triangles.data(), accepted_triangles.data(), triangles.size_bytes()) == 0);
+        CHECK(std::memcmp(nodes.data(), accepted_nodes.data(), nodes.size_bytes()) == 0);
+    }
+    CHECK(world.SetGeometryActive(first, false));
+    CHECK_FALSE(world.Filters[first].GeometryActive);
+    CHECK_FALSE(world.SetGeometryActive(NoIndex, true));
+    CHECK(world.RemoveBody(first));
+    CHECK_FALSE(world.SetGeometryActive(first, true));
+}
 
 namespace {
 constexpr float TileHalf = 2.5f, TileTop = 0.25f;

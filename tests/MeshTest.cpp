@@ -175,3 +175,97 @@ TEST_CASE("cooking: mesh hierarchy bounds cover each surviving triangle once") {
         CHECK(std::ranges::all_of(triangle_visits, [](uint32_t n) { return n == 1; }));
     }
 }
+
+TEST_CASE("refit: deformation flips front and back creases without changing features") {
+    std::vector<float3> points{float3{-1,0,-1},float3{1,0,-1},float3{-1,.5f,0},float3{1,.5f,0},float3{-1,0,1},float3{1,0,1}};
+    std::vector<uint32_t> indices;
+    Quad(indices,points,0,1,3,2,float3{0,1,0});Quad(indices,points,2,3,5,4,float3{0,1,0});
+    auto mesh=CookMesh(points,indices);
+    const auto topology=mesh.Triangles;const auto nodes=mesh.Nodes;
+    const auto crease_flags=[&](bool front) {
+        int found=0;
+        for(const auto& t:mesh.Triangles) {
+            const Index corner[]{t.A,t.B,t.C};
+            for(int e=0;e<3;++e) if(mesh.Vertices[corner[e]].z==0 && mesh.Vertices[corner[(e+1)%3]].z==0) {
+                CHECK(bool(t.ActiveEdges&(1u<<e))==front);
+                CHECK(bool(t.BackActiveEdges&(1u<<e))==!front);++found;
+            }
+        }
+        CHECK(found==2);
+    };
+    crease_flags(true);
+    for(auto& p:mesh.Vertices) if(p.z==0) p.y=-.5f;
+    REQUIRE(RefitMesh(mesh.Vertices,mesh.Triangles,mesh.Nodes));crease_flags(false);
+    for(std::size_t i=0;i<topology.size();++i) {
+        CHECK(mesh.Triangles[i].A==topology[i].A);CHECK(mesh.Triangles[i].B==topology[i].B);
+        CHECK(mesh.Triangles[i].C==topology[i].C);CHECK(mesh.Triangles[i].OwnedEdges==topology[i].OwnedEdges);
+    }
+    for(std::size_t i=0;i<nodes.size();++i) {CHECK(mesh.Nodes[i].First==nodes[i].First);CHECK(mesh.Nodes[i].Count==nodes[i].Count);}
+    CHECK(simd::all(mesh.Nodes[0].Low==float3{-1,-.5f,-1}));CHECK(simd::all(mesh.Nodes[0].High==float3{1,0,1}));
+    for(auto& p:mesh.Vertices) if(p.z==0) p.y=0;
+    REQUIRE(RefitMesh(mesh.Vertices,mesh.Triangles,mesh.Nodes));
+    CHECK(!EdgeActive(mesh,float3{-1,0,0},float3{1,0,0}));
+    for(const auto& t:mesh.Triangles) {
+        const Index corner[]{t.A,t.B,t.C};
+        for(int e=0;e<3;++e) if(mesh.Vertices[corner[e]].z==0 && mesh.Vertices[corner[(e+1)%3]].z==0)
+            CHECK(!(t.BackActiveEdges&(1u<<e)));
+    }
+}
+
+TEST_CASE("refit: every BVH bound equals its deformed descendant geometry") {
+    std::vector<float3> points;std::vector<uint32_t> indices;
+    for(int t=0;t<17;++t) for(float3 p:{float3{float(t),0,0},float3{float(t)+.3f,0,0},float3{float(t),0,.4f}}) {
+        indices.push_back(points.size());points.push_back(p);
+    }
+    auto mesh=CookMesh(points,indices);const auto triangles=mesh.Triangles;const auto topology=mesh.Nodes;
+    REQUIRE(mesh.Nodes.size()>1);
+    for(auto& p:mesh.Vertices) {p.y=.07f*p.x*p.x;p.x=-3*p.x+2;p.z=2*p.z-1;}
+    REQUIRE(RefitMesh(mesh.Vertices,mesh.Triangles,mesh.Nodes));
+    // Collect each node's complete descendant triangle set, then bound the
+    // vertices directly instead of reproducing the refit's child-box reduction.
+    const auto descendants=[&](auto&& self,uint32_t at)->std::vector<uint32_t> {
+        const auto& node=mesh.Nodes[at];std::vector<uint32_t> found;
+        if(node.Count) for(uint32_t i=0;i<node.Count;++i) found.push_back(node.First+i);
+        else {found=self(self,at+1);const auto right=self(self,node.First);found.insert(found.end(),right.begin(),right.end());}
+        float3 low{INFINITY,INFINITY,INFINITY},high=-low;
+        for(auto i:found) for(auto v:{mesh.Triangles[i].A,mesh.Triangles[i].B,mesh.Triangles[i].C}) {
+            low=simd::min(low,mesh.Vertices[v]);high=simd::max(high,mesh.Vertices[v]);
+        }
+        CHECK(simd::all(node.Low==low));CHECK(simd::all(node.High==high));
+        CHECK(node.First==topology[at].First);CHECK(node.Count==topology[at].Count);
+        return found;
+    };
+    CHECK(descendants(descendants,0).size()==triangles.size());
+    for(std::size_t i=0;i<triangles.size();++i) {
+        CHECK(mesh.Triangles[i].A==triangles[i].A);CHECK(mesh.Triangles[i].B==triangles[i].B);
+        CHECK(mesh.Triangles[i].C==triangles[i].C);CHECK(mesh.Triangles[i].OwnedEdges==triangles[i].OwnedEdges);
+    }
+}
+
+TEST_CASE("refit: malformed geometry and topology reject without partial metadata updates") {
+    std::vector<float3> points;std::vector<uint32_t> indices;
+    for(int t=0;t<9;++t) for(float3 p:{float3{float(t),0,0},float3{float(t)+.3f,0,0},float3{float(t),0,.4f}}) {
+        indices.push_back(points.size());points.push_back(p);
+    }
+    auto mesh=CookMesh(points,indices);REQUIRE(mesh.Nodes.size()>1);
+    SUBCASE("nonfinite coordinate") {mesh.Vertices.back().y=INFINITY;}
+    SUBCASE("degenerate triangle") {mesh.Vertices[mesh.Triangles.back().C]=mesh.Vertices[mesh.Triangles.back().A];}
+    SUBCASE("invalid vertex index") {mesh.Triangles.back().B=uint32_t(mesh.Vertices.size());}
+    SUBCASE("cycle") {mesh.Nodes[0].First=0;}
+    SUBCASE("missing right child") {mesh.Nodes[0].First=uint32_t(mesh.Nodes.size());}
+    SUBCASE("overlapping child subtrees") {mesh.Nodes[0].First=1;}
+    SUBCASE("overflowing leaf range") {mesh.Nodes.back().First=~0u;}
+    SUBCASE("repeated triangle range") {mesh.Nodes.back().First=mesh.Nodes[1].Count?mesh.Nodes[1].First:mesh.Nodes[2].First;}
+    SUBCASE("unreachable extra node") {mesh.Nodes.push_back(mesh.Nodes.back());}
+    const auto before_triangles=mesh.Triangles;const auto before_nodes=mesh.Nodes;
+    CHECK_FALSE(RefitMesh(mesh.Vertices,mesh.Triangles,mesh.Nodes));
+    for(std::size_t i=0;i<mesh.Triangles.size();++i) {
+        const auto& a=mesh.Triangles[i];const auto& b=before_triangles[i];
+        CHECK(a.A==b.A);CHECK(a.B==b.B);CHECK(a.C==b.C);CHECK(a.ActiveEdges==b.ActiveEdges);
+        CHECK(a.BackActiveEdges==b.BackActiveEdges);CHECK(a.OwnedEdges==b.OwnedEdges);
+    }
+    for(std::size_t i=0;i<mesh.Nodes.size();++i) {
+        const auto& a=mesh.Nodes[i];const auto& b=before_nodes[i];
+        CHECK(simd::all(a.Low==b.Low));CHECK(simd::all(a.High==b.High));CHECK(a.First==b.First);CHECK(a.Count==b.Count);
+    }
+}

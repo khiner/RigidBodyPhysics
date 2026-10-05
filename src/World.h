@@ -59,6 +59,9 @@ struct BodyDesc {
     // Collider masks override body defaults, and both masks must accept the pair.
     uint32_t Layer = ~0u, CollidesWith = ~0u;
     bool Sensor = false;
+    // Include stationary bodies with externally evolving surfaces in geometry-only
+    // collection. This does not grant rigid mobility or change AVBD constraints.
+    bool GeometryActive = false;
 };
 
 // Joint anchors and frames use world coordinates.
@@ -224,6 +227,13 @@ struct World {
     bool SetBodyShape(Index body, Index shape, float density = 1000, std::optional<AuthoredMass> mass = {});
     // Replace a body's mass properties and wake it, so a static body can start moving in place.
     bool SetBodyMass(Index body, const BodyMass &);
+    bool SetGeometryActive(Index body, bool active);
+    // Update a mesh asset in cooked vertex order without changing topology,
+    // feature identity, body mass or pose. Shared instances all see the update;
+    // independently deforming bodies must own independent mesh assets.
+    // Invalid data leaves geometry unchanged. Like other mutations, call only
+    // after completion; speculative solver state must own its rollback separately.
+    bool SetMeshVertices(Index shape, std::span<const float3> points);
     bool Alive(Index body) const { return body < NumBodies && LiveBodies[body]; }
 
     // Mark internal faces between stationary boxes or hulls with identical effective masks.

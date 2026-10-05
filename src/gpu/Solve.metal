@@ -2795,6 +2795,7 @@ kernel void CollectContacts(
     const Filter own_filter = filters[body];
     const float own_inverse_mass = masses[body].InvMass;
     const bool i_move = Moves(masses[body]);
+    const bool i_collide = i_move || (p.GeometryOnly && own_filter.GeometryActive);
 
     const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
 
@@ -2902,12 +2903,13 @@ kernel void CollectContacts(
             const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
             if (cached_pair && !measure_cached) continue;
             const bool they_move = Moves(masses[other]);
+            const bool they_collide = they_move || (p.GeometryOnly && filters[other].GeometryActive);
 #if SENSOR_PASS
             if (!(own_filter.Sensor || filters[other].Sensor)) continue;
 
 #else
             if (own_filter.Sensor || filters[other].Sensor) continue;
-            if (!i_move && !they_move) continue;
+            if (!i_collide && !they_collide) continue;
 
 #endif
 
@@ -2945,7 +2947,7 @@ kernel void CollectContacts(
 #if SENSOR_PASS
                     if (other < body) continue;
 #else
-                    if (!i_move || (they_move && other < body)) continue;
+                    if (!i_collide || (they_collide && other < body)) continue;
 #endif
                 }
                 const Poly own_bounds = mesh_pair ? MeshBounds(shape, shape_pose, bvh_nodes) : leaf_poly;

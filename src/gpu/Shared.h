@@ -321,6 +321,7 @@ struct Filter {
     uint Layer;
     uint Collides;
     uint Sensor = 0;
+    uint GeometryActive = 0; // Only geometry-only collection uses this activity.
     // The union of leaf masks provides conservative body-pair rejection.
     CollisionMask Aggregate{};
     uint Mixed = 0; // Different leaf masks prevent unconditional face suppression.

@@ -19,4 +19,10 @@ struct CookedMesh {
 // Return an empty mesh when the input contains no valid triangles.
 CookedMesh CookMesh(std::span<const float3> points, std::span<const uint32_t> indices);
 
+// Refit cooked-local geometry without welding, reordering or changing identity.
+// Preserves triangle indices/OwnedEdges and node First/Count; refreshes active
+// front/back edge flags and bounds. Rejects empty, nonfinite, degenerate or
+// malformed geometry/topology without changing either output span.
+bool RefitMesh(std::span<const float3> points, std::span<Triangle> triangles, std::span<BvhNode> nodes);
+
 } // namespace rbp
