@@ -4,6 +4,7 @@
 
 #include "metal/Buffer.h"
 #include "metal/Context.h"
+#include <array>
 #include <cmath>
 #include <optional>
 #include <span>
@@ -106,6 +107,25 @@ struct BodyId {
     Index Slot = NoIndex;
     uint32_t Spawn = 0;
     bool operator==(const BodyId &) const = default;
+};
+
+// Caller-certified closed world-space bounds over one common time interval.
+// Bounds follow cooked mesh vertex order; no float conversion is performed.
+struct SweptBounds {
+    std::array<double, 3> Low{}, High{};
+};
+struct SweptMesh {
+    BodyId Body;
+    Index Shape = NoIndex;
+    uint32_t Child = NoIndex; // Compound leaf ordinal; NoIndex for a direct mesh.
+    std::span<const SweptBounds> Vertices;
+};
+struct SweptTrianglePair {
+    BodyId A, B;
+    Index ShapeA, ShapeB;
+    uint32_t ChildA, ChildB;
+    Index TriangleA, TriangleB; // Absolute World::Triangles indices.
+    bool operator==(const SweptTrianglePair &) const = default;
 };
 
 // A geometric manifold, independent of point features and solver ownership order.
@@ -235,6 +255,19 @@ struct World {
     // after completion; speculative solver state must own its rollback separately.
     bool SetMeshVertices(Index shape, std::span<const float3> points);
     bool Alive(Index body) const { return body < NumBodies && LiveBodies[body]; }
+
+    // Geometry-only conservative candidates, not a manifold or contact solve.
+    // Supply every live nonsensor collision mesh leaf exactly once. Nonmesh
+    // colliders are unsupported. Caller certifies bounds enclose the full
+    // interval, including deformation/rigid motion; this validates structure
+    // and applies current masks, joint suppression and geometry activity.
+    // BVH overlaps are pruned only by conservative fixed-axis interval tests.
+    // Mesh triangles have zero skin, matching CollectGeometry; margin is the
+    // total pair distance allowance (include any desired extra reach here).
+    // Requires a completed advance. Does not mutate World. Invalid input or
+    // capacity overflow throws without publishing a partial result.
+    std::vector<SweptTrianglePair> CollectSweptTriangles(std::span<const SweptMesh>, double margin, uint32_t capacity) const;
+
 
     // Mark internal faces between stationary boxes or hulls with identical effective masks.
     // Every call recomputes welding over the bodies whose bounds touch, and stores masks on private shape copies.

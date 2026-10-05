@@ -475,3 +475,127 @@ TEST_CASE("cooking: primitive mass inertia and scale match solid integrals") {
     CHECK(capsule.InvInertiaLocal.x == doctest::Approx(capsule.InvInertiaLocal.z));
     CHECK(MassProperties(GroundPlane, 1000).InvMass == 0);
 }
+
+TEST_CASE_FIXTURE(OneWorld, "world: swept mesh BVH returns every triangle pair and preserves identity") {
+    std::vector<float3> points;
+    std::vector<uint32_t> indices;
+    for (uint32_t i = 0; i < 10; ++i) {
+        const uint32_t start = uint32_t(points.size());
+        const float x = 2.f * i;
+        points.push_back(float3{x, 0, 0}); points.push_back(float3{x + 1, 0, 0}); points.push_back(float3{x, 0, 1});
+        indices.insert(indices.end(), {start, start + 1, start + 2});
+    }
+    const Index mesh = world.AddMesh(points, indices);
+    const Index a = world.AddBody({.Shape = mesh, .Density = 0, .GeometryActive = true});
+    const Index b = world.AddBody({.Pose = At(float3{0, 2, 0}), .Shape = mesh, .Density = 0});
+    REQUIRE(a != NoIndex); REQUIRE(b != NoIndex);
+    const Shape shape = world.Shapes[mesh];
+    REQUIRE(shape.NodeCount > 1);
+    std::vector<SweptBounds> ba(shape.VertexCount), bb(shape.VertexCount);
+    for (uint32_t i = 0; i < shape.VertexCount; ++i) {
+        const auto v = world.ShapeVertices[shape.FirstVertex + i];
+        ba[i] = {{v.x, 0, v.z}, {v.x, 0, v.z}};
+        // Endpoints y=2 are clear; the caller's conservative motion envelope
+        // contains an interior excursion to y=-1. No endpoint sampling here.
+        bb[i] = {{v.x + .25, -1, v.z}, {v.x + .25, 2, v.z}};
+    }
+    std::vector<SweptMesh> inputs{{world.IdOf(a), mesh, NoIndex, ba}, {world.IdOf(b), mesh, NoIndex, bb}};
+    const auto before = world.BvhNodes[shape.RootNode];
+    const auto pairs = world.CollectSweptTriangles(inputs, 0, 100);
+    REQUIRE(pairs.size() == 10);
+    for (const auto &pair : pairs) {
+        CHECK(pair.A == world.IdOf(a)); CHECK(pair.B == world.IdOf(b));
+        CHECK(pair.ShapeA == mesh); CHECK(pair.ShapeB == mesh);
+        CHECK(pair.ChildA == NoIndex); CHECK(pair.ChildB == NoIndex);
+        CHECK(pair.TriangleA == pair.TriangleB);
+    }
+    std::reverse(inputs.begin(), inputs.end());
+    CHECK(world.CollectSweptTriangles(inputs, 0, 100) == pairs);
+    CHECK_THROWS_AS(world.CollectSweptTriangles(inputs, 0, 9), std::overflow_error);
+    CHECK(std::memcmp(&before, &world.BvhNodes[shape.RootNode], sizeof(before)) == 0);
+    CHECK(world.CollectSweptTriangles(inputs, 0, 100) == pairs);
+    for (auto &bound : bb) bound.Low[1] = bound.High[1] = 2;
+    CHECK(world.CollectSweptTriangles(inputs, 0, 100).empty());
+    CHECK(world.CollectSweptTriangles(inputs, 2, 100).size() >= 10);
+    bb[0].Low[0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(world.CollectSweptTriangles(inputs, 0, 100), std::invalid_argument);
+}
+
+TEST_CASE_FIXTURE(OneWorld, "world: swept mesh query honors leaf filters activity joints and generations") {
+    const Index mesh = AddQuadMesh(world);
+    const Index compound = world.AddCompound(std::vector<Index>{mesh, mesh});
+    REQUIRE(compound != NoIndex);
+    const Index a = world.AddBody({.Shape = compound, .Density = 0, .GeometryActive = true});
+    const Index b = world.AddBody({.Shape = mesh, .Density = 0});
+    REQUIRE(a != NoIndex); REQUIRE(b != NoIndex);
+    const SweptBounds broad{{-2, -2, -2}, {2, 2, 2}};
+    std::vector<SweptBounds> vertices(world.Shapes[mesh].VertexCount, broad);
+    std::vector<SweptMesh> inputs{{world.IdOf(a), world.Child(compound, 0), 0, vertices},
+        {world.IdOf(a), world.Child(compound, 1), 1, vertices}, {world.IdOf(b), mesh, NoIndex, vertices}};
+    const auto pairs = world.CollectSweptTriangles(inputs, 0, 32);
+    CHECK(pairs.size() == 8); // Four triangle pairs per leaf; never self-body pairs.
+    world.Shapes[world.Child(compound, 1)].HasFilter = true;
+    world.Shapes[world.Child(compound, 1)].Mask = {0, 0};
+    const auto filtered = world.CollectSweptTriangles(inputs, 0, 32);
+    REQUIRE(filtered.size() == 4);
+    for (const auto &pair : filtered) CHECK(pair.ChildA == 0);
+    REQUIRE(world.SetGeometryActive(a, false));
+    CHECK(world.CollectSweptTriangles(inputs, 0, 32).empty());
+    REQUIRE(world.SetGeometryActive(a, true));
+    const Index joint = world.AddJoint({.BodyA = a, .BodyB = b});
+    REQUIRE(joint != NoIndex);
+    CHECK(world.CollectSweptTriangles(inputs, 0, 32).empty());
+    REQUIRE(world.RemoveJoint(joint));
+    CHECK(world.CollectSweptTriangles(inputs, 0, 32) == filtered);
+    CHECK_THROWS_AS(world.CollectSweptTriangles(std::span(inputs).first(2), 0, 32), std::invalid_argument);
+    auto duplicate = inputs; duplicate.push_back(inputs.back());
+    CHECK_THROWS_AS(world.CollectSweptTriangles(duplicate, 0, 32), std::invalid_argument);
+    CHECK_THROWS_AS(world.CollectSweptTriangles(inputs, -1, 32), std::invalid_argument);
+    CHECK_THROWS_AS(world.CollectSweptTriangles(inputs, 0, 0), std::invalid_argument);
+    world.Filters[b].Sensor = true;
+    CHECK(world.CollectSweptTriangles(std::span(inputs).first(2), 0, 32).empty());
+    world.Filters[b].Sensor = false;
+    const auto old = world.IdOf(b);
+    REQUIRE(world.RemoveBody(b));
+    // Retirement intentionally delays slot recycling until reporting completes
+    // or dynamics are explicitly reset. Reclaim before exercising generation.
+    world.ResetDynamics();
+    const Index reused = world.AddBody({.Shape = mesh, .Density = 0});
+    REQUIRE(reused == b); CHECK(world.IdOf(reused) != old);
+    CHECK_THROWS_AS(world.CollectSweptTriangles(inputs, 0, 32), std::invalid_argument);
+    inputs.back().Body = world.IdOf(reused);
+    const auto refreshed = world.CollectSweptTriangles(inputs, 0, 32);
+    REQUIRE(refreshed.size() == filtered.size());
+    for (const auto &pair : refreshed) CHECK(pair.B == world.IdOf(reused));
+}
+
+TEST_CASE_FIXTURE(OneWorld, "world: swept interval axes reject disjoint coplanar triangles without hiding motion") {
+    const std::vector<float3> pa{float3{0, 0, 0}, float3{2, 0, 0}, float3{0, 0, 2}};
+    const std::vector<float3> pb{float3{2, 0, 2}, float3{2, 0, .5}, float3{.5, 0, 2}};
+    const std::vector<uint32_t> indices{0, 1, 2};
+    const Index sa = world.AddMesh(pa, indices), sb = world.AddMesh(pb, indices);
+    const Index a = world.AddBody({.Shape = sa, .Density = 0, .GeometryActive = true});
+    const Index b = world.AddBody({.Shape = sb, .Density = 0});
+    REQUIRE(a != NoIndex); REQUIRE(b != NoIndex);
+    const auto bounds = [&](Index shape) {
+        std::vector<SweptBounds> result;
+        const auto &s = world.Shapes[shape];
+        for (uint32_t i = 0; i < s.VertexCount; ++i) {
+            const auto p = world.ShapeVertices[s.FirstVertex + i];
+            result.push_back({{p.x, p.y, p.z}, {p.x, p.y, p.z}});
+        }
+        return result;
+    };
+    auto ba = bounds(sa), bb = bounds(sb);
+    const std::vector<SweptMesh> inputs{{world.IdOf(a), sa, NoIndex, ba}, {world.IdOf(b), sb, NoIndex, bb}};
+    // A has x+z<=2; B has x+z>=2.5, despite overlapping XYZ boxes.
+    CHECK(world.CollectSweptTriangles(inputs, 0, 1).empty());
+    CHECK(world.CollectSweptTriangles(inputs, .3, 1).empty());
+    CHECK(world.CollectSweptTriangles(inputs, .36, 1).size() == 1);
+    // Closed interval contains a translated touching configuration (x+z=2).
+    for (auto &v : bb) { v.Low[0] -= .25; v.Low[2] -= .25; }
+    CHECK(world.CollectSweptTriangles(inputs, 0, 1).size() == 1);
+    // Widen to an interior crossing, with initial/final triangles still clear.
+    for (auto &v : bb) { v.Low[0] -= .5; v.Low[2] -= .5; }
+    CHECK(world.CollectSweptTriangles(inputs, 0, 1).size() == 1);
+}

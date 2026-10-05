@@ -8,6 +8,7 @@
 #include <bit>
 #include <memory>
 #include <numbers>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -1190,6 +1191,186 @@ void World::OnStepped(float delta_time, const StepSnapshot &snapshot) {
     DrainContactEvents(delta_time, snapshot);
     // Delay body-slot reuse until completed reporting no longer refers to its previous occupant.
     ReclaimBodies();
+}
+
+
+std::vector<SweptTrianglePair> World::CollectSweptTriangles(std::span<const SweptMesh> input, double margin, uint32_t capacity) const {
+    if (!std::isfinite(margin) || margin < 0 || !capacity)
+        throw std::invalid_argument("Invalid swept geometry margin or capacity");
+    struct Mesh {
+        const SweptMesh *Input;
+        const Shape *Asset;
+        CollisionMask Mask;
+        std::vector<SweptBounds> Triangles, Nodes;
+    };
+    const auto merge = [](SweptBounds a, const SweptBounds &b) {
+        for (int k = 0; k < 3; ++k) { a.Low[k] = std::min(a.Low[k], b.Low[k]); a.High[k] = std::max(a.High[k], b.High[k]); }
+        return a;
+    };
+    const auto overlaps = [margin](const SweptBounds &a, const SweptBounds &b) {
+        // Outward round the comparison threshold, including zero-margin ties.
+        for (int k = 0; k < 3; ++k)
+            if (a.Low[k] > std::nextafter(b.High[k] + margin, INFINITY) ||
+                b.Low[k] > std::nextafter(a.High[k] + margin, INFINITY)) return false;
+        return true;
+    };
+    // A fixed separating direction certifies clearance even if the actual
+    // triangle normals vary during the interval. Centers only propose axes;
+    // rejection always projects the complete caller-supplied vertex boxes.
+    const auto separated_triangles = [&](const Mesh &a, uint32_t ta, const Mesh &b, uint32_t tb) {
+        using D3 = std::array<double, 3>;
+        std::array<SweptBounds, 3> av, bv;
+        std::array<D3, 3> ac, bc, ae, be;
+        const auto gather = [&](const Mesh &m, uint32_t t, auto &bounds, auto &centers) {
+            const auto &triangle = Triangles[m.Asset->FirstTriangle + t];
+            const Index corners[]{triangle.A, triangle.B, triangle.C};
+            for (int i = 0; i < 3; ++i) {
+                bounds[i] = m.Input->Vertices[corners[i] - m.Asset->FirstVertex];
+                for (int k = 0; k < 3; ++k) centers[i][k] = std::midpoint(bounds[i].Low[k], bounds[i].High[k]);
+            }
+        };
+        gather(a, ta, av, ac); gather(b, tb, bv, bc);
+        for (int i = 0; i < 3; ++i) for (int k = 0; k < 3; ++k) {
+            ae[i][k] = ac[(i + 1) % 3][k] - ac[i][k];
+            be[i][k] = bc[(i + 1) % 3][k] - bc[i][k];
+        }
+        const auto cross = [](D3 x, D3 y) -> D3 {
+            return {x[1]*y[2]-x[2]*y[1], x[2]*y[0]-x[0]*y[2], x[0]*y[1]-x[1]*y[0]};
+        };
+        const auto separated = [&](D3 axis) {
+            double maximum = 0;
+            for (double x : axis) { if (!std::isfinite(x)) return false; maximum = std::max(maximum, std::abs(x)); }
+            if (!(maximum > 0)) return false;
+            for (double &x : axis) x /= maximum;
+            const double norm = std::hypot(axis[0], axis[1], axis[2]);
+            const auto project = [&](const auto &vertices) {
+                std::array<double, 2> range{INFINITY, -INFINITY};
+                for (const auto &v : vertices) {
+                    double low = 0, high = 0, magnitude = 0;
+                    for (int k = 0; k < 3; ++k) {
+                        const double x = axis[k]*v.Low[k], y = axis[k]*v.High[k];
+                        low += std::min(x, y); high += std::max(x, y);
+                        magnitude += std::max(std::abs(x), std::abs(y));
+                    }
+                    const double error = 32*std::numeric_limits<double>::epsilon()*magnitude +
+                        16*std::numeric_limits<double>::denorm_min();
+                    if (!std::isfinite(low) || !std::isfinite(high) || !std::isfinite(error))
+                        return std::array<double, 2>{-INFINITY, INFINITY};
+                    range[0] = std::min(range[0], std::nextafter(low-error, -INFINITY));
+                    range[1] = std::max(range[1], std::nextafter(high+error, INFINITY));
+                }
+                return range;
+            };
+            const auto pa = project(av), pb = project(bv);
+            const double reach = std::nextafter(margin*norm*(1+8*std::numeric_limits<double>::epsilon()), INFINITY);
+            return pa[0] > std::nextafter(pb[1]+reach, INFINITY) || pb[0] > std::nextafter(pa[1]+reach, INFINITY);
+        };
+        const D3 an = cross(ae[0], ae[1]), bn = cross(be[0], be[1]);
+        if (separated(an) || separated(bn)) return true;
+        for (int i = 0; i < 3; ++i) {
+            if (separated(cross(an, ae[i])) || separated(cross(an, be[i])) ||
+                separated(cross(bn, ae[i])) || separated(cross(bn, be[i]))) return true;
+            for (int j = 0; j < 3; ++j) if (separated(cross(ae[i], be[j]))) return true;
+        }
+        return false;
+    };
+    std::vector<Mesh> meshes;
+    std::vector<bool> used(input.size());
+    for (Index body = 0; body < BodyCount(); ++body) {
+        if (!Alive(body) || Filters[body].Sensor) continue;
+        const Index root_index = BodyShapes[body];
+        if (root_index == NoIndex) continue;
+        if (root_index >= ShapeCount()) throw std::invalid_argument("Invalid swept body shape");
+        const Shape &root = Shapes[root_index];
+        const CollisionMask inherited = ResolveFilter(root, {Filters[body].Layer, Filters[body].Collides});
+        const uint32_t leaves = root.Kind == ShapeCompound ? root.VertexCount : 1;
+        for (uint32_t leaf = 0; leaf < leaves; ++leaf) {
+            const uint32_t child = root.Kind == ShapeCompound ? leaf : NoIndex;
+            const Index shape_index = child == NoIndex ? root_index : Child(root_index, leaf);
+            if (shape_index >= ShapeCount()) throw std::invalid_argument("Invalid swept mesh leaf");
+            const Shape &shape = Shapes[shape_index];
+            if (shape.Kind != ShapeMesh) throw std::invalid_argument("Swept geometry supports mesh leaves only");
+            std::size_t found = input.size();
+            for (std::size_t i = 0; i < input.size(); ++i)
+                if (input[i].Body == IdOf(body) && input[i].Shape == shape_index && input[i].Child == child) {
+                    if (found != input.size()) throw std::invalid_argument("Duplicate swept mesh leaf");
+                    found = i;
+                }
+            if (found == input.size()) throw std::invalid_argument("Missing swept mesh leaf or stale body generation");
+            used[found] = true;
+            const auto &request = input[found];
+            if (!shape.VertexCount || !shape.TriangleCount || !shape.NodeCount ||
+                request.Vertices.size() != shape.VertexCount ||
+                uint64_t(shape.FirstVertex) + shape.VertexCount > ShapeVertices.Capacity ||
+                uint64_t(shape.FirstTriangle) + shape.TriangleCount > Triangles.Capacity ||
+                uint64_t(shape.RootNode) + shape.NodeCount > BvhNodes.Capacity)
+                throw std::invalid_argument("Invalid swept mesh storage ranges");
+            for (const auto &bound : request.Vertices)
+                for (int k = 0; k < 3; ++k)
+                    if (!std::isfinite(bound.Low[k]) || !std::isfinite(bound.High[k]) || bound.Low[k] > bound.High[k])
+                        throw std::invalid_argument("Invalid swept vertex bounds");
+            Mesh mesh{&request, &shape, ResolveFilter(shape, inherited), {}, {}};
+            mesh.Triangles.resize(shape.TriangleCount); mesh.Nodes.resize(shape.NodeCount);
+            for (uint32_t t = 0; t < shape.TriangleCount; ++t) {
+                const auto &triangle = Triangles[shape.FirstTriangle + t];
+                bool first = true;
+                for (Index corner : {triangle.A, triangle.B, triangle.C}) {
+                    if (corner < shape.FirstVertex || uint64_t(corner) - shape.FirstVertex >= shape.VertexCount)
+                        throw std::invalid_argument("Invalid swept mesh triangle");
+                    const auto &bound = request.Vertices[corner - shape.FirstVertex];
+                    mesh.Triangles[t] = first ? bound : merge(mesh.Triangles[t], bound); first = false;
+                }
+            }
+            std::vector<uint8_t> covered(shape.TriangleCount);
+            const auto visit = [&](auto &&self, uint32_t node, uint32_t depth) -> uint64_t {
+                if (node >= shape.NodeCount || depth >= 32) throw std::invalid_argument("Invalid swept mesh BVH topology");
+                const auto &n = BvhNodes[shape.RootNode + node];
+                if (n.Count) {
+                    if (n.Count > 4 || uint64_t(n.First) + n.Count > shape.TriangleCount)
+                        throw std::invalid_argument("Invalid swept mesh BVH leaf");
+                    for (uint32_t t = n.First; t < n.First + n.Count; ++t) {
+                        if (covered[t]++) throw std::invalid_argument("Repeated swept mesh BVH triangle");
+                        mesh.Nodes[node] = t == n.First ? mesh.Triangles[t] : merge(mesh.Nodes[node], mesh.Triangles[t]);
+                    }
+                    return uint64_t(node) + 1;
+                }
+                if (n.First <= uint64_t(node) + 1 || n.First >= shape.NodeCount || self(self, node + 1, depth + 1) != n.First)
+                    throw std::invalid_argument("Invalid swept mesh BVH branch");
+                const uint64_t end = self(self, n.First, depth + 1);
+                mesh.Nodes[node] = merge(mesh.Nodes[node + 1], mesh.Nodes[n.First]);
+                return end;
+            };
+            if (visit(visit, 0, 0) != shape.NodeCount || !std::ranges::all_of(covered, [](uint8_t x) { return x == 1; }))
+                throw std::invalid_argument("Incomplete swept mesh BVH");
+            meshes.push_back(std::move(mesh));
+        }
+    }
+    if (!std::ranges::all_of(used, [](bool x) { return x; })) throw std::invalid_argument("Unknown or excluded swept mesh registration");
+    std::vector<SweptTrianglePair> result;
+    for (std::size_t a = 0; a < meshes.size(); ++a) for (std::size_t b = a + 1; b < meshes.size(); ++b) {
+        const auto &ma = meshes[a], &mb = meshes[b];
+        const Index ia = ma.Input->Body.Slot, ib = mb.Input->Body.Slot;
+        if (ia == ib || !Allows(ma.Mask, mb.Mask) ||
+            (!(Moves(Masses[ia]) || Filters[ia].GeometryActive) && !(Moves(Masses[ib]) || Filters[ib].GeometryActive))) continue;
+        bool jointed = false;
+        for (uint32_t j = Jointed[ia]; j < Jointed[ia + 1]; ++j) jointed |= Jointed[j] == ib;
+        if (jointed) continue;
+        const auto walk = [&](auto &&self, uint32_t na, uint32_t nb) -> void {
+            if (!overlaps(ma.Nodes[na], mb.Nodes[nb])) return;
+            const auto &an = BvhNodes[ma.Asset->RootNode + na], &bn = BvhNodes[mb.Asset->RootNode + nb];
+            if (an.Count && bn.Count) {
+                for (uint32_t ta = an.First; ta < an.First + an.Count; ++ta)
+                    for (uint32_t tb = bn.First; tb < bn.First + bn.Count; ++tb) if (overlaps(ma.Triangles[ta], mb.Triangles[tb]) && !separated_triangles(ma, ta, mb, tb)) {
+                        if (result.size() == capacity) throw std::overflow_error("Swept triangle pair capacity exceeded");
+                        result.push_back({ma.Input->Body, mb.Input->Body, ma.Input->Shape, mb.Input->Shape,
+                            ma.Input->Child, mb.Input->Child, ma.Asset->FirstTriangle + ta, mb.Asset->FirstTriangle + tb});
+                    }
+            } else if (!an.Count) { self(self, na + 1, nb); self(self, an.First, nb); }
+            else { self(self, na, nb + 1); self(self, na, bn.First); }
+        };
+        walk(walk, 0, 0);
+    }
+    return result;
 }
 
 } // namespace rbp
