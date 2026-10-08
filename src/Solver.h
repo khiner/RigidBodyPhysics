@@ -7,6 +7,7 @@
 
 #include <array>
 #include <functional>
+#include <memory>
 
 namespace rbp {
 
@@ -59,6 +60,64 @@ struct Solver {
         uint64_t ContactsAddress, CountAddress;
         uint32_t Capacity;
     };
+    // Staged geometry follows the unchanged cooked pool indexing. The caller
+    // supplies a consistent vertex/triangle-edge/BVH tuple, or requests GPU
+    // refitting of the prepared meshes during Encode. World is never changed.
+    // Buffers may be GPU-produced.
+    struct GeometryView {
+        mtl::Buffer<Pose> Poses;
+        mtl::Buffer<Velocity> Velocities;
+        mtl::Buffer<float3> Vertices;
+        mtl::Buffer<Triangle> Triangles;
+        mtl::Buffer<BvhNode> Nodes;
+    };
+    class GeometryEpoch {
+        struct Impl;
+        std::unique_ptr<Impl> Data;
+        explicit GeometryEpoch(std::unique_ptr<Impl>);
+        friend struct Solver;
+    public:
+        struct Output {
+            uint64_t ContactsAddress, CountAddress, StatusAddress, BodyIdsAddress;
+            uint64_t Epoch, Trial;
+            uint32_t Capacity, BodyCount;
+        };
+        GeometryEpoch(GeometryEpoch &&) noexcept;
+        GeometryEpoch &operator=(GeometryEpoch &&) noexcept;
+        ~GeometryEpoch();
+        // Each slot is encoded at most once. Consume/copy contact scratch on
+        // GPU before encoding the next query; per-query status/count persists.
+        // Bind every used slot before the first Encode; no residency changes
+        // are permitted once command recording starts.
+        void SetView(uint32_t slot, const GeometryView &);
+        // No submission, host readback, world publication or buffer allocation.
+        // Caller binds ResidencySet() on its command buffer before execution.
+        // refit=true refreshes the selected fixed-topology meshes from the
+        // staged vertices entirely on GPU. Invalid geometry sets status bit4,
+        // preserves flags/BVH and suppresses subsequent collision work.
+        Output Encode(MTL4::ComputeCommandEncoder *, uint32_t slot, uint64_t trial, bool refit = false);
+        MTL::ResidencySet *ResidencySet() const;
+        // Private Metal buffer bytes only; excludes borrowed model/view buffers,
+        // argument-table/driver storage and host metadata.
+        uint64_t StorageBytes() const;
+        uint32_t EncodedQueries() const;
+        std::span<const BodyId> BodyIds() const;
+        // Boundary diagnostics only: the caller must have observed command
+        // completion. These never submit/wait and are not an interior GPU API.
+        GeometryQueryStatus StatusAfterCompletion(uint32_t slot) const;
+        std::span<const GeometryContact> ContactsAfterCompletion() const;
+        // Caller certifies all encoded work has completed (or was discarded
+        // without submission). Retain allocations/views, invalidate old outputs.
+        void ResetAfterCompletion();
+    };
+    // Preparation allocates bounded private collision storage and captures
+    // immutable model handles/generational identities. World topology, filters,
+    // materials and model data must remain unchanged for the epoch lifetime;
+    // Solver and World must outlive it. All submitted use must complete before
+    // epoch destruction. Staged input buffers are retained through destruction.
+    GeometryEpoch PrepareGeometryEpoch(const World &, const StepSettings &,
+        uint32_t contact_capacity, uint32_t maximum_queries, uint64_t epoch,
+        std::span<const Index> refit_shapes = {});
     // Encode collision into a caller-owned command buffer. The caller must
     // complete that buffer before FinishGeometry; the returned GPU addresses
     // remain owned by this solver until then.
@@ -96,6 +155,14 @@ private:
     void PrepareFollowers(World &, std::span<const SensorFollower>);
     void Bind(World &, uint32_t parameter);
     void PrepareQueries(World &, uint32_t collider_features);
+    struct CollisionBuffers {
+        uint64_t Bounds, BoundsReductions, BroadPhaseNodes, BroadPhaseKeys, BroadPhaseScratch;
+        uint64_t Iterates, PreviousVelocities, IncomingSlots, Materials, NextColors, ContactEventCounts;
+        uint64_t QueryScratch, QueryInputSnapshot, QueryInputs, ColorCursor;
+    };
+    CollisionBuffers CollisionStorage(const World &, bool sensor = false) const;
+    void EncodeCollision(MTL4::ComputeCommandEncoder *, const Recording &, const CollisionBuffers &, MTL4::ArgumentTable *, const StepParams &);
+    void EncodeCollect(MTL4::ComputeCommandEncoder *, const Recording &, const CollisionBuffers &, MTL4::ArgumentTable *, const StepParams &, bool sensor);
     void EncodeCollision(MTL4::ComputeCommandEncoder *, const Recording &, World &);
     void EncodeCollect(MTL4::ComputeCommandEncoder *, const Recording &, World &, bool sensor);
     void Encode(MTL4::ComputeCommandEncoder *, const Recording &, World &);

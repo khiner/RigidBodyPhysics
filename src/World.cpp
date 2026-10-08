@@ -498,10 +498,12 @@ void World::EndContacts(std::span<const uint8_t> removed, std::span<const Index>
     }
 }
 
-void World::RefreshFilters() {
+void World::RefreshFilters() { RefreshFilters(Filters.All()); }
+
+void World::RefreshFilters(std::span<Filter> resolved) const {
     for (Index body = 0; body < NumBodies; ++body) {
         if (!Alive(body)) continue;
-        Filter &filter = Filters[body];
+        Filter &filter = resolved[body];
         filter.Aggregate = {filter.Layer, filter.Collides};
         filter.Mixed = 0;
         const Index index = BodyShapes[body];

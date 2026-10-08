@@ -63,7 +63,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     entries = json.loads((args.source / "Pipelines.json").read_text())
-    sources = {name: (args.source / (name + ".metal")).read_text() for name in ["Solve", "BroadPhase", "SolveCommands", "Ji", "JiScene"]}
+    sources = {name: (args.source / (name + ".metal")).read_text() for name in ["Solve", "BroadPhase", "MeshRefit", "SolveCommands", "Ji", "JiScene"]}
     sources["FullStep"] = generate(args.source, args.compiler)
     sources["SolveCommands"] = (args.source / "SolveCommandData.h").read_text() + sources["SolveCommands"]
     sources["Ji"] = (args.source / "JiData.h").read_text() + sources["Ji"]

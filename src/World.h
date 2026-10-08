@@ -366,6 +366,7 @@ private:
     friend struct Solver;
     void EnsureSensorBuffers();
     void RefreshFilters();
+    void RefreshFilters(std::span<Filter>) const;
     // Variable-length geometry runs with reusable gaps.
     struct RunPool {
         struct Run {

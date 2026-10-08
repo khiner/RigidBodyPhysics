@@ -1,4 +1,10 @@
 [
+  {"pass_name": "MeshRefitValidatePass", "kernel": "MeshRefitValidate", "source": "MeshRefit", "safe_math": true},
+  {"pass_name": "MeshRefitLeavesPass", "kernel": "MeshRefitLeaves", "source": "MeshRefit", "safe_math": true},
+  {"pass_name": "MeshRefitLevelPass", "kernel": "MeshRefitLevel", "source": "MeshRefit", "safe_math": true},
+  {"pass_name": "MeshRefitCommitPass", "kernel": "MeshRefitCommit", "source": "MeshRefit", "safe_math": true},
+  {"pass_name": "ResetGeometryOutputPass", "kernel": "ResetGeometryOutput", "source": "Solve"},
+  {"pass_name": "FinishGeometryOutputPass", "kernel": "FinishGeometryOutput", "source": "Solve"},
   {"pass_name": "ReduceBoundsPass", "kernel": "ReduceBodyBounds", "source": "BroadPhase"},
   {"pass_name": "ReduceScenePass", "kernel": "ReduceSceneBounds", "source": "BroadPhase"},
   {"pass_name": "MortonPass", "kernel": "MakeMortonKeys", "source": "BroadPhase"},

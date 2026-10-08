@@ -8,10 +8,10 @@
 namespace rbp {
 
 namespace {
-constexpr uint32_t LeafSize = 4;
+constexpr uint32_t LeafSize = MeshLeafSize;
 
 // Treat folds below one degree as coplanar to suppress contacts on tessellation edges.
-constexpr float ActiveEdgeSine = 0.0175f;
+constexpr float ActiveEdgeSine = MeshActiveEdgeSine;
 
 float3 Normal(std::span<const float3> points, const Triangle &triangle) {
     const float3 turn = cross(points[triangle.B] - points[triangle.A], points[triangle.C] - points[triangle.A]);

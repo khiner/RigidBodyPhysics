@@ -22,6 +22,7 @@ kernel void ReduceBodyBounds(
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     threadgroup float3 lows[RadixBlockSize], highs[RadixBlockSize];
     BodyBounds value{float3(INFINITY), float3(-INFINITY)};
     if (body < p.BodyCount && FiniteBounds(bounds[body])) value = bounds[body];
@@ -32,6 +33,7 @@ kernel void ReduceBodyBounds(
 kernel void ReduceSceneBounds(
     device BodyBounds *reductions [[buffer(13)]], constant StepParams &p [[buffer(7)]], uint lane [[thread_index_in_threadgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     const uint blocks = RadixBlocks(p.BodyCount);
     float3 low = INFINITY, high = -INFINITY;
     for (uint i = lane; i < blocks; i += RadixBlockSize) {
@@ -71,6 +73,7 @@ kernel void MakeMortonKeys(
     device MortonKey *keys [[buffer(11)]], device BroadPhaseNode *nodes [[buffer(10)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     if (body >= p.BodyCount) return;
     keys[body] = MakeKey(bounds[body], reductions[RadixBlocks(p.BodyCount)], body);
     InitTreeLeaf(nodes, bounds[body], p.BodyCount, body);
@@ -83,6 +86,7 @@ kernel void RadixHistogram(
     uint body [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     threadgroup uint histogram[RadixWaves * RadixBins];
     for (uint i = tid; i < RadixWaves * RadixBins; i += RadixBlockSize) histogram[i] = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -110,6 +114,7 @@ kernel void RadixOffsets(
     device uint *scratch [[buffer(9)]], constant StepParams &p [[buffer(7)]],
     uint digit [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     const uint blocks = RadixBlocks(p.BodyCount);
     device uint *histogram = scratch + p.BodyCount;
     uint total = 0;
@@ -132,6 +137,7 @@ kernel void RadixScatter(
     device const uint *scratch [[buffer(9)]], constant uint &digit_index [[buffer(25)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     if (body >= p.BodyCount) return;
     const MortonKey key = input[body];
     const uint digit = (key.Code >> (8 * digit_index)) & 255u;
@@ -176,7 +182,8 @@ static void BuildTreeNode(device const MortonKey *keys, device BroadPhaseNode *n
 kernel void BuildRadixTree(
     device const MortonKey *keys [[buffer(11)]], device BroadPhaseNode *nodes [[buffer(13)]],
     constant StepParams &p [[buffer(7)]], uint index [[thread_position_in_grid]]
-) { BuildTreeNode(keys, nodes, p.BodyCount, index); }
+) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return; BuildTreeNode(keys, nodes, p.BodyCount, index); }
 
 static uint CandidateMask(device const BodyBounds *bounds, uint bodies, uint body) {
     uint mask = 0;
@@ -189,6 +196,7 @@ kernel void RefreshRadixLeaves(
     device const BodyBounds *bounds [[buffer(14)]], device BroadPhaseNode *nodes [[buffer(13)]],
     constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     if (body >= p.BodyCount) return;
     nodes[body].Bounds = bounds[body];
     if (p.BodyCount <= RadixSimdWidth) nodes[body].Candidates = CandidateMask(bounds, p.BodyCount, body);
@@ -222,13 +230,15 @@ static void RefitTreeLeaf(device BroadPhaseNode *nodes, uint bodies, uint body) 
 
 kernel void RefitRadixTree(
     device BroadPhaseNode *nodes [[buffer(13)]], constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]
-) { RefitTreeLeaf(nodes, p.BodyCount, body); }
+) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return; RefitTreeLeaf(nodes, p.BodyCount, body); }
 
 kernel void BuildSmallBroadPhase(
     device const BodyBounds *bounds [[buffer(14)]], device MortonKey *keys [[buffer(11)]],
     device BroadPhaseNode *nodes [[buffer(13)]], constant StepParams &p [[buffer(7)]],
     uint tid [[thread_index_in_threadgroup]], uint3 group_size [[threads_per_threadgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     // A world fitting one SIMD group stores its ordered candidate set in one word.
     if (p.BodyCount <= RadixSimdWidth) {
         if (tid < p.BodyCount) {

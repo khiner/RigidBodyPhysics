@@ -1,4 +1,5 @@
 #include "Solver.h"
+#include "Mesh.h"
 #include "metal/AutoreleasePool.h"
 
 #include <algorithm>
@@ -6,6 +7,8 @@
 #include <cstring>
 #include <exception>
 #include <numeric>
+#include <map>
+#include <set>
 #include <semaphore>
 #include <string>
 
@@ -264,6 +267,325 @@ void Solver::PrepareQueries(World &world, uint32_t collider_features) {
     // Geometry is immutable until this call returns, including across submissions.
     reinterpret_cast<QueryArenaHeader *>(QueryScratch.Data())->GeometryChecked = 0;
     if (residency_changed) Residency->commit();
+}
+
+struct Solver::GeometryEpoch::Impl {
+    Solver *Owner;
+    const World *Source;
+    uint64_t Epoch, Bytes = 0;
+    uint32_t Bodies, Shapes, Joints, Features, Capacity, Encoded = 0;
+    uint32_t VertexCapacity, TriangleCapacity, NodeCapacity;
+    bool Failed = false;
+    mtl::Buffer<BodyBounds> Bounds, Reductions;
+    mtl::Buffer<BroadPhaseNode> Nodes;
+    mtl::Buffer<MortonKey> Keys;
+    mtl::Buffer<uint32_t> Scratch, QueryScratch, QuerySnapshot, Counts, Digits, Refusals;
+    mtl::Buffer<QueryInputSpec> QueryInputs;
+    mtl::Buffer<StepParams> Parameters;
+    mtl::Buffer<GeometryContact> Contacts;
+    mtl::Buffer<GeometryQueryStatus> Status;
+    mtl::Buffer<BodyId> Ids;
+    mtl::Buffer<MeshRefitTriangle> RefitTriangles;
+    mtl::Buffer<MeshRefitNode> RefitNodes;
+    mtl::Buffer<uint32_t> RefitVertices, RefitFarVertices, RefitDepths;
+    mtl::Buffer<MeshRefitCounts> RefitCounts;
+    mtl::Buffer<float3> RefitNormals;
+    mtl::Buffer<std::array<uint32_t,2>> RefitFlags;
+    mtl::Buffer<BodyBounds> RefitBounds;
+    uint32_t RefitMaximumDepth = 0;
+    mtl::Buffer<Filter> Filters;
+    std::array<uint64_t, BindingCount> Bindings{};
+    std::array<NS::SharedPtr<MTL::Buffer>, BindingCount> ModelBuffers;
+    std::vector<GeometryView> Views;
+    std::vector<uint8_t> Bound, Live;
+    std::vector<Index> Roots;
+    std::vector<NS::SharedPtr<MTL4::ArgumentTable>> Tables;
+    NS::SharedPtr<MTL::ResidencySet> Residency;
+
+    Impl(Solver &owner, const World &world, uint32_t capacity, uint32_t queries, uint64_t epoch)
+        : Owner(&owner), Source(&world), Epoch(epoch), Bodies(world.BodyCount()), Shapes(world.ShapeCount()), Joints(world.JointCount()),
+          Features(ColliderFeatures(world)), Capacity(capacity),
+          VertexCapacity(world.ShapeVertices.Capacity), TriangleCapacity(world.Triangles.Capacity), NodeCapacity(world.BvhNodes.Capacity),
+          Views(queries), Bound(queries), Live(Bodies), Roots(Bodies), Tables(queries) {}
+    void CheckWorld() const {
+        if (Source->BodyCount() != Bodies || Source->ShapeCount() != Shapes || Source->JointCount() != Joints)
+            throw std::logic_error("Geometry epoch topology changed");
+        for (uint32_t i = 0; i < Bodies; ++i)
+            if (Source->IdOf(i) != Ids[i] || Source->Alive(i) != bool(Live[i]) || Source->BodyShapes[i] != Roots[i])
+                throw std::logic_error("Geometry epoch body generation or shape changed");
+    }
+    CollisionBuffers Storage() const {
+        const auto address = [](const auto &b) { return b.Handle ? b.Address() : uint64_t(0); };
+        return {Bounds.Address(), Reductions.Address(), Nodes.Address(), Keys.Address(), Scratch.Address(),
+            Bindings[11], Bindings[9], Bindings[18], Bindings[10], Bindings[13], Bindings[25],
+            address(QueryScratch), address(QuerySnapshot), address(QueryInputs), Digits.Address()};
+    }
+};
+
+Solver::GeometryEpoch::GeometryEpoch(std::unique_ptr<Impl> data) : Data(std::move(data)) {}
+Solver::GeometryEpoch::GeometryEpoch(GeometryEpoch &&) noexcept = default;
+Solver::GeometryEpoch &Solver::GeometryEpoch::operator=(GeometryEpoch &&) noexcept = default;
+Solver::GeometryEpoch::~GeometryEpoch() = default;
+MTL::ResidencySet *Solver::GeometryEpoch::ResidencySet() const { return Data ? Data->Residency.get() : nullptr; }
+uint64_t Solver::GeometryEpoch::StorageBytes() const { return Data ? Data->Bytes : 0; }
+uint32_t Solver::GeometryEpoch::EncodedQueries() const { return Data ? Data->Encoded : 0; }
+std::span<const BodyId> Solver::GeometryEpoch::BodyIds() const { return Data ? std::span<const BodyId>(Data->Ids.All()) : std::span<const BodyId>{}; }
+
+GeometryQueryStatus Solver::GeometryEpoch::StatusAfterCompletion(uint32_t slot) const {
+    if (!Data || slot >= Data->Encoded) throw std::out_of_range("Geometry status slot is not encoded");
+    const auto result = Data->Status[slot];
+    if (!result.Complete) throw std::logic_error("Geometry query has not completed");
+    return result;
+}
+std::span<const GeometryContact> Solver::GeometryEpoch::ContactsAfterCompletion() const {
+    if (!Data || !Data->Encoded) throw std::logic_error("Geometry epoch has no query");
+    const auto status = StatusAfterCompletion(Data->Encoded - 1);
+    if (status.Errors || status.Count > Data->Capacity) throw std::runtime_error("Geometry query failed; no contacts published");
+    return Data->Contacts.All().first(status.Count);
+}
+void Solver::GeometryEpoch::ResetAfterCompletion() {
+    if (!Data) throw std::logic_error("Moved geometry epoch");
+    Data->CheckWorld();
+    Data->Encoded = 0; Data->Failed = false;
+}
+
+Solver::GeometryEpoch Solver::PrepareGeometryEpoch(const World &world, const StepSettings &settings,
+        uint32_t capacity, uint32_t maximum_queries, uint64_t epoch, std::span<const Index> refit_shapes) {
+    const mtl::AutoreleasePool pool;
+    if (Advancing || !world.BodyCount() || !capacity || !maximum_queries || !epoch)
+        throw std::invalid_argument("Geometry epoch needs an idle solver and nonzero capacities/identity");
+    if (world.Queue.get() != Context.Queue.get()) throw std::invalid_argument("Geometry epoch requires the shared queue");
+    auto data = std::make_unique<GeometryEpoch::Impl>(*this, world, capacity, maximum_queries, epoch);
+    NS::Error *error{};
+    data->Residency = NS::TransferPtr(Context.Device->newResidencySet(mtl::Make<MTL::ResidencySetDescriptor>().get(), &error));
+    if (!data->Residency) throw std::runtime_error("Geometry epoch residency allocation failed");
+    const auto make = [&](auto &buffer, uint64_t count) {
+        if (!count || count > UINT32_MAX) throw std::length_error("Geometry epoch capacity overflow");
+        buffer = {Context.Device.get(), uint32_t(count)};
+        if (!buffer.Handle) throw std::bad_alloc();
+        data->Bytes += buffer.Handle->length();
+        data->Residency->addAllocation(buffer.Handle.get());
+    };
+    const uint32_t bodies = data->Bodies;
+    make(data->Bounds, bodies); make(data->Reductions, RadixBlocks(bodies) + 1);
+    make(data->Nodes, uint64_t(2) * bodies); make(data->Keys, uint64_t(2) * bodies);
+    make(data->Scratch, uint64_t(bodies) + uint64_t(RadixBlocks(bodies)) * RadixBins);
+    make(data->Contacts, capacity); make(data->Counts, maximum_queries); make(data->Status, maximum_queries);
+    make(data->Ids, bodies); make(data->Filters, bodies); make(data->Refusals, bodies); make(data->Parameters, maximum_queries); make(data->Digits, 4);
+    for (uint32_t i = 0; i < bodies; ++i) { data->Ids[i] = world.IdOf(i); data->Filters[i] = world.Filters[i]; data->Live[i] = world.Alive(i); data->Roots[i] = world.BodyShapes[i]; }
+    world.RefreshFilters(data->Filters.All());
+    for (uint32_t i = 0; i < 4; ++i) data->Digits[i] = i;
+    std::fill(data->Status.All().begin(), data->Status.All().end(), GeometryQueryStatus{});
+    std::fill(data->Counts.All().begin(), data->Counts.All().end(), 0u);
+    data->Parameters[0] = {.Gravity = settings.Gravity, .DeltaTime = settings.DeltaTime,
+        .ContactMargin = settings.ContactMargin, .MaxContactReach = settings.MaxContactReach,
+        .BodyCount = bodies, .JointCount = world.JointCount(),
+        .QueuedQueries = bool(data->Features & MeshQueries) && QueuedQueriesFit(bodies),
+        .GeometryOnly = 1, .GeometryCapacity = capacity};
+    for (uint32_t i = 0; i < maximum_queries; ++i) {
+        data->Parameters[i] = data->Parameters[0];
+        data->Parameters[i].GeometryStatusAddress = data->Status.Address()+uint64_t(i)*sizeof(GeometryQueryStatus);
+    }
+    if (!refit_shapes.empty()) {
+        std::vector<MeshRefitTriangle> triangle_map;
+        std::vector<MeshRefitNode> node_map;
+        std::vector<uint32_t> vertex_map, far_vertices;
+        std::set<Index> selected_shapes, selected_vertices, selected_triangles, selected_nodes;
+        for (const Index index : refit_shapes) {
+            if (index >= world.ShapeCount() || !world.LiveShapes[index] || !selected_shapes.insert(index).second)
+                throw std::invalid_argument("Refit selection requires unique live mesh shapes");
+            const Shape &shape = world.Shapes[index];
+            if (shape.Kind != ShapeMesh || uint64_t(shape.FirstVertex)+shape.VertexCount > world.ShapeVertices.Capacity ||
+                uint64_t(shape.FirstTriangle)+shape.TriangleCount > world.Triangles.Capacity ||
+                uint64_t(shape.RootNode)+shape.NodeCount > world.BvhNodes.Capacity)
+                throw std::invalid_argument("Invalid geometry epoch refit ranges");
+            const auto points = world.ShapeVertices.All().subspan(shape.FirstVertex,shape.VertexCount);
+            const auto source_triangles = world.Triangles.All().subspan(shape.FirstTriangle,shape.TriangleCount);
+            const auto source_nodes = world.BvhNodes.All().subspan(shape.RootNode,shape.NodeCount);
+            std::vector<Triangle> local(source_triangles.begin(),source_triangles.end());
+            std::vector<BvhNode> checked_nodes(source_nodes.begin(),source_nodes.end());
+            for (auto &t : local) {
+                for (Index *v : {&t.A,&t.B,&t.C}) {
+                    if (*v < shape.FirstVertex || *v-shape.FirstVertex >= shape.VertexCount)
+                        throw std::invalid_argument("Invalid refit triangle vertex");
+                    *v -= shape.FirstVertex;
+                }
+            }
+            // Use the authoritative CPU validator at immutable-epoch creation,
+            // never as a per-query geometry update or numerical fallback.
+            if (!RefitMesh(points,local,checked_nodes)) throw std::invalid_argument("Invalid cooked refit topology");
+            for (uint32_t v=0;v<shape.VertexCount;++v) {
+                const Index at=shape.FirstVertex+v;
+                if (!selected_vertices.insert(at).second) throw std::invalid_argument("Overlapping refit mesh vertex runs");
+                vertex_map.push_back(at);
+            }
+            std::map<std::pair<Index,Index>,std::vector<uint32_t>> edges;
+            for (uint32_t t=0;t<shape.TriangleCount;++t) {
+                const auto &x=source_triangles[t];const Index c[]{x.A,x.B,x.C};
+                for(uint32_t e=0;e<3;++e)edges[{std::min(c[e],c[(e+1)%3]),std::max(c[e],c[(e+1)%3])}].push_back(t);
+            }
+            for (uint32_t t=0;t<shape.TriangleCount;++t) {
+                MeshRefitTriangle out{};out.Original=source_triangles[t];out.Index=shape.FirstTriangle+t;
+                if (!selected_triangles.insert(out.Index).second) throw std::invalid_argument("Overlapping refit triangle runs");
+                const Index c[]{out.Original.A,out.Original.B,out.Original.C};
+                for(uint32_t e=0;e<3;++e) {
+                    const Index from=c[e],to=c[(e+1)%3];const auto &shared=edges.at({std::min(from,to),std::max(from,to)});
+                    if (far_vertices.size()>UINT32_MAX || shared.size()>UINT32_MAX) throw std::length_error("Refit incidence exceeds device indices");
+                    out.EdgeOffset[e]=uint32_t(far_vertices.size());out.SharedCount[e]=uint32_t(shared.size());
+                    for(const uint32_t other:shared)if(other!=t) {
+                        const auto &neighbor=source_triangles[other];
+                        for(const Index far:{neighbor.A,neighbor.B,neighbor.C})if(far!=from&&far!=to)far_vertices.push_back(far);
+                    }
+                    if (far_vertices.size()>UINT32_MAX) throw std::length_error("Refit incidence exceeds device indices");
+                    out.EdgeCount[e]=uint32_t(far_vertices.size())-out.EdgeOffset[e];
+                }
+                triangle_map.push_back(out);
+            }
+            if (node_map.size()+shape.NodeCount>UINT32_MAX) throw std::length_error("Refit node map overflow");
+            const uint32_t base=uint32_t(node_map.size());node_map.resize(node_map.size()+shape.NodeCount);
+            const auto visit=[&](auto &&self,uint32_t at,uint32_t depth)->void {
+                const auto &node=source_nodes[at];const Index absolute=shape.RootNode+at;
+                if (!selected_nodes.insert(absolute).second) throw std::invalid_argument("Overlapping refit node runs");
+                node_map[base+at]={absolute,node.First,node.Count,shape.FirstTriangle,
+                    node.Count?NoIndex:base+at+1,node.Count?NoIndex:base+node.First,depth};
+                data->RefitMaximumDepth=std::max(data->RefitMaximumDepth,depth);
+                if(!node.Count){self(self,at+1,depth+1);self(self,node.First,depth+1);}
+            };visit(visit,0,0);
+        }
+        if(vertex_map.size()>UINT32_MAX||triangle_map.size()>UINT32_MAX)throw std::length_error("Refit work map overflow");
+        const auto upload=[&](auto &buffer,const auto &values) {
+            make(buffer,std::max(std::size_t(1),values.size()));
+            std::copy(values.begin(),values.end(),buffer.Data());
+        };
+        upload(data->RefitVertices,vertex_map);upload(data->RefitTriangles,triangle_map);
+        upload(data->RefitFarVertices,far_vertices);upload(data->RefitNodes,node_map);
+        make(data->RefitCounts,1);data->RefitCounts[0]={uint32_t(vertex_map.size()),uint32_t(triangle_map.size()),uint32_t(node_map.size()),0};
+        make(data->RefitNormals,triangle_map.size());make(data->RefitFlags,triangle_map.size());make(data->RefitBounds,node_map.size());
+        make(data->RefitDepths,data->RefitMaximumDepth+1);
+        for(uint32_t d=0;d<=data->RefitMaximumDepth;++d)data->RefitDepths[d]=d;
+    }
+    const auto retain = [&](uint32_t slot, const auto &buffer) {
+        data->ModelBuffers[slot] = buffer.Handle;
+        data->Bindings[slot] = buffer.Handle ? buffer.Address() : 0;
+        if (buffer.Handle) data->Residency->addAllocation(buffer.Handle.get());
+    };
+    retain(0, world.Poses); retain(1, world.InitialPoses); retain(2, world.InertialPoses);
+    retain(3, world.Velocities); retain(4, world.Masses); retain(5, world.Contacts);
+    retain(6, world.BodyShapes); retain(8, world.Shapes); retain(9, world.PreviousVelocities);
+    retain(10, world.Materials); retain(11, world.Iterates); retain(13, world.NextColors);
+    retain(15, world.CompoundChildren); retain(17, world.Incoming); retain(18, world.IncomingSlots);
+    retain(20, world.Jointed); retain(21, world.Quiet); retain(22, world.RestPoses); retain(23, world.NextQuiet);
+    retain(24, world.ContactEvents); retain(25, world.ContactEventCounts); retain(26, world.ContactRefusals);
+    retain(27, world.ShapeVertices); retain(28, world.Triangles); retain(29, world.BvhNodes); retain(30, world.HullFaces);
+    data->Bindings[7] = data->Parameters.Address(); data->Bindings[12] = data->Contacts.Address();
+    data->Bindings[14] = data->Bounds.Address(); data->Bindings[19] = data->Filters.Address();
+    data->Bindings[26] = data->Refusals.Address();
+    if (data->Parameters[0].QueuedQueries) {
+        make(data->QueryScratch, QueryScratchBytes / sizeof(uint32_t)); make(data->QueryInputs, 1);
+        auto &header = *reinterpret_cast<QueryArenaHeader *>(data->QueryScratch.Data());
+        header = {}; header.Bytes = QueryScratchBytes;
+        QueryInputSpec spec{};
+        const uint64_t bytes[]{uint64_t(bodies)*sizeof(Pose), uint64_t(bodies)*sizeof(Velocity), uint64_t(bodies)*sizeof(BodyMass),
+            uint64_t(bodies)*sizeof(Index), uint64_t(world.ShapeCount())*sizeof(Shape), uint64_t(bodies)*sizeof(Material),
+            uint64_t(bodies)*sizeof(Filter), uint64_t(world.Jointed.Capacity)*sizeof(Index),
+            uint64_t(world.ShapeVertices.Capacity)*sizeof(float3), uint64_t(world.HullFaces.Capacity)*sizeof(HullFace),
+            uint64_t(world.Triangles.Capacity)*sizeof(Triangle), uint64_t(world.BvhNodes.Capacity)*sizeof(BvhNode),
+            uint64_t(world.CompoundChildren.Capacity)*sizeof(Index), sizeof(StepParams), uint64_t(bodies)*sizeof(uint32_t),
+            uint64_t(bodies)*ContactsPerBody*8*sizeof(uint32_t)};
+        uint64_t words = 0;
+        for (uint32_t i = 0; i < 16; ++i) {
+            if (bytes[i]/4 > UINT32_MAX-words) throw std::length_error("Geometry epoch query snapshot overflow");
+            spec.Offsets[i] = uint32_t(words); words += bytes[i]/4;
+        }
+        spec.Words = uint32_t(words); data->QueryInputs[0] = spec;
+        make(data->QuerySnapshot, spec.Words);
+        std::fill(data->QuerySnapshot.All().begin(), data->QuerySnapshot.All().end(), 0u);
+    }
+    for (auto &table : data->Tables) {
+        auto desc = mtl::Make<MTL4::ArgumentTableDescriptor>(); desc->setMaxBufferBindCount(BindingCount);
+        table = NS::TransferPtr(Context.Device->newArgumentTable(desc.get(), &error));
+        if (!table) throw std::runtime_error("Geometry epoch argument table allocation failed");
+    }
+    // Pipeline creation is preparation, never an interior numerical operation.
+    const auto warm = [&](Pass pass, uint32_t variant = 0, CollectionMode mode = Direct) {
+        Pipeline(shaders::PipelineIndices[mode][pass][variant]);
+    };
+    warm(ResetGeometryOutputPass); warm(FinishGeometryOutputPass);
+    if(data->RefitCounts.Handle)for(Pass pass:{MeshRefitValidatePass,MeshRefitLeavesPass,MeshRefitLevelPass,MeshRefitCommitPass})warm(pass);
+    warm(GeometryBoundsPass, bodies <= RadixSimdWidth ? 1 : 0);
+    if (bodies <= RadixBlockSize) warm(SmallBroadPhasePass);
+    else for (Pass pass : {ReduceBoundsPass, ReduceScenePass, MortonPass, RadixHistogramPass,
+                           RadixOffsetsPass, RadixScatterPass, BuildTreePass, RefitTreePass}) warm(pass);
+    const bool mesh = data->Features & MeshQueries;
+    const Pass collect = mesh ? CollectPass : bodies > NativeCollectBodyLimit && !(data->Features & BoundedPlanes) ? ScalarCollectPass : NativeCollectPass;
+    const uint32_t lanes = bodies <= RadixSimdWidth || mesh ? CollisionLanes : bodies <= NativeCollectBodyLimit ? 32 : 1;
+    const auto variant = [&](uint32_t width) { return collect == NativeCollectPass && bodies <= RadixSimdWidth ? 0u : uint32_t(collect == NativeCollectPass)+2*uint32_t(width>1); };
+    warm(collect, variant(lanes));
+    if (data->Parameters[0].QueuedQueries) {
+        for (Pass pass : {ResetQueryReusePass, CheckQueryInputsPass, CheckQueryGeometryPass, ResetQueryPass, QueryPass}) warm(pass);
+        warm(collect, variant(lanes), Prepare); warm(collect, variant(1), Queued);
+    }
+    data->Residency->commit(); data->Residency->requestResidency();
+    return GeometryEpoch(std::move(data));
+}
+
+void Solver::GeometryEpoch::SetView(uint32_t slot, const GeometryView &view) {
+    if (!Data || Data->Encoded || Data->Failed) throw std::logic_error("Geometry view must be bound before recording");
+    auto &d = *Data; d.CheckWorld();
+    if (slot >= d.Views.size()) throw std::out_of_range("Geometry epoch view slot");
+    const auto validate = [&](const auto &b, uint32_t capacity) {
+        if (!b.Handle || b.Capacity < capacity || b.Handle->device() != d.Owner->Context.Device.get())
+            throw std::invalid_argument("Geometry staged buffer capacity/device mismatch");
+    };
+    validate(view.Poses, d.Bodies); validate(view.Velocities, d.Bodies);
+    validate(view.Vertices, d.VertexCapacity); validate(view.Triangles, d.TriangleCapacity); validate(view.Nodes, d.NodeCapacity);
+    if (d.Bound[slot]) throw std::logic_error("Geometry epoch slot is already bound");
+    d.Views[slot] = view;
+    for (auto *b : {view.Poses.Handle.get(), view.Velocities.Handle.get(), view.Vertices.Handle.get(), view.Triangles.Handle.get(), view.Nodes.Handle.get()})
+        d.Residency->addAllocation(b);
+    d.Residency->commit(); d.Bound[slot] = 1;
+}
+
+Solver::GeometryEpoch::Output Solver::GeometryEpoch::Encode(MTL4::ComputeCommandEncoder *encoder, uint32_t slot, uint64_t trial, bool refit) {
+    if (!Data || !encoder || Data->Failed) throw std::invalid_argument("Invalid geometry epoch recording");
+    auto &d = *Data; d.CheckWorld();
+    if (slot != d.Encoded || slot >= d.Views.size() || !d.Bound[slot]) throw std::logic_error("Geometry query slots must be bound and encoded in order");
+    if(refit&&!d.RefitCounts.Handle)throw std::invalid_argument("Geometry epoch has no prepared refit topology");
+    auto *table = d.Tables[slot].get(); const auto &v = d.Views[slot];
+    if(refit&&(v.Triangles.Handle.get()==d.ModelBuffers[28].get()||v.Nodes.Handle.get()==d.ModelBuffers[29].get()))
+        throw std::invalid_argument("GPU refit requires private staged triangle and BVH buffers");
+    const auto count = d.Counts.Address()+uint64_t(slot)*sizeof(uint32_t);
+    const auto status = d.Status.Address()+uint64_t(slot)*sizeof(GeometryQueryStatus);
+    d.Status[slot] = {.Epoch=d.Epoch,.Trial=trial};
+    for (uint32_t i = 0; i < BindingCount; ++i) table->setAddress(d.Bindings[i], i);
+    table->setAddress(v.Poses.Address(),0); table->setAddress(v.Velocities.Address(),3);
+    table->setAddress(v.Vertices.Address(),27); table->setAddress(v.Triangles.Address(),28); table->setAddress(v.Nodes.Address(),29);
+    table->setAddress(status,1); table->setAddress(count,16);
+    table->setAddress(d.Parameters.Address()+uint64_t(slot)*sizeof(StepParams),7);
+    table->setAddress(d.QueryScratch.Handle ? d.QueryScratch.Address() : 0,11);
+    encoder->setArgumentTable(table);
+    try {
+        d.Owner->Dispatch(encoder, ResetGeometryOutputPass, 1);
+        if(refit) {
+            const auto n=d.RefitCounts[0];
+            table->setAddress(d.RefitTriangles.Address(),2);table->setAddress(d.RefitFarVertices.Address(),4);
+            table->setAddress(d.RefitVertices.Address(),6);table->setAddress(d.RefitNodes.Address(),8);
+            table->setAddress(d.RefitFlags.Address(),10);table->setAddress(d.RefitBounds.Address(),11);
+            table->setAddress(d.RefitNormals.Address(),12);table->setAddress(d.RefitCounts.Address(),13);
+            d.Owner->Dispatch(encoder,MeshRefitValidatePass,std::max({n.Vertices,n.Triangles,n.Nodes}));
+            d.Owner->Dispatch(encoder,MeshRefitLeavesPass,std::max(n.Triangles,n.Nodes));
+            for(uint32_t depth=d.RefitMaximumDepth;depth-->0;) {
+                table->setAddress(d.RefitDepths.Address()+uint64_t(depth)*sizeof(uint32_t),17);
+                d.Owner->Dispatch(encoder,MeshRefitLevelPass,n.Nodes);
+            }
+            d.Owner->Dispatch(encoder,MeshRefitCommitPass,std::max(n.Triangles,n.Nodes));
+            for(uint32_t binding:{2,4,6,8,10,11,12,13,17})table->setAddress(d.Bindings[binding],binding);
+        }
+        d.Owner->EncodeCollision(encoder, {.Bodies=d.Bodies,.ColliderFeatures=d.Features}, d.Storage(), table, d.Parameters[slot]);
+        d.Owner->Dispatch(encoder, FinishGeometryOutputPass, 1);
+    } catch (...) { d.Failed = true; throw; }
+    ++d.Encoded;
+    return {d.Contacts.Address(), count, status, d.Ids.Address(), d.Epoch, trial, d.Capacity, d.Bodies};
 }
 
 Solver::GeometryOutput Solver::EncodeGeometry(MTL4::ComputeCommandEncoder *encoder, World &world, const StepSettings &settings, uint32_t capacity) {
@@ -645,9 +967,24 @@ void Solver::EncodeSolveCommands(MTL4::ComputeCommandEncoder *encoder, const Rec
     Table->setAddress(world.Poses.Address(), 0);
 }
 
+Solver::CollisionBuffers Solver::CollisionStorage(const World &world, bool sensor) const {
+    const auto address = [](const auto &buffer) { return buffer.Handle ? buffer.Address() : uint64_t(0); };
+    return {world.Bounds.Address(), world.BoundsReductions.Address(), world.BroadPhaseNodes.Address(),
+        world.BroadPhaseKeys.Address(), world.BroadPhaseScratch.Address(), world.Iterates.Address(),
+        world.PreviousVelocities.Address(), world.IncomingSlots.Address(), world.Materials.Address(),
+        world.NextColors.Address(), world.ContactEventCounts.Address(),
+        address(sensor ? SensorQueries : QueryScratch), address(QueryInputSnapshot), address(QueryInputs), ColorCursor.Address()};
+}
 void Solver::EncodeCollect(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world, bool sensor) {
+    EncodeCollect(encoder, recording, CollisionStorage(world, sensor), Table.get(), Params[recording.Parameter], sensor);
+}
+void Solver::EncodeCollision(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
+    EncodeCollision(encoder, recording, CollisionStorage(world), Table.get(), Params[recording.Parameter]);
+}
+
+void Solver::EncodeCollect(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, const CollisionBuffers &buffers, MTL4::ArgumentTable *table, const StepParams &params, bool sensor) {
     const uint32_t bodies = recording.Bodies;
-    const bool queued_queries = Params[recording.Parameter].QueuedQueries;
+    const bool queued_queries = params.QueuedQueries;
     const uint32_t collision_lanes = bodies <= RadixSimdWidth || (recording.ColliderFeatures & MeshQueries) ? CollisionLanes :
                                      bodies <= NativeCollectBodyLimit ? 32 : 1;
     Pass pass = sensor ? SensorPass : CollectPass;
@@ -659,15 +996,15 @@ void Solver::EncodeCollect(MTL4::ComputeCommandEncoder *encoder, const Recording
         return;
     }
     // Retain solid geometry while sensors use separate scratch storage.
-    const uint64_t query_address = sensor ? SensorQueries.Address() : QueryScratch.Address();
-    Table->setAddress(query_address, 11);
+    const uint64_t query_address = buffers.QueryScratch;
+    table->setAddress(query_address, 11);
     if (!sensor) {
-        Table->setAddress(QueryInputSnapshot.Address(), 18);
-        Table->setAddress(QueryInputs.Address(), 9);
+        table->setAddress(buffers.QueryInputSnapshot, 18);
+        table->setAddress(buffers.QueryInputs, 9);
         Dispatch(encoder, CheckQueryInputsPass, 1, 1, query_address + offsetof(QueryArenaHeader, InputX));
         Dispatch(encoder, CheckQueryGeometryPass, 1, 1, query_address + offsetof(QueryArenaHeader, GeometryX));
-        Table->setAddress(world.IncomingSlots.Address(), 18);
-        Table->setAddress(world.PreviousVelocities.Address(), 9);
+        table->setAddress(buffers.IncomingSlots, 18);
+        table->setAddress(buffers.PreviousVelocities, 9);
     }
     Dispatch(encoder, ResetQueryPass, bodies);
     Dispatch(encoder, pass, bodies, lanes, 0, Prepare);
@@ -675,67 +1012,67 @@ void Solver::EncodeCollect(MTL4::ComputeCommandEncoder *encoder, const Recording
     Dispatch(encoder, pass, bodies, 1, 0, Queued);
     // Recompute queries that exceed arena capacity.
     Dispatch(encoder, pass, bodies, lanes);
-    Table->setAddress(world.Iterates.Address(), 11);
+    table->setAddress(buffers.Iterates, 11);
 }
 
-void Solver::EncodeCollision(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {
+void Solver::EncodeCollision(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, const CollisionBuffers &buffers, MTL4::ArgumentTable *table, const StepParams &params) {
     const uint32_t bodies = recording.Bodies;
     const uint32_t bounds_lanes = bodies <= RadixSimdWidth ? RadixSimdWidth : 1;
-    const bool queued_queries = Params[recording.Parameter].QueuedQueries;
+    const bool queued_queries = params.QueuedQueries;
     if (queued_queries) {
-        Table->setAddress(QueryScratch.Address(), 11);
-        Table->setAddress(QueryInputs.Address(), 9);
-        Table->setAddress(QueryInputSnapshot.Address(), 18);
+        table->setAddress(buffers.QueryScratch, 11);
+        table->setAddress(buffers.QueryInputs, 9);
+        table->setAddress(buffers.QueryInputSnapshot, 18);
         Dispatch(encoder, ResetQueryReusePass, 1);
     }
-    Dispatch(encoder, Params[recording.Parameter].GeometryOnly ? GeometryBoundsPass : BoundsPass, bodies, bounds_lanes);
+    Dispatch(encoder, params.GeometryOnly ? GeometryBoundsPass : BoundsPass, bodies, bounds_lanes);
     if (queued_queries) {
-        Table->setAddress(world.Iterates.Address(), 11);
-        Table->setAddress(world.PreviousVelocities.Address(), 9);
-        Table->setAddress(world.IncomingSlots.Address(), 18);
+        table->setAddress(buffers.Iterates, 11);
+        table->setAddress(buffers.PreviousVelocities, 9);
+        table->setAddress(buffers.IncomingSlots, 18);
     }
     if (bodies <= RadixBlockSize) {
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        table->setAddress(buffers.BroadPhaseKeys, 11);
+        table->setAddress(buffers.BroadPhaseNodes, 13);
         Dispatch(encoder, SmallBroadPhasePass, std::bit_ceil(std::max(RadixSimdWidth, bodies)));
     } else if (recording.Parameter && Params[recording.Parameter - 1].BodyCount == bodies) {
         // Rebuild at each submission boundary; within it the same body slots retain a valid topology.
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        table->setAddress(buffers.BroadPhaseNodes, 13);
         Dispatch(encoder, RefreshTreePass, bodies);
         Dispatch(encoder, RefitTreePass, bodies);
     } else {
         const uint32_t blocks = RadixBlocks(bodies);
-        Table->setAddress(world.BoundsReductions.Address(), 13);
+        table->setAddress(buffers.BoundsReductions, 13);
         Dispatch(encoder, ReduceBoundsPass, blocks * RadixBlockSize);
         Dispatch(encoder, ReduceScenePass, RadixBlockSize);
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 10);
+        table->setAddress(buffers.BroadPhaseKeys, 11);
+        table->setAddress(buffers.BroadPhaseNodes, 10);
         Dispatch(encoder, MortonPass, bodies);
-        Table->setAddress(world.BroadPhaseScratch.Address(), 9);
+        table->setAddress(buffers.BroadPhaseScratch, 9);
         for (uint32_t digit = 0; digit < 4; ++digit) {
-            const uint64_t input = world.BroadPhaseKeys.Address() + (digit % 2) * bodies * sizeof(MortonKey);
-            const uint64_t output = world.BroadPhaseKeys.Address() + ((digit + 1) % 2) * bodies * sizeof(MortonKey);
-            Table->setAddress(input, 11);
-            Table->setAddress(output, 13);
-            Table->setAddress(ColorCursor.Address() + digit * sizeof(uint32_t), 25);
+            const uint64_t input = buffers.BroadPhaseKeys + (digit % 2) * bodies * sizeof(MortonKey);
+            const uint64_t output = buffers.BroadPhaseKeys + ((digit + 1) % 2) * bodies * sizeof(MortonKey);
+            table->setAddress(input, 11);
+            table->setAddress(output, 13);
+            table->setAddress(buffers.ColorCursor + digit * sizeof(uint32_t), 25);
             Dispatch(encoder, RadixHistogramPass, blocks * RadixBlockSize);
             Dispatch(encoder, RadixOffsetsPass, RadixBlockSize);
             Dispatch(encoder, RadixScatterPass, bodies);
         }
-        Table->setAddress(world.BroadPhaseKeys.Address(), 11);
-        Table->setAddress(world.BroadPhaseNodes.Address(), 13);
+        table->setAddress(buffers.BroadPhaseKeys, 11);
+        table->setAddress(buffers.BroadPhaseNodes, 13);
         Dispatch(encoder, BuildTreePass, bodies);
         Dispatch(encoder, RefitTreePass, bodies);
     }
-    Table->setAddress(world.BroadPhaseNodes.Address(), BroadPhaseOrCursorAt);
-    Table->setAddress(world.PreviousVelocities.Address(), 9);
-    Table->setAddress(world.Materials.Address(), 10);
-    Table->setAddress(world.Iterates.Address(), 11);
-    Table->setAddress(world.NextColors.Address(), 13);
-    Table->setAddress(world.ContactEventCounts.Address(), 25);
+    table->setAddress(buffers.BroadPhaseNodes, BroadPhaseOrCursorAt);
+    table->setAddress(buffers.PreviousVelocities, 9);
+    table->setAddress(buffers.Materials, 10);
+    table->setAddress(buffers.Iterates, 11);
+    table->setAddress(buffers.NextColors, 13);
+    table->setAddress(buffers.ContactEventCounts, 25);
     // Measure collision geometry before warm starting so C0 and Jacobians use the initial pose.
     // Shared lanes increase parallelism for mesh queries and small worlds.
-    EncodeCollect(encoder, recording, world, false);
+    EncodeCollect(encoder, recording, buffers, table, params, false);
 }
 
 void Solver::Encode(MTL4::ComputeCommandEncoder *encoder, const Recording &recording, World &world) {

@@ -1812,6 +1812,7 @@ kernel void BuildBodyBounds(
     uint body [[thread_position_in_grid]]
 #endif
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
 #if BOUNDS_LANES == 1
     const uint lane = 0;
 #endif
@@ -1931,7 +1932,33 @@ static device QueryContext *QueryContexts(device uint *pool) { return (device Qu
 static device QueuedQuery *QueryRecords(device uint *pool) { return (device QueuedQuery *)((device uchar *)pool + QueryHeader(pool).TaskOffset); }
 static device GeometryManifold *QueryResults(device uint *pool) { return (device GeometryManifold *)((device uchar *)pool + QueryHeader(pool).ResultOffset); }
 
-kernel void ResetQueryReuse(device uint *pool [[buffer(11)]], constant QueryInputSpec &spec [[buffer(9)]]) {
+// Ordered per-query reset: host writes cannot reset a later query in the
+// same submitted block. These slots never alias public World buffers.
+kernel void ResetGeometryOutput(device GeometryQueryStatus *result [[buffer(1)]],
+    device uint *pool [[buffer(11)]], device uint *count [[buffer(16)]],
+    constant StepParams &p [[buffer(7)]]) {
+    *count = 0;
+    result->Count = result->Errors = result->Complete = 0;
+    if (p.QueuedQueries) {
+        device QueryArenaHeader &h = QueryHeader(pool);
+        h.Valid = h.GeometryValid = h.GeometryChecked = h.Reuse = h.DynamicSame = 0;
+        h.TaskCount = h.GeometryX = h.InputX = 0;
+        h.DispatchY = h.DispatchZ = h.GeometryY = h.GeometryZ = h.InputY = h.InputZ = 1;
+    }
+}
+kernel void FinishGeometryOutput(device GeometryQueryStatus *result [[buffer(1)]],
+    device const BroadPhaseNode *nodes [[buffer(14)]], device const uint *count [[buffer(16)]],
+    constant StepParams &p [[buffer(7)]]) {
+    if (result->Errors) { result->Count = 0; result->Complete = 1; return; }
+    const BroadPhaseNode root = nodes[BroadPhaseRoot(p.BodyCount)];
+    result->Count = *count;
+    result->Errors = (root.Ready != (p.BodyCount <= RadixSimdWidth ? 0u : 2u) || root.Errors ? 1u : 0u)
+        | (*count > p.GeometryCapacity ? 2u : 0u);
+    result->Complete = 1;
+}
+
+kernel void ResetQueryReuse(device uint *pool [[buffer(11)]], constant QueryInputSpec &spec [[buffer(9)]], constant StepParams &p [[buffer(7)]]) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     device QueryArenaHeader &h = QueryHeader(pool);
     h.DynamicSame = h.Valid;
     h.Reuse = h.DynamicSame && h.GeometryValid;
@@ -1950,6 +1977,7 @@ kernel void CheckQueryInputs(
     device const uint *nodes [[buffer(29)]], device const uint *faces [[buffer(30)]],
     uint id [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     const uint skip = spec.Offsets[13] - spec.Offsets[8];
     if (id >= spec.Offsets[8]) id += skip;
     bool changed = false;
@@ -2003,12 +2031,14 @@ kernel void CheckQueryInputs(
     }
 }
 kernel void CheckQueryGeometry(
+    constant StepParams &p [[buffer(7)]],
     constant QueryInputSpec &spec [[buffer(9)]], device uint *pool [[buffer(11)]],
     device const uint *children [[buffer(15)]], device uint *snapshot [[buffer(18)]],
     device const uint *vertices [[buffer(27)]], device const uint *triangles [[buffer(28)]],
     device const uint *nodes [[buffer(29)]], device const uint *faces [[buffer(30)]],
     uint id [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     // Motion can suppress this dispatch; only an executed check validates the snapshot.
     if (id == 0) QueryHeader(pool).GeometryChecked = 1;
     id += spec.Offsets[8];
@@ -2032,6 +2062,7 @@ kernel void CheckQueryGeometry(
     if (lane == 0 && wave_changed) atomic_store_explicit((device atomic_uint *)&QueryHeader(pool).Reuse, 0u, memory_order_relaxed);
 }
 kernel void ResetQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], uint body [[thread_position_in_grid]]) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     if (body >= p.BodyCount) return;
     if (QueryHeader(pool).Reuse) {
         if (body == 0) QueryHeader(pool).TaskCount = 0;
@@ -2477,6 +2508,7 @@ static GeometryManifold QueryGeometry(
 }
 
 kernel void EvaluateQueries(device uint *pool [[buffer(11)]], constant StepParams &p [[buffer(7)]], device const float3 *vertices [[buffer(27)]], device const HullFace *faces [[buffer(30)]], device const Triangle *triangles [[buffer(28)]], uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
     if (QueryHeader(pool).Reuse || group >= min(QueryHeader(pool).TaskCount, QueryHeader(pool).TaskCapacity)) return;
     device QueuedQuery &task = QueryRecords(pool)[group];
     if (task.Batch >= QueryHeader(pool).BatchCapacity) return;
@@ -2702,6 +2734,7 @@ kernel void CollectContacts(
     uint body [[thread_position_in_grid]]
 #endif
 ) {
+    if (!GeometryQueryEnabled(p.GeometryStatusAddress)) return;
 #if COLLECT_LANES == 1
     const uint lane = 0;
 #endif

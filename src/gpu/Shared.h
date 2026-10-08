@@ -146,6 +146,12 @@ struct BroadPhaseNode {
     BodyBounds Bounds;
     uint Left, Right, Parent, MinBody, MaxBody, Ready, Errors, Candidates;
 };
+// Per-query private collision status. Count remains the literal attempted
+// count, even on overflow; consumers must check Complete and Errors first.
+struct GeometryQueryStatus {
+    ulong Epoch, Trial;
+    uint Count, Errors, Complete, Reserved;
+};
 struct MortonKey {
     uint Code, Body;
 };
@@ -316,6 +322,19 @@ struct BvhNode {
     Index First;
     uint Count;
 };
+
+// Fixed-topology GPU refit metadata, prepared once from cooked mesh pools.
+GPU_CONSTANT float MeshActiveEdgeSine = 0.0175f;
+GPU_CONSTANT uint MeshLeafSize = 4;
+struct MeshRefitTriangle {
+    Triangle Original;
+    uint Index;
+    uint EdgeOffset[3], EdgeCount[3], SharedCount[3];
+};
+struct MeshRefitNode {
+    uint Index, First, Count, FirstTriangle, Left, Right, Depth;
+};
+struct MeshRefitCounts { uint Vertices, Triangles, Nodes, Reserved; };
 
 struct Filter {
     uint Layer;
@@ -596,7 +615,14 @@ struct StepParams {
     uint QueuedQueries;
     uint GeometryOnly; // Collect geometry without touching AVBD contacts or history.
     uint GeometryCapacity;
+    ulong GeometryStatusAddress; // Optional staged-query status; zero on legacy paths.
 };
+
+#ifdef __METAL_VERSION__
+inline bool GeometryQueryEnabled(ulong status_address) {
+    return !status_address || ((device const GeometryQueryStatus *)status_address)->Errors == 0;
+}
+#endif
 
 inline float4 QuatConjugate(float4 q) { return MakeFloat4(-q.xyz, q.w); }
 
