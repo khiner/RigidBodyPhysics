@@ -63,6 +63,8 @@ struct BodyDesc {
     // Include stationary bodies with externally evolving surfaces in geometry-only
     // collection. This does not grant rigid mobility or change AVBD constraints.
     bool GeometryActive = false;
+    // Bit i marks scope i, and the body interacts only with bodies sharing a bit.
+    uint64_t Scope = ~0ull;
 };
 
 // Joint anchors and frames use world coordinates.
@@ -236,7 +238,7 @@ struct World {
     // Removes the live bodies in one pass over joints and contact storage.
     void RemoveBodies(std::span<const Index>);
     bool RemoveJoint(Index);
-    // Replace an active joint's configuration and reset its solver history.
+    // Replace a live joint's configuration and reset its solver history.
     bool SetJoint(Index, const JointDesc &);
 
     bool RemoveShape(Index);
@@ -247,6 +249,8 @@ struct World {
     bool SetBodyShape(Index body, Index shape, float density = 1000, std::optional<AuthoredMass> mass = {});
     // Replace a body's mass properties and wake it, so a static body can start moving in place.
     bool SetBodyMass(Index body, const BodyMass &);
+    // Replace a body's scope and wake it, engaging each of its joints only while both bodies share a scope.
+    bool SetBodyScope(Index body, uint64_t scope);
     bool SetGeometryActive(Index body, bool active);
     // Update a mesh asset in cooked vertex order without changing topology,
     // feature identity, body mass or pose. Shared instances all see the update;
@@ -260,7 +264,7 @@ struct World {
     // Supply every live nonsensor collision mesh leaf exactly once. Nonmesh
     // colliders are unsupported. Caller certifies bounds enclose the full
     // interval, including deformation/rigid motion; this validates structure
-    // and applies current masks, joint suppression and geometry activity.
+    // and applies current masks, scopes, joint suppression and geometry activity.
     // BVH overlaps are pruned only by conservative fixed-axis interval tests.
     // Mesh triangles have zero skin, matching CollectGeometry; margin is the
     // total pair distance allowance (include any desired extra reach here).
@@ -269,7 +273,7 @@ struct World {
     std::vector<SweptTrianglePair> CollectSweptTriangles(std::span<const SweptMesh>, double margin, uint32_t capacity) const;
 
 
-    // Mark internal faces between stationary boxes or hulls with identical effective masks.
+    // Mark internal faces between stationary boxes or hulls with identical effective masks and scopes.
     // Every call recomputes welding over the bodies whose bounds touch, and stores masks on private shape copies.
     // Only a body whose mask changed takes the new mask and wakes.
     // Repeat after topology, shape or motion changes.
@@ -393,12 +397,13 @@ private:
     void ReleaseShape(Index);
 
     void RebuildJointed();
+    bool EngageJoint(Index joint);
     bool RetireJoint(Index joint);
     void ReclaimBodies();
 
     uint32_t NumBodies{}, NumShapes{}, NumJoints{};
     RunPool VertexPool, FacePool, TrianglePool, NodePool, ChildPool;
-    std::vector<uint8_t> LiveBodies, LiveShapes;
+    std::vector<uint8_t> LiveBodies, LiveShapes, LiveJoints;
     // Private welded shape per body, or NoIndex.
     std::vector<Index> WeldedShapes;
     std::vector<Index> FreeBodies, FreeShapes, FreeJoints;

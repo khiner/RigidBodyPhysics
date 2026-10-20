@@ -2848,7 +2848,7 @@ kernel void CollectContacts(
             if (body_shapes[partner] == NoIndex) continue;
             if (!Frozen(masses[partner], velocities[partner], quiet[partner], p)) continue;
             const Shape other_root = shapes[body_shapes[partner]];
-            if (own_filter.Sensor || filters[partner].Sensor ||
+            if (own_filter.Sensor || filters[partner].Sensor || !SharesScope(own_filter, filters[partner]) ||
                 !Allows(LeafFilter(body_shape, OwnChild(history.was_children[j]), own_filter, shapes, compound_children), LeafFilter(other_root, OtherChild(history.was_children[j]), filters[partner], shapes, compound_children))) continue;
 
 #if !PREPARE_QUERIES
@@ -2947,7 +2947,7 @@ kernel void CollectContacts(
 #endif
 
             const Filter theirs = filters[other];
-            if (!Allows(leaf_filter, theirs.Aggregate)) continue;
+            if (!SharesScope(own_filter, theirs) || !Allows(leaf_filter, theirs.Aggregate)) continue;
             bool jointed = false;
             for (uint i = jointed_to[body]; i < jointed_to[body + 1] && !jointed; ++i) jointed = jointed_to[i] == other;
             if (jointed) continue;

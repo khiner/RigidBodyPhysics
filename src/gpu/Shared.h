@@ -343,8 +343,12 @@ struct Filter {
     uint GeometryActive = 0; // Only geometry-only collection uses this activity.
     // The union of leaf masks provides conservative body-pair rejection.
     CollisionMask Aggregate{};
+    // Bit i marks scope i, and two bodies interact only while they share a bit.
+    ulong Scope = ~0ul;
     uint Mixed = 0; // Different leaf masks prevent unconditional face suppression.
 };
+// Contacts, sensor overlaps and joints act only between bodies that share a scope.
+inline bool SharesScope(Filter a, Filter b) { return (a.Scope & b.Scope) != 0; }
 
 // Color in the low byte, contact degree in the remaining bits.
 GPU_CONSTANT uint ColorDegreeShift = 8;

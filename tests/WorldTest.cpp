@@ -138,6 +138,23 @@ TEST_CASE_FIXTURE(OneWorld, "world: retirement preserves joint topology and reus
     CHECK(world.IdOf(hub) != retired);
 }
 
+TEST_CASE_FIXTURE(OneWorld, "world: joints engage only while their bodies share a scope") {
+    const auto a = world.AddBody({.Scope = 1}), b = world.AddBody({.Scope = 3});
+    const auto joint = world.AddJoint({.BodyA = a, .BodyB = b});
+    REQUIRE(joint != NoIndex);
+    CHECK(world.Joints[joint].Active);
+    REQUIRE(world.SetBodyScope(b, 2));
+    CHECK(!world.Joints[joint].Active);
+    CHECK(world.JointCount() == joint + 1);
+    REQUIRE(world.SetJoint(joint, {.BodyA = a, .BodyB = b, .Collide = true}));
+    CHECK(!world.Joints[joint].Active);
+    REQUIRE(world.SetBodyScope(a, 2));
+    CHECK(world.Joints[joint].Active);
+    CHECK(world.AddJoint({.BodyA = a, .BodyB = b}) == joint + 1);
+    REQUIRE(world.RemoveJoint(joint));
+    CHECK(world.AddJoint({.BodyA = a, .BodyB = b}) == joint);
+}
+
 TEST_CASE_FIXTURE(OneWorld, "world: geometry edits preserve body properties and release owned storage") {
     SUBCASE("new geometry recomputes what the shape decides and keeps what the body decides") {
         const auto box = world.AddShape(UnitBox);

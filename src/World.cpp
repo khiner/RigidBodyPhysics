@@ -167,7 +167,8 @@ bool Within(const ShapeFace &inner, const ShapeFace &outer, float tolerance) {
 
 // Compares only pieces whose bounds touch, swept along x.
 // A buried face lies within the opposing face up to the tolerance and the normals' tilt, so the bounds grow by both.
-std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces, std::span<const CollisionMask> filters = {}) {
+// Only pieces the predicate accepts as a pair bury each other.
+std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces, auto &&comparable) {
     float scale = 1e-6f;
     for (const auto &piece : pieces)
         for (const ShapeFace &face : piece)
@@ -192,7 +193,7 @@ std::vector<uint32_t> BuriedFaces(std::span<const std::vector<ShapeFace>> pieces
 
     std::vector<uint32_t> masks(pieces.size(), 0);
     const auto bury = [&](uint32_t i, uint32_t j) {
-        if (!filters.empty() && !SameMask(filters[i], filters[j])) return;
+        if (!comparable(i, j)) return;
         for (const ShapeFace &mine : pieces[i])
             for (const ShapeFace &theirs : pieces[j]) {
                 if (dot(mine.Normal, theirs.Normal) > -0.99999f) continue;
@@ -350,6 +351,7 @@ World::World(const mtl::Context &context, WorldLimits limits) {
     ChildPool.Capacity = limits.CompoundChildren;
     LiveBodies.assign(limits.Bodies, 0);
     LiveShapes.assign(limits.Shapes, 0);
+    LiveJoints.assign(limits.Joints, 0);
     WeldedShapes.assign(limits.Bodies, NoIndex);
     Spawns.assign(limits.Bodies, 0);
     residency->commit();
@@ -816,7 +818,7 @@ Index World::AddCompound(std::span<const Index> children, Pose *frame) {
         if (child.Kind == ShapeBox || child.Kind == ShapeHull || child.Kind == ShapeCylinder) SetInternalFaces(child, 0);
         faces.push_back(ShapeFaces(child, child.Local, ShapeVertices.All(), HullFaces.All()));
     }
-    const auto masks = BuriedFaces(faces);
+    const auto masks = BuriedFaces(faces, [](uint32_t, uint32_t) { return true; });
     for (uint32_t i = 0; i < count; ++i) {
         Shape &child = Shapes[CompoundChildren[first + i]];
         if (child.Kind == ShapeBox || child.Kind == ShapeHull || child.Kind == ShapeCylinder) SetInternalFaces(child, masks[i]);
@@ -833,7 +835,6 @@ Index World::AddCompound(std::span<const Index> children, Pose *frame) {
 uint32_t World::WeldStatic() {
     std::vector<Index> resting;
     std::vector<std::vector<ShapeFace>> faces;
-    std::vector<CollisionMask> filters;
     for (Index body = 0; body < NumBodies; ++body) {
         if (!LiveBodies[body] || Moves(Masses[body]) || Filters[body].Sensor) continue;
         const Velocity motion = Velocities[body];
@@ -843,12 +844,13 @@ uint32_t World::WeldStatic() {
         const Shape &held = Shapes[shape];
         if (held.Kind != ShapeBox && held.Kind != ShapeHull && held.Kind != ShapeCylinder) continue;
         resting.push_back(body);
-        filters.push_back(ResolveFilter(held, {Filters[body].Layer, Filters[body].Collides}));
-
         faces.push_back(ShapeFaces(held, ComposePose(Poses[body], held.Local), ShapeVertices.All(), HullFaces.All()));
     }
     std::vector<uint32_t> wanted(NumBodies, 0);
-    const std::vector<uint32_t> masks = BuriedFaces(faces, filters);
+    const auto mask = [this](Index body) { return ResolveFilter(Shapes[BodyShapes[body]], {Filters[body].Layer, Filters[body].Collides}); };
+    const std::vector<uint32_t> masks = BuriedFaces(faces, [&](uint32_t i, uint32_t j) {
+        return Filters[resting[i]].Scope == Filters[resting[j]].Scope && SameMask(mask(resting[i]), mask(resting[j]));
+    });
     for (uint32_t i = 0; i < resting.size(); ++i) wanted[resting[i]] = masks[i];
 
     // Revisit all live bodies so previous welds can be undone after edits.
@@ -904,7 +906,7 @@ Index World::AddBody(const BodyDesc &desc) {
     Quiet[index] = 0;
     RestPoses[index] = desc.Pose;
     Materials[index] = desc.Surface.value_or(Material{desc.Friction, desc.Friction, desc.Restitution, CombineGeometricMean, CombineMaximum});
-    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor, .GeometryActive = desc.GeometryActive};
+    Filters[index] = {.Layer = desc.Layer, .Collides = desc.CollidesWith, .Sensor = desc.Sensor, .GeometryActive = desc.GeometryActive, .Scope = desc.Scope};
     if (index + 1 == NumBodies) {
         Jointed[index + 1] = Jointed[index];
         JointIncidence[index + 1] = JointIncidence[index];
@@ -976,24 +978,53 @@ Index World::AddJoint(const JointDesc &desc) {
     const Index index = TakeSlot(FreeJoints, NumJoints, Joints.Capacity, Overflow.Joints);
     if (index == NoIndex) return NoIndex;
     Joints[index] = *joint;
+    LiveJoints[index] = 1;
+    EngageJoint(index);
     RebuildJointed();
     return index;
 }
 
 bool World::SetJoint(Index index, const JointDesc &desc) {
-    if (index >= NumJoints || !Joints[index].Active || !Alive(desc.BodyA) || !Alive(desc.BodyB)) return false;
+    if (index >= NumJoints || !LiveJoints[index] || !Alive(desc.BodyA) || !Alive(desc.BodyB)) return false;
     const auto joint = MakeJoint(desc, Poses[desc.BodyA], Poses[desc.BodyB]);
     if (!joint) return false;
     auto &current = Joints[index];
     const bool topology_changed = current.BodyA != desc.BodyA || current.BodyB != desc.BodyB || current.Suppresses != joint->Suppresses;
+    const uint32_t was_active = current.Active;
     Quiet[current.BodyA] = Quiet[current.BodyB] = Quiet[desc.BodyA] = Quiet[desc.BodyB] = 0;
     current = *joint;
-    if (topology_changed) RebuildJointed();
+    EngageJoint(index);
+    if (topology_changed || current.Active != was_active) RebuildJointed();
+    return true;
+}
+
+bool World::SetBodyScope(Index body, uint64_t scope) {
+    if (!Alive(body)) return false;
+    if (Filters[body].Scope == scope) return true;
+    Filters[body].Scope = scope;
+    Wake(body);
+    bool changed = false;
+    for (Index joint = 0; joint < NumJoints; ++joint) {
+        const Joint &held = Joints[joint];
+        if (LiveJoints[joint] && (held.BodyA == body || held.BodyB == body)) changed |= EngageJoint(joint);
+    }
+    if (changed) RebuildJointed();
+    return true;
+}
+
+// A joint is active while its bodies share a scope, and a change of engagement discards its solver history.
+bool World::EngageJoint(Index index) {
+    Joint &joint = Joints[index];
+    const uint32_t active = SharesScope(Filters[joint.BodyA], Filters[joint.BodyB]) ? 1u : 0u;
+    if (joint.Active == active) return false;
+    joint.Active = active;
+    ResetJoint(joint);
+    Quiet[joint.BodyA] = Quiet[joint.BodyB] = 0;
     return true;
 }
 
 void World::RebuildJointed() {
-    TrimTail(NumJoints, FreeJoints, [this](Index at) { return Joints[at].Active != 0; });
+    TrimTail(NumJoints, FreeJoints, [this](Index at) { return LiveJoints[at] != 0; });
     std::vector<Index> cursor(NumBodies, 0);
     for (const bool suppressing : {false, true}) {
         auto &links = suppressing ? Jointed : JointIncidence;
@@ -1042,7 +1073,7 @@ void World::RemoveBodies(std::span<const Index> bodies) {
     bool removed_joints = false;
     for (Index joint = 0; joint < NumJoints; ++joint) {
         const Joint &held = Joints[joint];
-        if (held.Active && (removed[held.BodyA] || removed[held.BodyB])) removed_joints |= RetireJoint(joint);
+        if (LiveJoints[joint] && (removed[held.BodyA] || removed[held.BodyB])) removed_joints |= RetireJoint(joint);
     }
     if (removed_joints) RebuildJointed();
     EndContacts(removed, live);
@@ -1057,12 +1088,13 @@ void World::RemoveBodies(std::span<const Index> bodies) {
 }
 
 bool World::RetireJoint(Index joint) {
-    if (joint >= NumJoints || !Joints[joint].Active) return false;
+    if (joint >= NumJoints || !LiveJoints[joint]) return false;
     const Joint &held = Joints[joint];
 
     Quiet[held.BodyA] = 0;
     Quiet[held.BodyB] = 0;
     Joints[joint].Active = 0;
+    LiveJoints[joint] = 0;
     FreeJoints.push_back(joint);
     return true;
 }
@@ -1352,7 +1384,7 @@ std::vector<SweptTrianglePair> World::CollectSweptTriangles(std::span<const Swep
     for (std::size_t a = 0; a < meshes.size(); ++a) for (std::size_t b = a + 1; b < meshes.size(); ++b) {
         const auto &ma = meshes[a], &mb = meshes[b];
         const Index ia = ma.Input->Body.Slot, ib = mb.Input->Body.Slot;
-        if (ia == ib || !Allows(ma.Mask, mb.Mask) ||
+        if (ia == ib || !SharesScope(Filters[ia], Filters[ib]) || !Allows(ma.Mask, mb.Mask) ||
             (!(Moves(Masses[ia]) || Filters[ia].GeometryActive) && !(Moves(Masses[ib]) || Filters[ib].GeometryActive))) continue;
         bool jointed = false;
         for (uint32_t j = Jointed[ia]; j < Jointed[ia + 1]; ++j) jointed |= Jointed[j] == ib;
