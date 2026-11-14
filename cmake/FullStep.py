@@ -87,4 +87,4 @@ def generate(source, compiler):
             text = replace_once(text, match[0], "")
         variants.append("namespace " + name + " {\n" + text + "\n}\n")
     variants.append("namespace broad {\n" + helpers(preprocess("BroadPhase.metal"), set()) + "\n}\n")
-    return (source / "FullStepData.h").read_text() + "\n" + "\n".join(shared) + "\n" + "".join(variants) + (source / "FullStep.metal").read_text()
+    return '#include "gpu/FullStepData.h"\n' + "\n".join(shared) + "\n" + "".join(variants) + (source / "FullStep.metal").read_text()

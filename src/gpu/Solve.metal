@@ -2566,13 +2566,6 @@ static void CollectManifold(
     constant StepParams &p, thread uint &count, thread uint *inherited,
     COLLECT_STORAGE const ContactHistory &history
 ) {
-    const Shape shape = q.Shape, target = q.Target;
-    const Pose pose = q.Pose, target_pose = q.TargetPose, shape_pose = q.ShapePose, target_shape_pose = q.TargetShapePose;
-    const Velocity own_velocity = q.OwnVelocity, other_velocity = q.OtherVelocity;
-    const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
-    const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
-    const float3 penalty_floor(p.PenaltyMin);
-    const float weld = geometry.Weld;
     const ulong children = ChildPair(own_leaf, target_leaf);
     if (!geometry.Visited) return;
     const Index sub_shape = geometry.SubShape, sub_shape_a = geometry.SubShapeA;
@@ -2591,6 +2584,13 @@ static void CollectManifold(
     }
 
 #if !SENSOR_PASS
+    const Shape shape = q.Shape, target = q.Target;
+    const Pose pose = q.Pose, target_pose = q.TargetPose, shape_pose = q.ShapePose, target_shape_pose = q.TargetShapePose;
+    const Velocity own_velocity = q.OwnVelocity, other_velocity = q.OtherVelocity;
+    const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
+    const uint target_leaf_count = other_body_shape.Kind == ShapeCompound ? other_body_shape.VertexCount : 1;
+    const float3 penalty_floor(p.PenaltyMin);
+    const float weld = geometry.Weld;
     // Weld matching positions and normals across leaves or triangles without merging unrelated features.
     const bool siblings = own_leaf_count > 1 || target_leaf_count > 1 || sub_shape_a != NoIndex || sub_shape != NoIndex;
 #endif
@@ -2772,10 +2772,12 @@ kernel void CollectContacts(
     if (!PREPARE_QUERIES && lane == 0) contact_refusals[body] = 0;
 #if PREPARE_QUERIES || QUEUED_QUERIES
     device QueuedQuery *query_records = QueryRecords(query_pool);
-    COLLECT_STORAGE uint query_base, context_base, batch_base;
-    COLLECT_STORAGE bool first_context, query_failed;
     device QueryBatch *query_batches = QueryBatches(query_pool);
     device QueryContext *query_contexts = QueryContexts(query_pool);
+#endif
+#if PREPARE_QUERIES
+    COLLECT_STORAGE uint query_base, context_base, batch_base;
+    COLLECT_STORAGE bool first_context, query_failed;
     uint query_tail = NoIndex;
 #endif
 #if !PREPARE_QUERIES && !QUEUED_QUERIES
@@ -2824,13 +2826,10 @@ kernel void CollectContacts(
         return;
     }
     const Shape body_shape = shapes[shape_index];
+#if !SENSOR_PASS || !QUEUED_QUERIES
     const Pose pose = poses[body];
+#endif
     const Filter own_filter = filters[body];
-    const float own_inverse_mass = masses[body].InvMass;
-    const bool i_move = Moves(masses[body]);
-    const bool i_collide = i_move || (p.GeometryOnly && own_filter.GeometryActive);
-
-    const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
 
     uint count = 0;
     // Carry frozen pairs forward unchanged; remeasure reporting geometry when reporting is enabled later.
@@ -2894,10 +2893,14 @@ kernel void CollectContacts(
         }
     }
 #else
+#if !SENSOR_PASS
+    const bool i_collide = Moves(masses[body]) || (p.GeometryOnly && own_filter.GeometryActive);
+#endif
     // Visit every leaf pair even after the contact run fills.
 #if PREPARE_QUERIES
     for (uint own_leaf = first_leaf; own_leaf < last_leaf; ++own_leaf) {
 #else
+    const uint own_leaf_count = body_shape.Kind == ShapeCompound ? body_shape.VertexCount : 1;
     for (uint own_leaf = 0; own_leaf < own_leaf_count; ++own_leaf) {
 #endif
         Shape shape = shapes[body_shape.Kind == ShapeCompound ? ChildOf(body_shape, own_leaf, compound_children) : shape_index];
@@ -2935,13 +2938,12 @@ kernel void CollectContacts(
 
             const bool cached_pair = frozen && Frozen(masses[other], velocities[other], quiet[other], p);
             if (cached_pair && !measure_cached) continue;
-            const bool they_move = Moves(masses[other]);
-            const bool they_collide = they_move || (p.GeometryOnly && filters[other].GeometryActive);
 #if SENSOR_PASS
             if (!(own_filter.Sensor || filters[other].Sensor)) continue;
 
 #else
             if (own_filter.Sensor || filters[other].Sensor) continue;
+            const bool they_collide = Moves(masses[other]) || (p.GeometryOnly && filters[other].GeometryActive);
             if (!i_collide && !they_collide) continue;
 
 #endif
@@ -3165,7 +3167,8 @@ kernel void CollectContacts(
 
     if (PREPARE_QUERIES) return;
     if (p.GeometryOnly) return;
-#if !SENSOR_PASS && COLLECT_LANES >= 32
+#if !SENSOR_PASS
+#if COLLECT_LANES >= 32
     threadgroup_barrier(mem_flags::mem_device);
     if (lane >= 32) return;
     const uint final_count = simd_shuffle(count, 0);
@@ -3175,7 +3178,7 @@ kernel void CollectContacts(
     const uint final_count = count;
     constexpr uint final_stride = 1;
 #endif
-#if !SENSOR_PASS
+    const float own_inverse_mass = masses[body].InvMass;
     for (uint first = 0; lane == 0 && first < count;) {
         const Index other = slots[first].BodyB;
         uint end = first + 1;

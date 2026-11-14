@@ -1,7 +1,6 @@
 // Host and device layouts use SI units, right-handed Y-up coordinates and body-frame diagonal inertia.
 
-#ifndef RBP_GPU_SHARED_H // An include guard supports prepending this header to MSL source.
-#define RBP_GPU_SHARED_H
+#pragma once
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
@@ -666,6 +665,4 @@ inline Pose ComposePose(Pose outer, Pose inner) {
 #ifdef __METAL_VERSION__
 
 using namespace rbp;
-#endif
-
 #endif

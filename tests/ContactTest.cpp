@@ -249,7 +249,7 @@ TEST_CASE_FIXTURE(Reporting, "geometry collection shares collision features with
     CHECK(length(world.Velocities[box].Linear - velocity.Linear) == 0);
     CHECK_FALSE(world.Contacts[box * ContactsPerBody].Active);
     CHECK_THROWS_AS(solver.CollectGeometry(world, settings, 2), std::overflow_error);
-    solver.Step(world, {.Gravity = {0, 0, 0}, .ContactMargin = 0, .Iterations = 0});
+    solver.Step(world, {.Gravity = {0, 0, 0}, .Iterations = 0, .ContactMargin = 0});
     for (uint32_t i = 0; i < 4; ++i) {
         const Contact &contact = world.Contacts[box * ContactsPerBody + i];
         CHECK(contact.Active);
@@ -336,7 +336,7 @@ TEST_CASE_FIXTURE(Reporting, "geometry collection preserves AVBD features for hu
         moving = world.AddBody({.Pose = At(float3{0, Half, 0}), .Shape = compound});
     }
     REQUIRE(moving != NoIndex);
-    const StepSettings settings{.Gravity = {0, 0, 0}, .ContactMargin = 0, .Iterations = 0};
+    const StepSettings settings{.Gravity = {0, 0, 0}, .Iterations = 0, .ContactMargin = 0};
     const auto raw = solver.CollectGeometry(world, settings, 128);
     REQUIRE_FALSE(raw.empty());
     const std::vector<GeometryContact> features(raw.begin(), raw.end());

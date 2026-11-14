@@ -1,15 +1,10 @@
 kernel void FullStep(constant FullStepData &s [[buffer(0)]], uint tid [[thread_index_in_threadgroup]], uint wave [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint3 group_size [[threads_per_threadgroup]]) {
     StepParams p = s.params[0];
     const uint threads = group_size.x, waves = threads / SolveLanes;
-    threadgroup uint max_colors;
     if (s.gpu_colors) {
-        if (wave == 0) {
-            const uint mine = lane < p.BodyCount && Moves(s.masses[lane]) ? ColorOf(s.colors[lane]) + 1 : 1;
-            const uint count = min(p.MaxColors, simd_max(mine) + 1);
-            if (lane == 0) max_colors = count;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        p.MaxColors = max_colors;
+        // Every SIMD group reduces the same bodies, so no group waits on another.
+        const uint mine = lane < p.BodyCount && Moves(s.masses[lane]) ? ColorOf(s.colors[lane]) + 1 : 1;
+        p.MaxColors = min(p.MaxColors, simd_max(mine) + 1);
     }
     const StepOutputFlags output{uint(s.output_poses), uint(s.output_sensors)};
     threadgroup uint changed_waves[SmallSolveWaves];

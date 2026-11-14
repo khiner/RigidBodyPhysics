@@ -46,8 +46,10 @@ include(${ShaderDir}/Shaders.cmake)
 foreach(Name IN LISTS ShaderNames)
     add_custom_command(OUTPUT ${ShaderDir}/${Name}.air
         COMMAND ${Xcrun} -sdk macosx metal -std=metal4.0 -Wno-unused-function -fmetal-math-mode=${ShaderMath_${Name}}
+            -I ${CMAKE_CURRENT_SOURCE_DIR}/src -MMD -MF ${ShaderDir}/${Name}.d
             -c ${ShaderDir}/${Name}.metal -o ${ShaderDir}/${Name}.air
-        DEPENDS ${ShaderDir}/${Name}.metal ${ShaderDir}/Shaders.cmake VERBATIM)
+        DEPENDS ${ShaderDir}/${Name}.metal ${ShaderDir}/Shaders.cmake
+        DEPFILE ${ShaderDir}/${Name}.d VERBATIM)
     list(APPEND ShaderAir ${ShaderDir}/${Name}.air)
 endforeach()
 add_custom_command(OUTPUT ${ShaderDir}/rbp.metallib

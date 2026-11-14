@@ -51,7 +51,18 @@ def prune_helpers(source):
             parts.append(source[match.start():end])
         position = end
     parts.append(source[position:])
-    return "".join(parts)
+    return prune_constants("".join(parts))
+
+
+def prune_constants(source):
+    declaration = re.compile(r"(?m)^constant \w+ (\w+) = [^;]*;\n")
+    # Removing one constant can leave the constants in its initializer unused.
+    while True:
+        declared = {match[1] for match in declaration.finditer(source)}
+        unused = declared - set(re.findall(r"\b\w+\b", declaration.sub("", source)))
+        if not unused:
+            return source
+        source = declaration.sub(lambda match: "" if match[1] in unused else match[0], source)
 
 
 def main():
@@ -65,11 +76,10 @@ def main():
     entries = json.loads((args.source / "Pipelines.json").read_text())
     sources = {name: (args.source / (name + ".metal")).read_text() for name in ["Solve", "BroadPhase", "MeshRefit", "SolveCommands", "Ji", "JiScene"]}
     sources["FullStep"] = generate(args.source, args.compiler)
-    sources["SolveCommands"] = (args.source / "SolveCommandData.h").read_text() + sources["SolveCommands"]
-    sources["Ji"] = (args.source / "JiData.h").read_text() + sources["Ji"]
-    sources["JiScene"] = ((args.source / "JiData.h").read_text()
-                          + (args.source / "JiContactIdentity.h").read_text() + sources["JiScene"])
-    shared = (args.source / "Shared.h").read_text()
+    sources["SolveCommands"] = '#include "gpu/SolveCommandData.h"\n' + sources["SolveCommands"]
+    sources["Ji"] = '#include "gpu/JiData.h"\n' + sources["Ji"]
+    sources["JiScene"] = '#include "gpu/JiData.h"\n#include "gpu/JiContactIdentity.h"\n' + sources["JiScene"]
+    shared = '#include "gpu/Shared.h"\n'
     pipelines, compile_commands, groups = [], [], {}
     indices = [[[65535] * 4 for _ in entries] for _ in range(3)]
     extras = []
