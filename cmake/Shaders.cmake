@@ -20,7 +20,7 @@ string(STRIP "${GpuArchitecture}" GpuArchitecture)
 # An empty pipeline script exercises the translator lookup without compiling any shader.
 set(ProbeDir ${CMAKE_CURRENT_BINARY_DIR}/gpu-architecture-probe)
 file(WRITE ${ProbeDir}/empty.mtlp-json "{\"libraries\":{\"paths\":[]},\"pipelines\":{\"compute_pipelines\":[]}}\n")
-execute_process(COMMAND ${Xcrun} metal-tt -target air64-apple-macos26.0 -arch ${GpuArchitecture}
+execute_process(COMMAND ${Xcrun} metal-tt -arch ${GpuArchitecture}
     ${ProbeDir}/empty.mtlp-json -o ${ProbeDir}/empty.metallib
     RESULT_VARIABLE TranslatorStatus OUTPUT_QUIET ERROR_QUIET)
 if(TranslatorStatus EQUAL 0)
@@ -59,7 +59,7 @@ set(ShaderFiles ${ShaderDir}/rbp.metallib)
 if(BuildArchive)
     file(GENERATE OUTPUT ${ShaderDir}/ArchiveTarget.txt CONTENT "${GpuArchitecture}\n")
     add_custom_command(OUTPUT ${ShaderDir}/rbp.binary.metallib
-        COMMAND ${Xcrun} metal-tt -target air64-apple-macos26.0 -arch ${GpuArchitecture}
+        COMMAND ${Xcrun} metal-tt -arch ${GpuArchitecture}
             -L ${ShaderDir} ${ShaderDir}/rbp.mtlp-json -o ${ShaderDir}/rbp.binary.metallib
         WORKING_DIRECTORY ${ShaderDir}
         DEPENDS ${ShaderDir}/rbp.metallib ${ShaderDir}/rbp.mtlp-json ${ShaderDir}/ArchiveTarget.txt VERBATIM)
